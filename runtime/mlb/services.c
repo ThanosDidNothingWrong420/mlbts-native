@@ -164,6 +164,36 @@ static void pctl_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
     }
 }
 
+// ---- nifm:u: the network interface manager. Offline: no network is ever available. Only the commands MLB was seen
+// to use are served; the rest stop with a named fatal.
+static void nifm_general_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    switch (rq->cmd) {
+    default: ipc_unimplemented(s, rq);
+    }
+}
+
+static void nifm_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    switch (rq->cmd) {
+    case 4: case 5:   // CreateGeneralServiceOld, CreateGeneralService(u64, pid) -> IGeneralService
+        rs->move[rs->nmove++] = ipc_session_new("nifm:IGeneralService", nifm_general_handler, NULL, NULL);
+        return;
+    default: ipc_unimplemented(s, rq);
+    }
+}
+
+// ---- bsd:u: BSD sockets (nn::socket::Initialize). Offline: the client registers; sockets are not served yet.
+static void bsd_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    switch (rq->cmd) {
+    case 0: {   // RegisterClient(LibraryConfigData, u64 pid, u64 transfer memory size, copy handle, pid) -> s32
+        int32_t ret = 0;
+        IPC_OUT(rs, ret);
+        return;
+    }
+    case 1: return;   // StartMonitoring(u64 pid, pid)
+    default: ipc_unimplemented(s, rq);
+    }
+}
+
 // ---- table
 void am_applet_oe_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs);   // am.c
 void aoc_u_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs);          // aoc.c
@@ -177,6 +207,8 @@ static const struct { const char *name; IpcHandler handler; } services[] = {
     {"ectx:aw", ectx_handler},
     {"pctl", pctl_handler},
     {"time:u", time_u_handler},
+    {"nifm:u", nifm_handler},
+    {"bsd:u", bsd_handler},
 };
 
 IpcHandler rt_service_handler(const char *name, const char **stable_name) {

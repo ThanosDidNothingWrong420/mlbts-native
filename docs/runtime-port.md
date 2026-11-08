@@ -134,8 +134,14 @@ linker. `tools/shader_smoke.py` translates a sample of MLB's FXB shaders offline
     `nvnBootstrapLoader` hands out TotK's NVN procs. The game creates its device, records command buffers and **presents
     its first frame** through Vulkan on the RTX 3060 Ti. ✔ Two procs TotK never needed were added:
     `nvnSamplerPoolRegisterSamplerBuilder` and `nvnQueueWaitSync`.
-14. Network setup opens **`nifm:u`** (`nn::nifm`, from `main+0x151db04`). ✘ **Current stop:**
-    `sm: service "nifm:u" is not implemented`.
+14. Network setup, offline: **`nifm:u`** (`CreateGeneralService`) and **`bsd:u`** (`RegisterClient`,
+    `StartMonitoring`) are served with nothing behind them (`runtime/mlb/services.c`). ✔
+15. **`nn::account`** by symbol override (`runtime/mlb/account.c`, TotK's six overrides). The preselected user opens
+    with the local Uid, and its nickname comes from `MLB_NICKNAME` (default `Player`). The network service account
+    reads as unavailable; its other online calls stop with a named fatal, so no SDK code ever sees a host-made user
+    handle. ✔
+16. Input: `nn::hid::InitializeNpad` (from `main+0x1342ec8`) opens **`hid`**. ✘ **Current stop:**
+    `sm: service "hid" is not implemented`.
 
 Commands each service has not been seen to use stop with a named fatal (`ipc_unimplemented`), so every new one is
 found where it is first needed; commands that only pass a setting are accepted and logged under `MLB_TRACE=ipc`.
@@ -143,7 +149,7 @@ found where it is first needed; commands that only pass a setting are accepted a
 `tools/disasm.py` disassembles a module range or symbol (with PLT call targets named) for reading SDK code paths
 such as the ones above.
 
-Still ahead: nifm (offline), more of the game's frames and their correctness, hid, audio, account, and the save path as the game first uses it.
+Still ahead: hid (input), then more of the game's frames and their correctness, audio, and the save path as the game first uses it.
 
 ## Approach for services
 

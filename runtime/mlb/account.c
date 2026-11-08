@@ -1,12 +1,17 @@
-// The local user: one offline account whose Uid survives restarts in <profile>/account.uid (host.h account_uid).
-// Adapted from TotK Recomp runtime/ov_system.c load_uid @ ae30a61 (MIT, LICENSE.totk-recomp).
+// The local user: one offline account whose Uid survives restarts in <profile>/account.uid (host.h account_uid), and
+// the nn::account functions main imports, by symbol override. Adapted from TotK Recomp runtime/ov_system.c (the
+// nn::account section) @ ae30a61 (MIT, LICENSE.totk-recomp).
 //
-// MLB's NACP requires a startup user account (StartupUserAccount = 1), so am hands this Uid out as the preselected
-// user (PopLaunchParameter kind 2). nn::account itself is not served yet.
+// MLB's NACP requires a startup user account (StartupUserAccount = 1), so am also hands this Uid out as the
+// preselected user (PopLaunchParameter kind 2). User handles are made here ({Uid, token}, nn::account::UserHandle's
+// 24 bytes), so no SDK account function may see one: every imported function that takes a handle is overridden. The
+// network service account ones answer as an offline console with no linked Nintendo Account would, or stop with a
+// named fatal where that answer is not known.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "cfg.h"
 #include "host.h"
 #include "platform/platform.h"
 
@@ -45,3 +50,115 @@ void account_uid(uint64_t out[2]) {
     out[1] = uid_hi;
     plat_mutex_unlock(&account_lock);
 }
+
+// ---- nn::account overrides
+#define ACCOUNT_R_INVALID 0x7c67u   // MacNativeGames' result for an unknown user handle or uid (TotK ov_system.c)
+typedef struct { uint64_t lo, hi; } Uid;
+typedef struct { Uid uid; uint64_t token; } UserHandle;
+_Static_assert(sizeof(UserHandle) == 24, "nn::account::UserHandle");
+static uint64_t tokens[64], next_token = 1;
+
+static int same_uid(const Uid *u) { return u && u->lo == uid_lo && u->hi == uid_hi; }   // holding account_lock
+
+static int valid_handle(const UserHandle *h) {   // holding account_lock
+    if (!h || !same_uid(&h->uid)) return 0;
+    for (int i = 0; i < 64; i++)
+        if (tokens[i] && tokens[i] == h->token) return 1;
+    return 0;
+}
+
+static void need_handle(Cpu *c, const char *fn, int arg) {
+    plat_mutex_lock(&account_lock);
+    int ok = valid_handle(arg_p(c, arg));
+    plat_mutex_unlock(&account_lock);
+    if (!ok) rt_fatal("nn::account::%s: not an open user handle", fn);
+}
+
+// void Initialize()
+static void ov_account_initialize(Cpu *c) {
+    (void)c;
+    uint64_t uid[2];
+    account_uid(uid);
+}
+
+// bool TryOpenPreselectedUser(UserHandle *out)
+static void ov_open_user(Cpu *c) {
+    UserHandle *out = arg_p(c, 0);
+    if (!out) rt_fatal("nn::account::TryOpenPreselectedUser: null handle");
+    plat_mutex_lock(&account_lock);
+    load_uid();
+    int ok = 0;
+    for (int i = 0; i < 64 && !ok; i++)
+        if (!tokens[i]) {
+            tokens[i] = next_token++;
+            *out = (UserHandle){{uid_lo, uid_hi}, tokens[i]};
+            ok = 1;
+        }
+    plat_mutex_unlock(&account_lock);
+    ret_x(c, (uint64_t)ok);
+}
+
+// void CloseUser(const UserHandle &)
+static void ov_close_user(Cpu *c) {
+    const UserHandle *h = arg_p(c, 0);
+    plat_mutex_lock(&account_lock);
+    if (!valid_handle(h)) rt_fatal("nn::account::CloseUser: not an open user handle");
+    for (int i = 0; i < 64; i++)
+        if (tokens[i] == h->token) tokens[i] = 0;
+    plat_mutex_unlock(&account_lock);
+}
+
+// Result GetUserId(Uid *out, const UserHandle &)
+static void ov_user_id(Cpu *c) {
+    Uid *out = arg_p(c, 0);
+    plat_mutex_lock(&account_lock);
+    int ok = out && valid_handle(arg_p(c, 1));
+    if (ok) *out = (Uid){uid_lo, uid_hi};
+    plat_mutex_unlock(&account_lock);
+    ret_x(c, ok ? 0 : ACCOUNT_R_INVALID);
+}
+
+// Result GetNickname(Nickname *out, const Uid &): 33 bytes, NUL-terminated UTF-8; MLB_NICKNAME, default "Player"
+static void ov_nickname(Cpu *c) {
+    char *out = arg_p(c, 0);
+    plat_mutex_lock(&account_lock);
+    load_uid();
+    int ok = out && same_uid(arg_p(c, 1));
+    plat_mutex_unlock(&account_lock);
+    if (ok) {
+        memset(out, 0, 33);
+        snprintf(out, 33, "%s", cfg_value("MLB_NICKNAME"));
+    }
+    ret_x(c, ok ? 0 : ACCOUNT_R_INVALID);
+}
+
+// Result IsNetworkServiceAccountAvailable(bool *out, const UserHandle &): no Nintendo Account is linked offline
+static void ov_nsa_available(Cpu *c) {
+    uint8_t *out = arg_p(c, 0);
+    need_handle(c, "IsNetworkServiceAccountAvailable", 1);
+    if (out) *out = 0;
+    ret_x(c, out ? 0 : ACCOUNT_R_INVALID);
+}
+
+// The online ones: with IsNetworkServiceAccountAvailable false the game should not get here; if it does, the answer
+// Horizon gives (and whether an applet would show) is not known yet.
+#define ACCOUNT_ONLINE(fn, name)                                                                                           static void fn(Cpu *c) {                                                                                                 (void)c;                                                                                                             rt_fatal("nn::account::%s: the network service account is not served (offline)", name);                         }
+ACCOUNT_ONLINE(ov_nsa_id, "GetNetworkServiceAccountId")
+ACCOUNT_ONLINE(ov_nsa_ensure, "EnsureNetworkServiceAccountAvailable")
+ACCOUNT_ONLINE(ov_nsa_token, "LoadNetworkServiceAccountIdTokenCache")
+ACCOUNT_ONLINE(ov_nsa_license, "ShowLicenseRequirementsForNetworkService")
+ACCOUNT_ONLINE(ov_na_request, "CreateNintendoAccountAuthorizationRequest")
+ACCOUNT_ONLINE(ov_nsa_token_async, "EnsureNetworkServiceAccountIdTokenCacheAsync")
+
+HOST_OVERRIDE("_ZN2nn7account10InitializeEv", ov_account_initialize);
+HOST_OVERRIDE("_ZN2nn7account22TryOpenPreselectedUserEPNS0_10UserHandleE", ov_open_user);
+HOST_OVERRIDE("_ZN2nn7account9CloseUserERKNS0_10UserHandleE", ov_close_user);
+HOST_OVERRIDE("_ZN2nn7account9GetUserIdEPNS0_3UidERKNS0_10UserHandleE", ov_user_id);
+HOST_OVERRIDE("_ZN2nn7account11GetNicknameEPNS0_8NicknameERKNS0_3UidE", ov_nickname);
+HOST_OVERRIDE("_ZN2nn7account32IsNetworkServiceAccountAvailableEPbRKNS0_10UserHandleE", ov_nsa_available);
+HOST_OVERRIDE("_ZN2nn7account26GetNetworkServiceAccountIdEPNS0_23NetworkServiceAccountIdERKNS0_10UserHandleE", ov_nsa_id);
+HOST_OVERRIDE("_ZN2nn7account36EnsureNetworkServiceAccountAvailableERKNS0_10UserHandleE", ov_nsa_ensure);
+HOST_OVERRIDE("_ZN2nn7account37LoadNetworkServiceAccountIdTokenCacheEPmPcmRKNS0_10UserHandleE", ov_nsa_token);
+HOST_OVERRIDE("_ZN2nn7account40ShowLicenseRequirementsForNetworkServiceERKNS0_10UserHandleE", ov_nsa_license);
+HOST_OVERRIDE("_ZN2nn7account41CreateNintendoAccountAuthorizationRequestEPNS0_42NintendoAccountAuthorizationRequestContextERKNS0_10UserHandleERKNS0_45NintendoAccountAuthorizationRequestParametersEPvm", ov_na_request);
+HOST_OVERRIDE("_ZN2nn7account44EnsureNetworkServiceAccountIdTokenCacheAsyncEPNS0_12AsyncContextERKNS0_10UserHandleE", ov_nsa_token_async);
