@@ -185,6 +185,15 @@ static void svc_body(Cpu *c, uint32_t imm, uint64_t pc) {
         x[1] = 0;
         return;
     }
+    case 0x13: case 0x14: {   // Map/UnmapSharedMemory(w0 handle, x1 address, x2 size[, w3 permission]) (mlbts-native)
+        RtSharedMem *m = kern_handle_get((uint32_t)x[0], KERN_SHMEM);
+        if (!m) {
+            x[0] = KERN_R_BAD_HANDLE;
+            return;
+        }
+        x[0] = imm == 0x13 ? mem_map_shared(m, x[1], x[2], (uint32_t)x[3]) : mem_unmap_shared(m, x[1], x[2]);
+        return;
+    }
     case 0x2C: x[0] = mem_map_physical(x[0], x[1]); return;
     case 0x2D: x[0] = mem_unmap_physical(x[0], x[1]); return;
     case 0x26: {   // Break(x0 reason, x1 info, x2 info size); bit 31 of the reason: notification only

@@ -37,7 +37,7 @@
 #define MAIN_CORE 0                      // META+0xF
 #define FIBER_MAX 1024
 
-enum { O_FREE, O_THREAD, O_EVENT_R, O_EVENT_W, O_SESSION = KERN_SESSION, O_TMEM = KERN_TMEM };
+enum { O_FREE, O_THREAD, O_EVENT_R, O_EVENT_W, O_SESSION = KERN_SESSION, O_TMEM = KERN_TMEM, O_SHMEM = KERN_SHMEM };
 _Static_assert(O_EVENT_W < O_SESSION, "handle kinds");
 enum { W_NONE = KERN_WAIT_NONE, W_LOCK = KERN_WAIT_LOCK, W_CONDVAR = KERN_WAIT_CONDVAR, W_ADDRESS = KERN_WAIT_ADDRESS,
        W_SYNC = KERN_WAIT_SYNC };
@@ -1606,6 +1606,8 @@ static uint32_t handle_close(uint32_t h) {
             kind = type;
             ipc = o;
             ok = 1;
+        } else if (type == O_SHMEM) {   // mlbts-native: the block belongs to its service; mappings stay
+            ok = 1;
         } else if (type == O_THREAD) {
             RtThread *t = o;
             t->closed = 1;
@@ -2039,7 +2041,7 @@ int kern_svc(Cpu *c, uint32_t imm) {
 
 // ---- handles and events for host services (ipc.c and the service overrides)
 uint32_t kern_handle_new(int kind, void *obj) {
-    if (kind != KERN_SESSION && kind != KERN_TMEM) rt_fatal("kern_handle_new: kind %d", kind);
+    if (kind != KERN_SESSION && kind != KERN_TMEM && kind != KERN_SHMEM) rt_fatal("kern_handle_new: kind %d", kind);
     lock();
     uint32_t h = h_new(kind, obj);
     unlock();
@@ -2052,6 +2054,8 @@ void *kern_handle_get(uint32_t h, int kind) {
     unlock();
     return o;
 }
+
+uint32_t kern_shmem_handle(RtSharedMem *m) { return kern_handle_new(KERN_SHMEM, m); }   // mlbts-native
 
 uint32_t kern_event_new(void) {
     Event *e = calloc(1, sizeof *e);

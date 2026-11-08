@@ -167,6 +167,7 @@ static void pctl_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
 // ---- table
 void am_applet_oe_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs);   // am.c
 void aoc_u_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs);          // aoc.c
+void time_u_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs);         // time.c
 
 static const struct { const char *name; IpcHandler handler; } services[] = {
     {"lm", lm_handler},
@@ -175,6 +176,7 @@ static const struct { const char *name; IpcHandler handler; } services[] = {
     {"aoc:u", aoc_u_handler},
     {"ectx:aw", ectx_handler},
     {"pctl", pctl_handler},
+    {"time:u", time_u_handler},
 };
 
 IpcHandler rt_service_handler(const char *name, const char **stable_name) {

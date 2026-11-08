@@ -34,8 +34,8 @@
 #define REEXEC_LIMIT 20
 
 // Horizon memory states, permissions, attributes and results used here.
-enum { ST_FREE = 0, ST_CODE = 3, ST_CODEDATA = 4, ST_NORMAL = 5, ST_STACK = 0xB, ST_THREADLOCAL = 0xC,
-       ST_INACCESSIBLE = 0x10 };
+enum { ST_FREE = 0, ST_CODE = 3, ST_CODEDATA = 4, ST_NORMAL = 5, ST_SHARED = 6, ST_STACK = 0xB,
+       ST_THREADLOCAL = 0xC, ST_INACCESSIBLE = 0x10 };
 enum { PERM_NONE = 0, PERM_R = 1, PERM_RW = 3, PERM_RX = 5 };
 enum { ATTR_PERMISSION_LOCKED = 16 };
 #define R_OK 0u
@@ -58,6 +58,14 @@ typedef struct { uint64_t dst, src, size; } StackMap;
 static StackMap stack_maps[MAX_STACK_MAPS];
 static unsigned nstack_maps;
 static uint8_t *module_perm[MOD_COUNT];   // per data page of each module: perm | ATTR_PERMISSION_LOCKED
+// mlbts-native: guest mappings of shared memory (svc 0x13), each a committed copy of its block (see mem_shmem_*).
+#define MAX_SHARED_MAPS 64
+struct RtSharedMem { const char *name; uint8_t *data; uint64_t size; };
+typedef struct { uint64_t addr, size; uint32_t perm; RtSharedMem *mem; } SharedMap;
+static SharedMap shared_maps[MAX_SHARED_MAPS];
+static unsigned nshared_maps;
+
+static int overlaps_shared(uint64_t a, uint64_t n);
 
 static uint64_t align_up(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1); }
 
@@ -284,7 +292,8 @@ static int inside(uint64_t a, uint64_t n, RtRange r) { return a >= r.base && n <
 // ---- 0x01 SetHeapSize
 uint32_t mem_set_heap_size(uint64_t size, uint64_t *addr) {
     plat_mutex_lock(&lock);
-    if (size > L.heap.size || size % 0x200000 || size + image_bytes() > L.pool) {
+    if (size > L.heap.size || size % 0x200000 || size + image_bytes() > L.pool ||
+        (size > heap_size && overlaps_shared(L.heap.base + heap_size, size - heap_size))) {
         plat_mutex_unlock(&lock);
         return R_INVALID_STATE;
     }
@@ -447,7 +456,8 @@ static uint32_t stack_move(int unmap, uint64_t dst, uint64_t src, uint64_t n) {
         if (in_module >= 0) module_pages_set(in_module, src, n, PERM_RW);
         stack_maps[found] = stack_maps[--nstack_maps];
     } else {
-        if (nstack_maps == MAX_STACK_MAPS || (in_module >= 0 && !module_rw_pages(in_module, src, n))) {
+        if (nstack_maps == MAX_STACK_MAPS || (in_module >= 0 && !module_rw_pages(in_module, src, n)) ||
+            overlaps_shared(dst, n)) {
             r = R_INVALID_STATE;
             goto out;
         }
@@ -493,6 +503,10 @@ static uint32_t alias_map(int unmap, uint64_t a, uint64_t n) {
     uint64_t first = (a - L.alias.base) / PAGE, count = n / PAGE;
     plat_mutex_lock(&lock);
     uint32_t r = R_OK;
+    if (overlaps_shared(a, n)) {
+        r = R_INVALID_STATE;
+        goto out;
+    }
     if (unmap) {
         for (unsigned i = 0; i < nstack_maps; i++)
             if (overlaps(a, n, stack_maps[i].src, stack_maps[i].size)) {
@@ -630,9 +644,105 @@ uint32_t mem_query(uint64_t a, RtMemoryInfo *out) {
         r.base = lo;
         r.size = hi - lo;
     }
+    for (unsigned i = 0; i < nshared_maps; i++) {   // shared mappings: inside one, Shared; free space around clipped
+        const SharedMap *m = &shared_maps[i];
+        if (a >= m->addr && a < m->addr + m->size) {
+            r = (RtMemoryInfo){.base = m->addr, .size = m->size, .state = ST_SHARED, .perm = m->perm};
+            break;
+        }
+        if (r.state != ST_FREE) continue;
+        uint64_t lo = r.base, hi = r.base + r.size, e = m->addr + m->size;
+        if (e <= a && e > lo) lo = e;
+        if (m->addr > a && m->addr < hi) hi = m->addr;
+        r.base = lo;
+        r.size = hi - lo;
+    }
     plat_mutex_unlock_shared(&lock);
     if (out) *out = r;
     return R_OK;
+}
+
+// ---- 0x13/0x14 MapSharedMemory, UnmapSharedMemory (mlbts-native)
+// A host service owns each block (mem_shmem_new). Guest addresses are host addresses and the guest regions are plain
+// reservations, so a mapping cannot alias the block's pages: it is committed and filled with a copy, and
+// mem_shmem_write updates the block and every mapping. That serves blocks the host writes and the guest reads (time,
+// hid, applet resources). Guest writes stay in its own mapping; mem_shmem_read reads the first mapping back.
+static int overlaps_shared(uint64_t a, uint64_t n) {   // under lock
+    for (unsigned i = 0; i < nshared_maps; i++)
+        if (overlaps(a, n, shared_maps[i].addr, shared_maps[i].size)) return 1;
+    return 0;
+}
+
+RtSharedMem *mem_shmem_new(const char *name, uint64_t size) {
+    RtSharedMem *m = calloc(1, sizeof *m);
+    if (!m || !size || (size & (PAGE - 1)) || !(m->data = calloc(1, size)))
+        rt_fatal("memory: shared memory %s of %#llx bytes", name, (unsigned long long)size);
+    m->name = name;
+    m->size = size;
+    return m;
+}
+
+void mem_shmem_write(RtSharedMem *m, uint64_t off, const void *p, uint64_t n) {
+    if (off > m->size || n > m->size - off) rt_fatal("memory: write past shared memory %s", m->name);
+    plat_mutex_lock_shared(&lock);
+    memcpy(m->data + off, p, n);
+    for (unsigned i = 0; i < nshared_maps; i++)
+        if (shared_maps[i].mem == m) memcpy((void *)(uintptr_t)(shared_maps[i].addr + off), p, n);
+    plat_mutex_unlock_shared(&lock);
+}
+
+void mem_shmem_read(RtSharedMem *m, uint64_t off, void *p, uint64_t n) {
+    if (off > m->size || n > m->size - off) rt_fatal("memory: read past shared memory %s", m->name);
+    plat_mutex_lock_shared(&lock);
+    const uint8_t *src = m->data;
+    for (unsigned i = 0; i < nshared_maps; i++)
+        if (shared_maps[i].mem == m) {
+            src = (const uint8_t *)(uintptr_t)shared_maps[i].addr;
+            break;
+        }
+    memcpy(p, src + off, n);
+    plat_mutex_unlock_shared(&lock);
+}
+
+uint32_t mem_map_shared(RtSharedMem *m, uint64_t a, uint64_t n, uint32_t perm) {
+    if (!n || (n & (PAGE - 1))) return R_INVALID_SIZE;
+    if (a & (PAGE - 1)) return R_INVALID_ADDRESS;
+    if (n != m->size) return R_INVALID_SIZE;
+    if (perm != PERM_R && perm != PERM_RW) return R_INVALID_NEW_PERM;
+    // Only the two reservations we own can take pages: the stack and heap block and the alias region.
+    int in_low = a >= L.aslr.base && n <= low_size && a - L.aslr.base <= low_size - n;
+    if (!in_low && !inside(a, n, L.alias)) return R_INVALID_REGION;
+    RtMemoryInfo q;
+    mem_query(a, &q);
+    if (q.state != ST_FREE || a + n > q.base + q.size) return R_INVALID_STATE;
+    plat_mutex_lock(&lock);
+    uint32_t r = R_OK;
+    if (nshared_maps == MAX_SHARED_MAPS || overlaps_shared(a, n)) {
+        r = R_INVALID_STATE;
+    } else {
+        // Read-only mappings stay writable on the host: mem_shmem_write updates them in place.
+        commit(a, n, "shared memory");
+        memcpy((void *)(uintptr_t)a, m->data, n);
+        shared_maps[nshared_maps++] = (SharedMap){a, n, perm, m};
+    }
+    plat_mutex_unlock(&lock);
+    if (rt_trace & RT_TRACE_SVC) rt_log("MapSharedMemory %s at %#llx+%#llx perm %u -> %#x", m->name,
+                                        (unsigned long long)a, (unsigned long long)n, perm, r);
+    return r;
+}
+
+uint32_t mem_unmap_shared(RtSharedMem *m, uint64_t a, uint64_t n) {
+    plat_mutex_lock(&lock);
+    uint32_t r = R_INVALID_STATE;
+    for (unsigned i = 0; i < nshared_maps; i++)
+        if (shared_maps[i].mem == m && shared_maps[i].addr == a && shared_maps[i].size == n) {
+            decommit(a, n, "shared memory");
+            shared_maps[i] = shared_maps[--nshared_maps];
+            r = R_OK;
+            break;
+        }
+    plat_mutex_unlock(&lock);
+    return r;
 }
 
 // ---- GetInfo memory ids

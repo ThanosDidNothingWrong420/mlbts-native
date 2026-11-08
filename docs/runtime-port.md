@@ -8,7 +8,7 @@ How `mlb.exe` is built from the game's code and TotK Recomp's runtime, and how f
 |---|---|---|
 | `recomp/` | ARM64 → C generator (lifter, NEON/FP lowering, jump tables, flags/register caching, module layout) | TotK Recomp `ae30a61`, unmodified |
 | `runtime/core/` | Generic host: CPU/SIMD headers, dispatch, host-function table, NSO loader, guest memory, kernel/threads (3 virtual cores), SVCs, IPC, platform (Win32), audio-renderer ABI header | TotK Recomp `ae30a61`; mlbts-native changes listed below |
-| `runtime/mlb/` | MLB layer: `main.c` (log, crash reporter, runtime services of the generated code), `boot.c` (rtld replacement, `nn::init::Start`, NPDM service list), `cfg.c` (environment settings), `services.c` (service table; lm, apm, ectx:aw, pctl), `am.c` (appletOE), `aoc.c` (aoc:u), `account.c` (local user id), `stubs.c` (named stubs) | ours (main/boot/cfg adapted from TotK, attributed in headers) |
+| `runtime/mlb/` | MLB layer: `main.c` (log, crash reporter, runtime services of the generated code), `boot.c` (rtld replacement, `nn::init::Start`, NPDM service list), `cfg.c` (environment settings), `services.c` (service table; lm, apm, ectx:aw, pctl), `am.c` (appletOE), `aoc.c` (aoc:u), `time.c` (time:u), `account.c` (local user id), `stubs.c` (named stubs) | ours (main/boot/cfg adapted from TotK, attributed in headers) |
 | `tools/build.py` | Writes `work/build/modules.c` and `build.ninja`, compiles with LLVM clang, links `work/build/mlb.exe` with lld | ours |
 | `tools/data/expected-1.0.15.json` | ExeFS hashes the loader checks | ours |
 
@@ -32,6 +32,13 @@ that another title couldn't replace.
   0x1000-byte stack in sdk's `.bss` and aliases it into the stack region; TotK's version allowed only heap and alias
   sources, so `MapAliasStack` failed 64 times and the SDK aborted. The pages read as no-access while moved.
 - `runtime/core/kernel.c`, `host.h`: `kern_event_clear`, so am can clear its message event when the queue empties.
+- `memory.c`, `kernel.c`, `svc.c`, `host.h`: **shared memory** (svc 0x13 MapSharedMemory, 0x14 UnmapSharedMemory,
+  handle kind `KERN_SHMEM`). A host service owns each block (`mem_shmem_new`). Guest addresses are host addresses
+  and the guest regions are plain reservations, so a mapping cannot alias the block's pages: it is committed in the
+  stack/heap block or the alias region and filled with a copy, and `mem_shmem_write` updates the block and every
+  mapping. That fits blocks the host writes and the guest reads (time now; hid and applet resources later). Guest
+  writes stay in their own mapping (`mem_shmem_read` reads the first one back). QueryMemory reports mappings as
+  Shared, and heap growth, stack moves and MapPhysicalMemory refuse to overlap them.
 
 ## Building and running
 
@@ -43,7 +50,7 @@ work/build/mlb.exe
 
 Generation takes about 50 s. A clean build takes about 2.5 min with 10 parallel jobs; after that, runtime-only
 changes relink in seconds. Settings come from the environment: `MLB_TRACE=svc,host,ipc,fs,sched,all`,
-`MLB_EXEFS`/`MLB_ROMFS`/`MLB_PROFILE`, `MLB_LANGUAGE` (default `en-US`), and every TotK `TOTK_<X>` key as `MLB_<X>`. The log goes to stderr and to
+`MLB_EXEFS`/`MLB_ROMFS`/`MLB_PROFILE`, `MLB_LANGUAGE` (default `en-US`), `MLB_TIMEZONE` (`local`, the default, or `utc`), and every TotK `TOTK_<X>` key as `MLB_<X>`. The log goes to stderr and to
 `work/build/logs/mlb.log`.
 
 The toolchain is LLVM clang 23 (`x86_64-pc-windows-msvc`) with lld and Ninja from the venv. MSYS2 is not needed.
@@ -69,19 +76,30 @@ The toolchain is LLVM clang 23 (`x86_64-pc-windows-msvc`) with lld and Ninja fro
 7. `nn::err::InitializeContextWriterApi` opens **`ectx:aw`**. ✔
 8. `nn::pctl::detail::ipc::InitializeIpcSessionIfNeeded` probes `pctl:s/a/r` (NotAllowed) and opens **`pctl`**: no
    restrictions. ✔
-9. `nntimeStartup` → `nn::time::...::GetUserStaticServiceSharedPointer` opens **`time:u`**. ✘ **Current stop:**
-   `sm: service "time:u" is not implemented`. This one needs kernel shared memory (svc 0x13 MapSharedMemory): since
-   SDK 6 the clocks are read from the time service's shared memory page. TotK replaced `nn::time` by symbol, which
-   cannot catch this call from inside sdk.
+9. `nntimeStartup` opens **`time:u`** (`runtime/mlb/time.c`), takes the time zone service and the service's shared
+   memory, and maps it read-only. ✔ From then on the SDK reads the clocks from that page without IPC. Its layout is
+   taken from SDK 19.3.11's `nn::time::detail::SharedMemoryClient` **[C, disassembly]**:
+   - local (user) and network clock contexts at 0x38 and 0x80, each a lock-free pair of 0x20-byte
+     `SystemClockContext`;
+   - the steady clock at 0xD0, a pair of 0x38-byte adjustment points {base, scale, shift, offset, limit, source id}.
+     The steady time point is `(now_ns + clamp(((now_ns - base) * scale >> shift) + offset, limit)) / 1e9`.
+
+   We write a steady clock equal to the guest tick (a new source id each run, as after a reboot) and system clocks
+   equal to the host's UTC time. The time zone is the host's or UTC (`MLB_TIMEZONE`). `ToCalendarTimeWithMyRule`
+   and `ToPosixTimeWithMyRule` are served; explicit time-zone rules (`LoadTimeZoneRule`) are not yet.
+10. `nn::init::Start` runs **module constructors**: `main` DT_INIT (1,025 init_array entries), then `sdk` (87). Both
+    leave their constructor flag at 2. ✔
+11. **`nnMain` runs.** ✔ The game's first SDK call is `nn::fs::QueryMountRomCacheSize`, and
+    `nn::fs::detail::GetFileSystemProxyServiceObject` opens **`fsp-srv`**. ✘ **Current stop:**
+    `sm: service "fsp-srv" is not implemented`.
 
 Commands each service has not been seen to use stop with a named fatal (`ipc_unimplemented`), so every new one is
 found where it is first needed; commands that only pass a setting are accepted and logged under `MLB_TRACE=ipc`.
 
 `tools/disasm.py` disassembles a module range or symbol (with PLT call targets named) for reading SDK code paths
-such as the two above.
+such as the ones above.
 
-Still ahead: the rest of SDK init, module constructors (`DT_INIT` of `main`, then `sdk`), `nnMain`, then the game's
-own use of fs (RomFS + save), hid, audio, time, account, NVN bootstrap and so on.
+Still ahead: the game's own use of fs (RomFS + save), hid, audio, account, NVN bootstrap and so on.
 
 ## Approach for services
 

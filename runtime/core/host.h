@@ -145,6 +145,15 @@ uint32_t mem_unmap(uint64_t dst, uint64_t src, uint64_t n);                     
 uint32_t mem_query(uint64_t a, RtMemoryInfo *out);                              // 0x06
 uint32_t mem_map_physical(uint64_t a, uint64_t n);                              // 0x2C
 uint32_t mem_unmap_physical(uint64_t a, uint64_t n);                            // 0x2D
+// mlbts-native: shared memory blocks owned by host services; the guest maps them with 0x13 (copy semantics: host
+// writes reach every mapping, guest writes stay in their mapping; memory.c).
+typedef struct RtSharedMem RtSharedMem;
+RtSharedMem *mem_shmem_new(const char *name, uint64_t size);                    // zeroed; size a page multiple
+void mem_shmem_write(RtSharedMem *m, uint64_t off, const void *p, uint64_t n);  // block and every mapping
+void mem_shmem_read(RtSharedMem *m, uint64_t off, void *p, uint64_t n);         // first mapping, else the block
+uint32_t mem_map_shared(RtSharedMem *m, uint64_t a, uint64_t n, uint32_t perm); // 0x13
+uint32_t mem_unmap_shared(RtSharedMem *m, uint64_t a, uint64_t n);              // 0x14
+uint32_t kern_shmem_handle(RtSharedMem *m);                                     // a new handle (copy to the guest)
 int mem_info(uint32_t id, uint64_t *out);                  // GetInfo memory ids 2-7, 12-17, 21, 22, 28; 0 if not a memory id
 void *mem_kernel_alloc(uint64_t size, uint64_t align);     // zeroed, guest-visible, in the kernel region; align <= 64 KiB
 uint64_t mem_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max);
@@ -224,7 +233,7 @@ uint32_t kern_handle_new(int kind, void *obj);             // kind: KERN_SESSION
 void *kern_handle_get(uint32_t h, int kind);
 void kern_handle_close(uint32_t h);                        // CloseHandle from the host side, any thread; fatal on a
                                                            // bad handle
-enum { KERN_SESSION = 4, KERN_TMEM = 5 };
+enum { KERN_SESSION = 4, KERN_TMEM = 5, KERN_SHMEM = 6 };   // SHMEM: mlbts-native
 uint32_t kern_event_new(void);                             // writable handle
 uint32_t kern_event_readable(uint32_t writable);
 void kern_event_signal(uint32_t writable);
