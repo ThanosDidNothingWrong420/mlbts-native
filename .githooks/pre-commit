@@ -1,0 +1,3 @@
+#!/bin/sh
+# Refuse game data, generated code and keys (tools/check_content.py).
+exec .venv/Scripts/python -I tools/check_content.py --staged

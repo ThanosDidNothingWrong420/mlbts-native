@@ -1,0 +1,32 @@
+# --- Proprietary game data: NEVER commit ---
+gamefiles/
+*.nsp
+*.xci
+*.nca
+*.nso
+*.nro
+*.npdm
+*.romfs
+*.bktr
+
+# Local extraction / analysis output (may contain copyrighted code or data)
+work/
+
+# Encryption keys
+*.keys
+prod.keys
+title.keys
+
+# Third-party reference checkouts (study only, tracked upstream)
+refs/
+
+# Python
+__pycache__/
+*.pyc
+
+# Build output
+build/
+out/
+
+# Python venv
+.venv/
