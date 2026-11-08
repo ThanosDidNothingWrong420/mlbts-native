@@ -53,7 +53,11 @@ struct IpcSession {
 };
 
 // mlbts-native: services beyond ipc.c's own table (audren:u, nfp:user). The game layer defines it; NULL: unknown.
-IpcHandler rt_service_handler(const char *name);
+// *stable_name gets a copy of name that lives as long as the process (session names are kept, not copied).
+IpcHandler rt_service_handler(const char *name, const char **stable_name);
+// mlbts-native: 1 when the game's NPDM lets it open the service; sm answers NotAllowed otherwise.
+int rt_service_allowed(const char *name);
+#define IPC_R_SM_NOT_ALLOWED 0x1015u   // sm (module 21), description 8
 
 uint32_t ipc_session_new(const char *name, IpcHandler handler, void *state, void (*close)(void *state));   // handle
 void ipc_out(IpcResponse *rs, const void *p, uint32_t n);

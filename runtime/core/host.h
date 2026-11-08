@@ -228,6 +228,7 @@ enum { KERN_SESSION = 4, KERN_TMEM = 5 };
 uint32_t kern_event_new(void);                             // writable handle
 uint32_t kern_event_readable(uint32_t writable);
 void kern_event_signal(uint32_t writable);
+void kern_event_clear(uint32_t writable);                   // mlbts-native
 void kern_bind_system_event(Cpu *c, uint64_t ev, int autoclear);   // guest thread only
 void kern_signal_system_event(uint64_t ev);                // any thread
 int kern_svc(Cpu *c, uint32_t imm);                        // thread/sync SVCs; 1 if handled

@@ -10,6 +10,7 @@ static const struct { const char *key, *def; } defaults[] = {
     {"TOTK_ASYNC_PREEMPT", "1"},   // kernel.c: asynchronous preemption of a core holder
     {"TOTK_SPIN", "1"},            // kernel.c: spin-wait gates (none are emitted for MLB yet)
     {"TOTK_FREE_CORES", "0"},      // kernel.c: experiments only
+    {"MLB_LANGUAGE", "en-US"},     // am.c GetDesiredLanguage; the NACP lists American English only
 };
 
 void cfg_init(void) {}

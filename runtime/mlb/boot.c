@@ -19,6 +19,45 @@ uint64_t rt_guest_start_ns;
 static uint32_t ctor_state(const RtLoaded *m) { return LD32(m->ctor_flag); }
 static const char *caller(const Cpu *c, char *buf, int n) { return ldr_describe(c->x[30] - 4, buf, n); }
 
+// The services main.npdm lets the game open (ACI0 service access control: one byte per entry, bits 0-2 the name
+// length - 1, bit 7 a server entry; a trailing '*' matches a prefix). sm answers other names NotAllowed, as Horizon
+// does; the SDK probes some (pctl:s) and falls back.
+#define SAC_MAX 96
+static char sac_names[SAC_MAX][9];
+static int sac_count;
+
+static void read_sac(const uint8_t *npdm, size_t n) {
+    uint32_t aci_off, aci_size, sac_off, sac_size;
+    memcpy(&aci_off, npdm + 0x70, 4);
+    memcpy(&aci_size, npdm + 0x74, 4);
+    if (aci_off > n || aci_size > n - aci_off || aci_size < 0x40 || memcmp(npdm + aci_off, "ACI0", 4))
+        rt_fatal("boot: main.npdm has no ACI0");
+    const uint8_t *aci = npdm + aci_off;
+    memcpy(&sac_off, aci + 0x28, 4);
+    memcpy(&sac_size, aci + 0x2C, 4);
+    if (sac_off > aci_size || sac_size > aci_size - sac_off) rt_fatal("boot: main.npdm ACI0 service list out of range");
+    for (uint32_t i = 0; i < sac_size;) {
+        uint8_t c = aci[sac_off + i];
+        uint32_t len = (c & 7u) + 1;
+        if (i + 1 + len > sac_size) rt_fatal("boot: main.npdm service list entry past its end");
+        if (!(c & 0x80)) {
+            if (sac_count == SAC_MAX) rt_fatal("boot: main.npdm lists more than %d services", SAC_MAX);
+            memcpy(sac_names[sac_count++], aci + sac_off + i + 1, len);
+        }
+        i += 1 + len;
+    }
+    rt_log("boot: main.npdm allows %d services", sac_count);
+}
+
+int rt_service_allowed(const char *name) {
+    for (int i = 0; i < sac_count; i++) {
+        size_t len = strlen(sac_names[i]);
+        if (len && sac_names[i][len - 1] == '*' ? !strncmp(sac_names[i], name, len - 1) : !strcmp(sac_names[i], name))
+            return 1;
+    }
+    return 0;
+}
+
 // kernel.c builds the main thread with priority 44, core 0 and a 1 MiB stack; MLB 1.0.15's main.npdm asks for the
 // same (docs/recon-report.md, NPDM), so a different npdm means a different game build.
 static void check_npdm(void) {
@@ -28,6 +67,7 @@ static void check_npdm(void) {
     uint32_t stack;
     memcpy(&stack, npdm + 0x1C, 4);
     int prio = npdm[0xE], core = npdm[0xF];
+    read_sac(npdm, n);
     free(npdm);
     if (prio != 44 || core != 0 || stack != 0x100000)
         rt_fatal("boot: main.npdm asks for priority %d, core %d, stack %#x; kernel.c builds 44, 0, 0x100000", prio,

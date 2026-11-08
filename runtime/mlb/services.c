@@ -105,14 +105,83 @@ static void apm_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
     }
 }
 
+// ---- ectx:aw: error context writer for applications (nn::err::InitializeContextWriterApi, SDK init). The error
+// contexts an application attaches to its error reports go nowhere: there is no error report to attach them to.
+static void ectx_registrar_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    switch (rq->cmd) {
+    case 0: {   // Complete(result, buffer 5) -> u32
+        uint32_t v = 0;
+        if (rt_trace & RT_TRACE_IPC) rt_log("ectx: context completed for result %#x", IPC_ARG(rq, uint32_t, 0));
+        IPC_OUT(rs, v);
+        return;
+    }
+    default: ipc_unimplemented(s, rq);
+    }
+}
+
+static void ectx_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    switch (rq->cmd) {
+    case 0:   // CreateContextRegistrar -> IContextRegistrar
+        rs->move[rs->nmove++] = ipc_session_new("ectx:IContextRegistrar", ectx_registrar_handler, NULL, NULL);
+        return;
+    default: ipc_unimplemented(s, rq);
+    }
+}
+
+// ---- pctl: parental controls (nn::pctl::detail::ipc::InitializeIpcSessionIfNeeded, SDK init). No restrictions are
+// set, no smart device is paired and the play timer is off, so every check passes.
+static uint32_t pctl_event_copy(uint32_t *w) {
+    if (!*w) *w = kern_event_new();
+    return kern_event_readable(*w);
+}
+
+static void pctl_service_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    static uint32_t suspension, unlinked;
+    uint8_t no = 0;
+    switch (rq->cmd) {
+    case 1: return;      // Initialize
+    case 1001: return;   // CheckFreeCommunicationPermission: permitted
+    case 1013: return;   // ConfirmStereoVisionPermission: permitted
+    case 1031:           // IsRestrictionEnabled -> bool
+    case 1403:           // IsPairingActive -> bool
+    case 1453:           // IsPlayTimerEnabled -> bool
+    case 1455:           // IsRestrictedByPlayTimer -> bool
+        IPC_OUT(rs, no);
+        return;
+    case 1451: case 1452: return;   // StartPlayTimer, StopPlayTimer
+    case 1457: rs->copy[rs->ncopy++] = pctl_event_copy(&suspension); return;   // GetPlayTimerEventToRequestSuspension
+    case 1473: rs->copy[rs->ncopy++] = pctl_event_copy(&unlinked); return;     // GetUnlinkedEvent
+    default: ipc_unimplemented(s, rq);
+    }
+}
+
+static void pctl_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    switch (rq->cmd) {
+    case 0: case 1:   // CreateService(u64, pid), CreateServiceWithoutInitialize(u64, pid) -> IParentalControlService
+        rs->move[rs->nmove++] = ipc_session_new("pctl:IParentalControlService", pctl_service_handler, NULL, NULL);
+        return;
+    default: ipc_unimplemented(s, rq);
+    }
+}
+
 // ---- table
+void am_applet_oe_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs);   // am.c
+void aoc_u_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs);          // aoc.c
+
 static const struct { const char *name; IpcHandler handler; } services[] = {
     {"lm", lm_handler},
     {"apm", apm_handler},
+    {"appletOE", am_applet_oe_handler},
+    {"aoc:u", aoc_u_handler},
+    {"ectx:aw", ectx_handler},
+    {"pctl", pctl_handler},
 };
 
-IpcHandler rt_service_handler(const char *name) {
+IpcHandler rt_service_handler(const char *name, const char **stable_name) {
     for (unsigned i = 0; i < sizeof services / sizeof *services; i++)
-        if (!strcmp(services[i].name, name)) return services[i].handler;
+        if (!strcmp(services[i].name, name)) {
+            *stable_name = services[i].name;
+            return services[i].handler;
+        }
     return NULL;
 }

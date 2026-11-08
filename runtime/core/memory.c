@@ -398,7 +398,21 @@ uint32_t mem_set_attribute(uint64_t a, uint64_t n, uint32_t mask, uint32_t at) {
 }
 
 // ---- 0x04/0x05 MapMemory, UnmapMemory: thread stacks move from heap or alias into the stack region by copy; the
-// source is inaccessible while moved and gets the contents back on unmap.
+// source is inaccessible while moved and gets the contents back on unmap. mlbts-native: a module's writable data is a
+// valid source too (Horizon lets CodeData alias); SDK 19.3.11's system worker thread has its stack in sdk's .bss.
+// Those pages read as no-access in the module permission table while moved.
+static int module_rw_pages(int i, uint64_t a, uint64_t n) {   // under lock: every page exactly PERM_RW, unlocked
+    const RtLoaded *m = ldr_module(i);
+    for (uint64_t off = a - m->base; off < a - m->base + n; off += PAGE)
+        if (module_page_perm(i, off) != PERM_RW) return 0;
+    return 1;
+}
+
+static void module_pages_set(int i, uint64_t a, uint64_t n, uint8_t perm) {   // under lock
+    const RtLoaded *m = ldr_module(i);
+    memset(perm_table(i) + (a - m->base - m->data_off) / PAGE, perm, n / PAGE);
+}
+
 static int alias_all_mapped(uint64_t a, uint64_t n) {   // under lock
     uint64_t first = (a - L.alias.base) / PAGE;
     for (uint64_t i = 0; i < n / PAGE; i++)
@@ -411,7 +425,8 @@ static uint32_t stack_move(int unmap, uint64_t dst, uint64_t src, uint64_t n) {
     if (!inside(dst, n, L.stack)) return R_INVALID_REGION;
     int in_heap = inside(src, n, (RtRange){L.heap.base, heap_size});
     int in_alias = inside(src, n, L.alias);
-    if (!in_heap && !in_alias) return R_INVALID_REGION;
+    int in_module = !in_heap && !in_alias ? module_data(src, n) : -1;
+    if (!in_heap && !in_alias && in_module < 0) return R_INVALID_REGION;
     plat_mutex_lock(&lock);
     uint32_t r = R_OK;
     if (in_alias && !alias_all_mapped(src, n)) {
@@ -429,9 +444,10 @@ static uint32_t stack_move(int unmap, uint64_t dst, uint64_t src, uint64_t n) {
         protect(src, n, PLAT_PROT_RW, "moved stack source");
         memcpy((void *)(uintptr_t)src, (const void *)(uintptr_t)dst, n);
         decommit(dst, n, "moved stack");
+        if (in_module >= 0) module_pages_set(in_module, src, n, PERM_RW);
         stack_maps[found] = stack_maps[--nstack_maps];
     } else {
-        if (nstack_maps == MAX_STACK_MAPS) {
+        if (nstack_maps == MAX_STACK_MAPS || (in_module >= 0 && !module_rw_pages(in_module, src, n))) {
             r = R_INVALID_STATE;
             goto out;
         }
@@ -444,6 +460,7 @@ static uint32_t stack_move(int unmap, uint64_t dst, uint64_t src, uint64_t n) {
         commit(dst, n, "moved stack");
         memcpy((void *)(uintptr_t)dst, (const void *)(uintptr_t)src, n);
         protect(src, n, PLAT_PROT_NONE, "moved stack source");
+        if (in_module >= 0) module_pages_set(in_module, src, n, PERM_NONE);
         stack_maps[nstack_maps++] = (StackMap){dst, src, n};
     }
 out:

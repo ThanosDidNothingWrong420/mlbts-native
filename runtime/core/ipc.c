@@ -380,16 +380,25 @@ static void sm_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
     case 1: {         // GetServiceHandle(name)
         char name[9] = {0};
         memcpy(name, ipc_arg(rq, 0, 8), 8);
+        if (!rt_service_allowed(name)) {   // mlbts-native: the NPDM's service access list, as sm enforces it
+            rt_log("ipc: sm: %s is not in the game's service list: NotAllowed", name);
+            rs->result = IPC_R_SM_NOT_ALLOWED;
+            // The TIPC reply keeps its move-handle slot on failure: SDK 19.3.11's nn::sm::GetServiceHandle reads
+            // the handle from word 3 and the result from word 4 without looking at the header.
+            if (rq->type >= 16) rs->move[rs->nmove++] = 0;
+            return;
+        }
         for (unsigned i = 0; i < sizeof services / sizeof *services; i++)
             if (!strcmp(services[i].name, name)) {
                 rs->move[rs->nmove++] = ipc_session_new(services[i].name, services[i].handler, NULL, NULL);
                 rt_log("ipc: opened service %s", services[i].name);
                 return;
             }
-        IpcHandler extra = rt_service_handler(name);   // mlbts-native: services the game layer adds
+        const char *stable = NULL;
+        IpcHandler extra = rt_service_handler(name, &stable);   // mlbts-native: services the game layer adds
         if (extra) {
-            rs->move[rs->nmove++] = ipc_session_new(name, extra, NULL, NULL);
-            rt_log("ipc: opened service %s", name);
+            rs->move[rs->nmove++] = ipc_session_new(stable, extra, NULL, NULL);
+            rt_log("ipc: opened service %s", stable);
             return;
         }
         fflush(stdout);

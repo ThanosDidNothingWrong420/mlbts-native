@@ -2083,6 +2083,15 @@ void kern_event_signal(uint32_t hw) {
     unlock();
 }
 
+// mlbts-native: host services that keep a level-triggered event (am's message queue) clear it themselves.
+void kern_event_clear(uint32_t hw) {
+    lock();
+    Event *e = h_peek(hw, O_EVENT_W);
+    if (!e) rt_fatal("kern_event_clear: %#x is not a writable event handle", hw);
+    e->signaled = 0;
+    unlock();
+}
+
 // System events of host services: the SDK's own nn::os::CreateSystemEvent creates the kernel event (SVC 0x45) on a
 // guest thread; the writable handle is kept, so any thread (host audio tick included) can signal it later.
 // The guest may destroy such an event and attach the same SystemEventType again: the game does that with the nfp
