@@ -50,14 +50,54 @@ static uint32_t session_clone(IpcSession *s) {
     return kern_handle_new(KERN_SESSION, s);
 }
 
+// ---- CMIF domains (mlbts-native). After ConvertToDomain a session carries objects by id (1-based; object 1 is the
+// session's own service object). Requests then start with a domain header naming the object; interfaces a service
+// returns come back as object ids. Layout per libnx sf/cmif.h (ISC), read for the layout only.
+#define DOMAIN_MAX 64
+typedef struct IpcDomain { IpcSession *obj[DOMAIN_MAX]; } IpcDomain;
+enum { DOMAIN_REQUEST = 1, DOMAIN_CLOSE = 2 };
+
+static uint32_t domain_add(IpcDomain *d, IpcSession *o) {
+    for (uint32_t i = 0; i < DOMAIN_MAX; i++)
+        if (!d->obj[i]) {
+            plat_inc32(&o->refs);
+            d->obj[i] = o;
+            return i + 1;
+        }
+    rt_fatal("ipc: domain full (%d objects)", DOMAIN_MAX);
+}
+
+static IpcSession *domain_get(IpcDomain *d, uint32_t id) {
+    return id >= 1 && id <= DOMAIN_MAX ? d->obj[id - 1] : NULL;
+}
+
+static void session_unref(IpcSession *s);
+
+static void domain_remove(IpcDomain *d, uint32_t id) {
+    IpcSession *o = domain_get(d, id);
+    if (!o) rt_fatal("ipc: domain close of unknown object %u", id);
+    d->obj[id - 1] = NULL;
+    session_unref(o);
+}
+
 void ipc_handle_closed(int kind, void *obj) {
     if (kind == KERN_TMEM) {
         free(obj);
         return;
     }
     if (kind != KERN_SESSION) rt_fatal("ipc_handle_closed: handle kind %d", kind);
-    IpcSession *s = obj;
+    session_unref(obj);
+}
+
+static void session_unref(IpcSession *s) {
     if (plat_dec32(&s->refs)) return;
+    if (s->domain) {   // object 1 is s itself and holds no extra reference; release the others
+        IpcDomain *d = s->domain;
+        s->domain = NULL;
+        for (uint32_t i = 1; i < DOMAIN_MAX; i++)
+            if (d->obj[i]) session_unref(d->obj[i]);
+        free(d);
+    }
     if (rt_trace & RT_TRACE_IPC) rt_log("ipc: %s closed", s->name);
     if (s->close) s->close(s->state);
     free(s);
@@ -160,7 +200,12 @@ static void parse(const uint32_t *m, IpcRequest *rq, const uint32_t **data_words
     if ((const uint8_t *)recv - (const uint8_t *)m > IPC_MSG_BYTES) rt_fatal("ipc: request exceeds the message buffer");
 }
 
-static void respond(uint32_t *m, int tipc, const IpcResponse *rs) {
+static void respond_domain(uint32_t *m, int tipc, const IpcResponse *rs, int domain, const uint32_t *objs,
+                           unsigned nobjs);
+static void respond(uint32_t *m, int tipc, const IpcResponse *rs) { respond_domain(m, tipc, rs, 0, NULL, 0); }
+
+static void respond_domain(uint32_t *m, int tipc, const IpcResponse *rs, int domain, const uint32_t *objs,
+                           unsigned nobjs) {
     uint32_t out[IPC_MSG_BYTES / 4];
     memset(out, 0, sizeof out);
     unsigned special = rs->ncopy || rs->nmove;
@@ -177,31 +222,68 @@ static void respond(uint32_t *m, int tipc, const IpcResponse *rs) {
         p[1] = (uint32_t)a;
     }
     uint8_t *words = (uint8_t *)p, *payload;
-    unsigned header = tipc ? 4 : 16;
+    unsigned header = tipc ? 4 : 16, dhead = domain ? 16 : 0;
     payload = tipc ? words : (uint8_t *)out + (((words - (uint8_t *)out) + 15) & ~15);
-    unsigned used = (unsigned)(payload - words) + header + rs->data_size;
+    unsigned used = (unsigned)(payload - words) + dhead + header + rs->data_size + 4 * nobjs;
     unsigned nwords = tipc ? (used + 3) / 4 : (used + 16 + 3) / 4;   // CMIF keeps alignment slack like libnx
     if ((size_t)(words - (uint8_t *)out) + nwords * 4 > IPC_MSG_BYTES) rt_fatal("ipc: response exceeds the message buffer");
+    if (domain) {   // CmifDomainOutHeader: number of out objects, then padding
+        uint32_t dh[4] = {nobjs, 0, 0, 0};
+        memcpy(payload, dh, 16);
+        payload += 16;
+    }
     if (tipc) memcpy(payload, &rs->result, 4);
     else {
         uint32_t h[4] = {CMIF_OUT_MAGIC, 0, rs->result, 0};
         memcpy(payload, h, 16);
     }
     memcpy(payload + header, rs->data, rs->data_size);
+    if (nobjs) memcpy(payload + header + rs->data_size, objs, 4 * nobjs);
     out[0] = (rs->nxout & 0xf) << 16;
     out[1] = (nwords & 0x3ff) | (special ? 1u << 31 : 0);
     memcpy(m, out, IPC_MSG_BYTES);
 }
 
-// CMIF control requests. Domains are not implemented: MNG boots 1.2.1 without them.
+// CMIF control requests (domains: mlbts-native).
 static void control(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
     switch (rq->cmd) {
+    case 0: {   // ConvertToDomain -> object id of the session's own object
+        if (s->domain) rt_fatal("ipc: %s is already a domain", s->name);
+        s->domain = calloc(1, sizeof *s->domain);
+        if (!s->domain) rt_fatal("ipc: domain allocation");
+        s->domain->obj[0] = s;   // no extra reference: object 1 lives as long as the session itself
+        uint32_t id = 1;
+        IPC_OUT(rs, id);
+        return;
+    }
+    case 1: {   // CopyFromCurrentDomain(object id) -> session handle for that object
+        IpcSession *o = s->domain ? domain_get(s->domain, IPC_ARG(rq, uint32_t, 0)) : NULL;
+        if (!o) rt_fatal("ipc: %s CopyFromCurrentDomain of unknown object", s->name);
+        rs->move[rs->nmove++] = session_clone(o);
+        return;
+    }
     case 3: { uint16_t n = POINTER_BUFFER_SIZE; IPC_OUT(rs, n); return; }   // QueryPointerBufferSize
     case 2: case 4: rs->move[rs->nmove++] = session_clone(s); return;          // CloneCurrentObject(Ex)
     default:
         ipc_backtrace();
-        rt_fatal("ipc: %s control command %u is not implemented (domains are not served)", s->name, rq->cmd);
+        rt_fatal("ipc: %s control command %u is not implemented", s->name, rq->cmd);
     }
+}
+
+// In a domain response, interfaces the service moved out as session handles become domain objects.
+static unsigned domain_out_objects(IpcDomain *d, IpcResponse *rs, uint32_t *objs) {
+    unsigned n = 0, keep = 0;
+    for (unsigned i = 0; i < rs->nmove; i++) {
+        IpcSession *o = kern_handle_get(rs->move[i], KERN_SESSION);
+        if (!o) {
+            rs->move[keep++] = rs->move[i];
+            continue;
+        }
+        objs[n++] = domain_add(d, o);
+        kern_handle_close(rs->move[i]);   // the domain's reference replaces the handle's
+    }
+    rs->nmove = keep;
+    return n;
 }
 
 static void dispatch(IpcSession *s, uint32_t *m) {
@@ -221,11 +303,53 @@ static void dispatch(IpcSession *s, uint32_t *m) {
         rq.data_size = (uint32_t)(end - bytes);
     } else if (rq.type == T_REQUEST || rq.type == T_REQUEST_CTX || rq.type == T_CONTROL || rq.type == T_CONTROL_CTX) {
         const uint8_t *payload = (const uint8_t *)m + (((bytes - (const uint8_t *)m) + 15) & ~15);
+        int is_control = rq.type == T_CONTROL || rq.type == T_CONTROL_CTX;
+        if (s->domain && !is_control) {   // CmifDomainInHeader: type, in objects, payload size, object id, pad, token
+            uint8_t dtype = payload[0], nin = payload[1];
+            uint16_t psize;
+            uint32_t oid;
+            memcpy(&psize, payload + 2, 2);
+            memcpy(&oid, payload + 4, 4);
+            IpcSession *o = domain_get(s->domain, oid);
+            if (!o) {
+                ipc_backtrace();
+                rt_fatal("ipc: %s: domain request to unknown object %u", s->name, oid);
+            }
+            if (dtype == DOMAIN_CLOSE) {
+                if (rt_trace & RT_TRACE_IPC) rt_log("ipc: %s domain object %u (%s) closed", s->name, oid, o->name);
+                if (oid == 1) rt_fatal("ipc: %s: domain close of its own object", s->name);
+                domain_remove(s->domain, oid);
+                respond_domain(m, 0, &rs, 1, NULL, 0);
+                return;
+            }
+            if (dtype != DOMAIN_REQUEST) rt_fatal("ipc: %s: domain message type %u", s->name, dtype);
+            payload += 16;
+            if (nin > 8) rt_fatal("ipc: %s: %u domain in-objects", s->name, nin);
+            rq.nin_objects = nin;
+            memcpy(rq.in_objects, payload + psize, 4u * nin);
+            uint32_t dh[4];
+            memcpy(dh, payload, 16);
+            if (dh[0] != CMIF_IN_MAGIC) rt_fatal("ipc: %s: CMIF magic %#x in a domain request", s->name, dh[0]);
+            rq.cmd = dh[2];
+            rq.data = payload + 16;
+            rq.data_size = psize >= 16 ? psize - 16u : 0;
+            o->handler(o, &rq, &rs);
+            uint32_t objs[8];
+            unsigned nobjs = domain_out_objects(s->domain, &rs, objs);
+            if (rt_trace & RT_TRACE_IPC) {
+                char d[160];
+                rt_log("ipc: %s[%u] %s cmd %u -> %#x (objects %u, copy %u move %u) from %s", s->name, oid, o->name,
+                       rq.cmd, rs.result, nobjs, rs.ncopy, rs.nmove,
+                       t_req ? ldr_describe(t_req->x[30], d, sizeof d) : "host");
+            }
+            respond_domain(m, 0, &rs, 1, objs, nobjs);
+            return;
+        }
         uint32_t h[4];
         memcpy(h, payload, 16);
         if (h[0] != CMIF_IN_MAGIC) {
             ipc_backtrace();
-            rt_fatal("ipc: %s: CMIF magic %#x (domain sessions are not served)", s->name, h[0]);
+            rt_fatal("ipc: %s: CMIF magic %#x", s->name, h[0]);
         }
         rq.cmd = h[2];
         rq.data = payload + 16;
@@ -262,6 +386,12 @@ static void sm_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
                 rt_log("ipc: opened service %s", services[i].name);
                 return;
             }
+        IpcHandler extra = rt_service_handler(name);   // mlbts-native: services the game layer adds
+        if (extra) {
+            rs->move[rs->nmove++] = ipc_session_new(name, extra, NULL, NULL);
+            rt_log("ipc: opened service %s", name);
+            return;
+        }
         fflush(stdout);
         ipc_backtrace();
         rt_fatal("sm: service \"%s\" is not implemented", name);

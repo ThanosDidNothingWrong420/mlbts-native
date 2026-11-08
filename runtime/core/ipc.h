@@ -24,6 +24,8 @@ typedef struct {
     unsigned nx, na, nb, nw, nc;
     const uint8_t *data;                   // command arguments after the CMIF header (TIPC: after the HIPC header)
     uint32_t data_size;
+    uint32_t in_objects[8];                // mlbts-native: domain object ids passed in (CMIF domain requests)
+    unsigned nin_objects;
 } IpcRequest;
 
 typedef struct {
@@ -47,7 +49,11 @@ struct IpcSession {
     void *state;
     void (*close)(void *state);
     int32_t refs;
+    struct IpcDomain *domain;   // mlbts-native: set once ConvertToDomain made this session a CMIF domain
 };
+
+// mlbts-native: services beyond ipc.c's own table (audren:u, nfp:user). The game layer defines it; NULL: unknown.
+IpcHandler rt_service_handler(const char *name);
 
 uint32_t ipc_session_new(const char *name, IpcHandler handler, void *state, void (*close)(void *state));   // handle
 void ipc_out(IpcResponse *rs, const void *p, uint32_t n);
