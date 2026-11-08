@@ -30,3 +30,7 @@ out/
 
 # Python venv
 .venv/
+
+# Ninja state (tools/build.py sets builddir under work/)
+.ninja_deps
+.ninja_log
