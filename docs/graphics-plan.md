@@ -1,0 +1,102 @@
+# Graphics plan: NVN on Vulkan
+
+How `mlb.exe` gets from the game's first `nvdrv` request to presented frames. Written 2026-11-08, when the boot
+stops at `sm: service "nvdrv"` (docs/runtime-port.md, boot step 13). Tags: **[C]** confirmed against the 1.0.15
+binaries or this machine, **[H]** hypothesis.
+
+## What MLB asks for
+
+- **Bring-up imports of `main` [C]:** `nv::SetGraphicsAllocator`, `nv::InitializeGraphics`, `nn::vi::Initialize`,
+  `OpenDefaultDisplay`, `CreateLayer`, `GetNativeWindow`, `nvnBootstrapLoader`, and `nvnPrivate0`. This is TotK's
+  set, minus `nv::SetGraphicsDevtoolsAllocator` and `nn::vi::GetDisplayVsyncEvent`, plus `nvnPrivate0` (unknown so
+  far). The `nvdrv` request comes from the SDK's own `nv::InitializeGraphics`, reached because nothing overrides it
+  yet.
+- **NVN API [C]:** MLB's NVN proc-name table has 536 names. 534 of them are also in TotK 1.2.1's table
+  (`runtime/nvn_procs.inc`). MLB adds `nvnBootstrapLoader` and `nvnPrivate0`, and lacks three NVX interop procs
+  (`nvnSyncGetNvRmSyncNVX`, `nvnSyncInitializeFromNvRmSyncNVX`, `nvnTextureGetNvRmSurfaceNVX`). The table is the
+  whole API the driver exposes, not proof that MLB calls each proc.
+- **Shaders [C]:** the FXB banks hold NVN GPU programs with a 0x30-byte header (magic `0x12345678`), a 0x50-byte
+  Maxwell SPH, then SASS (docs/recon-report.md §5a). That is the layout TotK's shader client expects (`gfx_shader.c`:
+  graphics code starts at code+0x30). The 0x880-byte control section TotK hashes and sends with the code is
+  **[H]** the same for MLB's NVN 19.3.11; to be confirmed on the first `nvnProgramSetShaders`.
+- **Textures [H]:** TX12 files are decoded by the game's own code into NVN textures, so the back end sees ordinary
+  NVN formats. Which ones (BCn, ASTC) is still open.
+- **GPU [C]:** RTX 3060 Ti, driver 610.88, Vulkan 1.4.341. It has `VK_EXT_external_memory_host`,
+  `VK_EXT_graphics_pipeline_library`, `VK_EXT_transform_feedback`, `VK_EXT_custom_border_color`,
+  `VK_EXT_extended_dynamic_state3`, `VK_EXT_vertex_input_dynamic_state`, `VK_EXT_robustness2` and dynamic rendering.
+  It has no `textureCompressionASTC_LDR`, so ASTC goes through TotK's compute decoder (`vk_astc.c`).
+
+## Approach: TotK's graphics stack, trimmed
+
+TotK Recomp (MIT) has a working NVN to Vulkan path on Windows. Its NVN front end is MacNativeGames' (MIT); its Vulkan
+1.3 back end and Ryujinx-based shader translator are its own. MLB uses the same NVN API on the same Maxwell GPU, so
+we reuse it instead of writing one. Astral Chain Recomp and Power Moon Recomp were compared in the recon report;
+TotK's is the most complete Windows/Vulkan path of the three.
+
+Layers, all vendored with attribution and `mlbts-native` markers on changes:
+
+| Layer | TotK files | Notes |
+|---|---|---|
+| Bring-up overrides | `ov_gfx.c` | `nv::*`, `nn::vi::*`, `nvnBootstrapLoader`; add `nvnPrivate0` once known |
+| NVN front end | `nvn.h`, `nvn_obj.h`, `nvn_api*.c`, `nvn_ext.c`, `nvn_tex.c`, `nvn_procs.c/.inc`, `nvn_hmap.h`, `nvn_pool_index.h` | records command buffers; nothing reaches the GPU before `QueueSubmitCommands` |
+| Vulkan back end | `vk_device.c`, `vk_memory.c`, `vk_texture.c`, `vk_exec*.c`, `vk_pipeline.c`, `vk_sync.c`, `vk_backend.c`, `vk_rec.c`, `vk_usnap.c`, `vk_formats.c`, `vk_deswizzle.c`, `vk_caps.c`, `vk_color.c`, `vk_astc.c`, `tex_astc.c`, `vk_vma.cpp` | replays recorded NVN commands into Vulkan; pools imported as host memory |
+| Present and window | `gfx_present.c`, `gfx_window_win.c`, `gfx_null.c` | Win32 window, swapchain, frame pacing |
+| Shaders | `gfx_shader.c` + `tools/xlate` (Ryujinx 1.3.2 + TotK patches, .NET NativeAOT) | out-of-process translator, disk cache |
+
+**Not ported (TotK-specific):**
+- resolution patch sets;
+- DLAA and motion vectors (`vk_dlaa.c`, `vk_mv*`);
+- HDR (`vk_hdr.c`) and FSR (`vk_fsr.c`);
+- contact shadows;
+- the ImGui settings menu;
+- TotK's movie decoder;
+- frame dumps and the flight recorder (until needed);
+- the shader prewarm list, which is built from TotK's captured shaders.
+
+These pieces sit behind headers that get stubs, so they can come back later as options.
+
+**MLB-specific additions, later:**
+- an ahead-of-time shader pass over the FXB banks (all 4,505 unique graphics programs are on disk);
+- the compute bank layout;
+- whatever `nvnPrivate0` turns out to be.
+
+## Toolchain additions
+
+- Vulkan headers: Khronos Vulkan-Headers (Apache-2.0), with the loader `vulkan-1.dll` that the driver installed.
+  The import library comes from the Vulkan SDK, or from the headers' DLL exports with `llvm-dlltool`.
+- Vulkan Memory Allocator: one header (MIT); `vk_vma.cpp` compiles with clang++ against the MSVC STL from VS 2022,
+  which is installed.
+- Shader translator: `.NET SDK 10.0.400` is installed and VS 2022 provides the NativeAOT linker. Built from TotK's
+  `tools/vendor/ryujinx` with `tools/xlate/patches`, output under `work/` (it is built from MIT sources, not game
+  data, but it stays out of git like every build output).
+
+## Steps
+
+1. **G0 toolchain:** Vulkan headers and import library, VMA, the translator built to `work/xlate/`.
+2. **G1 bring-up:** `ov_gfx.c` and the NVN proc table (`nvn_procs.c`, with every proc that is not implemented yet
+   stopping with its name). Expected result: the boot passes `nv::InitializeGraphics` and the first
+   `nvnBootstrapLoader`, then stops at the first NVN proc. That gives the list of procs MLB really calls in order.
+3. **G2 front end and back end:** vendor the NVN front end and the Vulkan back end, stub the TotK-only features,
+   build. TotK's probes (`--probe-nvn`, `--probe-vkexec`, `--probe-shader`) come along and must pass on this machine.
+4. **G3 shaders:** the shader client and translator. First check: the control section and code of MLB's first
+   programs translate (log the stage, sizes and translator answer).
+5. **G4 first present:** window, swapchain, `nvnQueuePresentTexture`. Done when the window shows the game's first
+   frame, whatever it is (clear colour, logo, loading screen).
+6. **G5 correctness pass:** render targets and formats MLB uses, texture formats from TX12, the Maxwell behaviour in
+   TotK's `docs/maxwell.md`; then the FXB ahead-of-time shader pass.
+
+Each step ends with a run, a log, and a commit; the boot progress in docs/runtime-port.md moves with it.
+
+## Status (2026-11-08)
+
+- **G0 ✔** `tools/fetch_deps.py` (Vulkan-Headers 1.4.363, VMA 3.4.0, `vulkan-1.lib` from the driver's loader exports)
+  and `tools/build_xlate.py` (NativeAOT, 11 s). Two of TotK's 15 translator patches are left out: 0010 (soft PCSS
+  sun shadows on every 2D-array shadow compare with an explicit LOD) and 0011 (a shadow filter spread factor). They
+  change the picture on purpose for TotK, and are not Maxwell behaviour. The support buffer fields they add sit
+  after every field the remaining patches use.
+- **G3 ✔ (offline)** `tools/shader_smoke.py`: 66 of 66 vertex/fragment programs from 12 FXB banks translate to
+  SPIR-V **[C]**.
+- **G1, G2, G4 ✔** The whole stack builds with clang (MSVC target) and lld. The boot passes `nv::InitializeGraphics`
+  and `nvnBootstrapLoader`, records command buffers and presents its first frame. The run then leaves graphics for
+  `nifm:u`.
+- **G5** open: the frames after the first, and what they show.

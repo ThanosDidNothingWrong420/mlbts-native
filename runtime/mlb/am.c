@@ -58,6 +58,19 @@ static void msg_start(void) {   // an application starts in focus: the SDK waits
     plat_mutex_unlock(&msg_lock);
 }
 
+// ---- the window's focus (gfx_present.c calls these from the window thread; declared in gfx.h for TotK's
+// ov_system.c). TOTK_ASSUME_FOCUS=1, the default, keeps the application in focus, as TotK and MacNativeGames do: a
+// game told it lost focus pauses or mutes itself.
+static int32_t focus_state = 1;
+
+void oe_set_focus(int in_focus) { plat_xchg32(&focus_state, in_focus || cfg_bool("TOTK_ASSUME_FOCUS") ? 1 : 2); }
+
+void oe_push_message(uint32_t message) {
+    plat_mutex_lock(&msg_lock);
+    msg_push(message);
+    plat_mutex_unlock(&msg_lock);
+}
+
 static void common_state_getter(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
     static AmEvent sleep_lock, resolution_change, hdcp_change;
     switch (rq->cmd) {
@@ -102,8 +115,8 @@ static void common_state_getter(IpcSession *s, const IpcRequest *rq, IpcResponse
         IPC_OUT(rs, v);
         return;
     }
-    case 9: {                 // GetCurrentFocusState -> u8: 1 in focus
-        uint8_t v = 1;
+    case 9: {                 // GetCurrentFocusState -> u8: 1 in focus, 2 out of focus
+        uint8_t v = (uint8_t)plat_cas32(&focus_state, 0, 0);
         IPC_OUT(rs, v);
         return;
     }

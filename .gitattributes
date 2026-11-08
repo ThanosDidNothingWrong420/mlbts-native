@@ -2,3 +2,5 @@
 *.bat text eol=crlf
 *.png binary
 *.ico binary
+tools/vendor/** -text
+tools/xlate/patches/*.patch -text

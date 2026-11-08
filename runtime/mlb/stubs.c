@@ -7,10 +7,7 @@
 #include "host.h"
 #include "ipc.h"
 #include "nfp.h"
-#include "vk.h"
 
-// ---- graphics: no back end yet
-void vk_pipeline_save(void) {}   // nothing to save without a pipeline cache
 
 // ---- services ipc.c lists in its sm: table
 void audren_manager_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {

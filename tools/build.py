@@ -26,9 +26,11 @@ GEN_FLAGS = ['-O1', '-fno-strict-aliasing', '-Wno-return-type', '-Wno-unused-lab
 RT_FLAGS = ['-O2', '-g', '-Wall', '-Wno-unused-function', '-fno-strict-aliasing', '-march=x86-64-v3', '-std=gnu11',
             '-D_CRT_SECURE_NO_WARNINGS']
 LIBS = ['bcrypt', 'user32', 'kernel32', 'advapi32', 'ntdll', 'synchronization', 'winmm', 'psapi', 'shell32', 'ole32',
-        'dbghelp']
+        'dbghelp', 'gdi32', 'dwmapi', 'imm32', 'uuid']
 RUNTIME_SOURCES = ['runtime/core/*.c', 'runtime/core/platform/common.c', 'runtime/core/platform/win32.c',
-                   'runtime/mlb/*.c']
+                   'runtime/mlb/*.c', 'runtime/gfx/*.c', 'runtime/gfx/*.cpp']
+DEPS = ROOT / 'work' / 'deps'   # tools/fetch_deps.py: Vulkan headers, VMA, vulkan-1.lib
+CXX_FLAGS = ['-O2', '-g', '-std=c++17', '-march=x86-64-v3', '-D_CRT_SECURE_NO_WARNINGS', '-Wno-nullability-completeness']
 
 
 def c_string(s):
@@ -109,7 +111,10 @@ def main():
 
     rt_srcs = sorted({p for pat in RUNTIME_SOURCES for p in ROOT.glob(pat)}) + [glue]
     gen_srcs = sorted(p for name in linked for p in (gen / name).glob('*.c'))
-    inc_rt = ['-I', 'runtime/mlb', '-I', 'runtime/core', '-I', rel(gen)]
+    if not (DEPS / 'lib' / 'vulkan-1.lib').is_file():
+        raise SystemExit(f'{DEPS} is missing the Vulkan headers and import library: run tools/fetch_deps.py')
+    inc_rt = ['-I', 'runtime/mlb', '-I', 'runtime/core', '-I', 'runtime/gfx', '-I', rel(gen), '-I', rel(DEPS / 'include'),
+              '-I', rel(DEPS / 'include' / 'vma')]
     inc_gen = ['-I', 'runtime/core', '-I', rel(gen)]
     for d in (rel(gen), rel(out)):
         if ' ' in d:
@@ -121,15 +126,18 @@ def main():
              'rule cc_gen', '  command = $cc $genflags -c $in -o $out', '  description = CC $in',
              'rule cc_rt', '  command = $cc $rtflags -MD -MF $out.d -c $in -o $out', '  depfile = $out.d',
              '  deps = gcc', '  description = CC $in',
+             f'cxxflags = {" ".join(CXX_FLAGS)} {" ".join(inc_rt)}',
+             'rule cxx_rt', '  command = $cc -x c++ $cxxflags -MD -MF $out.d -c $in -o $out', '  depfile = $out.d',
+             '  deps = gcc', '  description = CXX $in',
              'rule link', f'  command = $cc -fuse-ld=lld -g @$out.rsp -o $out {" ".join("-l" + l for l in LIBS)} '
-                          f'"{compiler_rt(a.clang)}" '
-                          '-Wl,/STACK:8388608', '  rspfile = $out.rsp', '  rspfile_content = $in',
+                          f'"{compiler_rt(a.clang)}" {rel(DEPS / "lib" / "vulkan-1.lib")} '
+                          '-Wl,/STACK:8388608 -Wl,/errorlimit:0', '  rspfile = $out.rsp', '  rspfile_content = $in',
              '  description = LINK $out', '']
     objs = []
     for s in rt_srcs:
         sub = s.relative_to(ROOT) if s.is_relative_to(ROOT) else Path(s.name)
         o = out / "obj" / "rt" / sub.with_suffix(".o")
-        lines.append(f'build {ninja_path(o)}: cc_rt {ninja_path(s)}')
+        lines.append(f'build {ninja_path(o)}: {"cxx_rt" if s.suffix == ".cpp" else "cc_rt"} {ninja_path(s)}')
         objs.append(o)
     for s in gen_srcs:
         o = out / 'obj' / 'gen' / s.parent.name / (s.stem + '.o')
@@ -140,7 +148,7 @@ def main():
     nf = out / 'build.ninja'
     nf.write_text('\n'.join(lines) + '\n')
     ninja = shutil.which('ninja') or str(Path(sys.executable).parent / 'ninja.exe')
-    cmd = [ninja, '-f', rel(nf)] + (['-j', str(a.jobs)] if a.jobs else [])
+    cmd = [ninja, '-f', rel(nf), '-k', '0'] + (['-j', str(a.jobs)] if a.jobs else [])   # every failure, not the first
     sys.exit(subprocess.run(cmd, cwd=ROOT).returncode)
 
 

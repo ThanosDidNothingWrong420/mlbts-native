@@ -5,6 +5,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#define strncasecmp _strnicmp   // mlbts-native: the MSVC C library names it so
+#endif
 
 #include "cfg.h"
 #include "host.h"

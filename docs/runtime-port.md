@@ -9,6 +9,7 @@ How `mlb.exe` is built from the game's code and TotK Recomp's runtime, and how f
 | `recomp/` | ARM64 → C generator (lifter, NEON/FP lowering, jump tables, flags/register caching, module layout) | TotK Recomp `ae30a61`, unmodified |
 | `runtime/core/` | Generic host: CPU/SIMD headers, dispatch, host-function table, NSO loader, guest memory, kernel/threads (3 virtual cores), SVCs, IPC, platform (Win32), audio-renderer ABI header | TotK Recomp `ae30a61`; mlbts-native changes listed below |
 | `runtime/mlb/` | MLB layer: `main.c` (log, crash reporter, runtime services of the generated code), `boot.c` (rtld replacement, `nn::init::Start`, NPDM service list), `cfg.c` (environment settings), `services.c` (service table; lm, apm, ectx:aw, pctl), `am.c` (appletOE), `aoc.c` (aoc:u), `time.c` (time:u), `game.c` (NACP figures for fs), `account.c` (local user id), `stubs.c` (named stubs) | ours (main/boot/cfg adapted from TotK, attributed in headers) |
+| `runtime/gfx/` | TotK's graphics stack: NVN front end, Vulkan back end, present and Win32 window, shader client (docs/graphics-plan.md); `gfx_stubs.c` switches off the TotK-only features; `nvn_api_more.c` has NVN procs TotK never implemented | TotK Recomp `ae30a61`; changes marked `mlbts-native` |
 | `tools/build.py` | Writes `work/build/modules.c` and `build.ninja`, compiles with LLVM clang, links `work/build/mlb.exe` with lld | ours |
 | `tools/data/expected-1.0.15.json` | ExeFS hashes the loader checks | ours |
 
@@ -81,7 +82,16 @@ changes relink in seconds. Settings come from the environment: `MLB_TRACE=svc,ho
 `work/build/logs/mlb.log`.
 
 The toolchain is LLVM clang 23 (`x86_64-pc-windows-msvc`) with lld and Ninja from the venv. MSYS2 is not needed.
-`clang_rt.builtins` is linked explicitly.
+`clang_rt.builtins` is linked explicitly. Graphics needs two more steps, once each:
+
+```bash
+.venv/Scripts/python -I tools/fetch_deps.py
+.venv/Scripts/python -I tools/build_xlate.py
+```
+
+The first fetches the pinned Vulkan headers and VMA into `work/deps` and generates `vulkan-1.lib` from the driver's
+loader. The second builds the shader translator `work/xlate/totk_xlate.exe` with .NET 10 NativeAOT; it needs VS 2022's
+linker. `tools/shader_smoke.py` translates a sample of MLB's FXB shaders offline: 66 of 66 translate.
 
 ## Boot progress (1.0.15)
 
@@ -120,8 +130,12 @@ The toolchain is LLVM clang 23 (`x86_64-pc-windows-msvc`) with lld and Ninja fro
     the `nn::fs` overrides took it.
 12. **fs**: the game mounts the RomFS as `FS_Rom` and temporary storage as `FS_Temp`, reads
     `FS_Rom:/BOOT/CONFIG_MAIN.TXT`, and logs its own start-up lines (`[lm 0] Compiler: ...`). ✔
-13. Graphics start-up opens **`nvdrv`** (from `main+0x59f974`). ✘ **Current stop:**
-    `sm: service "nvdrv" is not implemented`. This is the NVN bootstrap: the next phase is the graphics back end.
+13. **Graphics bring-up** (docs/graphics-plan.md). The `nv::` and `nn::vi::` overrides take the place of `nvdrv`, and
+    `nvnBootstrapLoader` hands out TotK's NVN procs. The game creates its device, records command buffers and **presents
+    its first frame** through Vulkan on the RTX 3060 Ti. ✔ Two procs TotK never needed were added:
+    `nvnSamplerPoolRegisterSamplerBuilder` and `nvnQueueWaitSync`.
+14. Network setup opens **`nifm:u`** (`nn::nifm`, from `main+0x151db04`). ✘ **Current stop:**
+    `sm: service "nifm:u" is not implemented`.
 
 Commands each service has not been seen to use stop with a named fatal (`ipc_unimplemented`), so every new one is
 found where it is first needed; commands that only pass a setting are accepted and logged under `MLB_TRACE=ipc`.
@@ -129,7 +143,7 @@ found where it is first needed; commands that only pass a setting are accepted a
 `tools/disasm.py` disassembles a module range or symbol (with PLT call targets named) for reading SDK code paths
 such as the ones above.
 
-Still ahead: NVN and the graphics back end, then hid, audio, account, and the save path as the game first uses it.
+Still ahead: nifm (offline), more of the game's frames and their correctness, hid, audio, account, and the save path as the game first uses it.
 
 ## Approach for services
 
