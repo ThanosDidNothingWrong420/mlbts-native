@@ -8,7 +8,7 @@ How `mlb.exe` is built from the game's code and TotK Recomp's runtime, and how f
 |---|---|---|
 | `recomp/` | ARM64 → C generator (lifter, NEON/FP lowering, jump tables, flags/register caching, module layout) | TotK Recomp `ae30a61`, unmodified |
 | `runtime/core/` | Generic host: CPU/SIMD headers, dispatch, host-function table, NSO loader, guest memory, kernel/threads (3 virtual cores), SVCs, IPC, platform (Win32), audio-renderer ABI header | TotK Recomp `ae30a61`; mlbts-native changes listed below |
-| `runtime/mlb/` | MLB layer: `main.c` (log, crash reporter, runtime services of the generated code), `boot.c` (rtld replacement, `nn::init::Start`, NPDM service list), `cfg.c` (environment settings), `services.c` (service table; lm, apm, ectx:aw, pctl), `am.c` (appletOE), `aoc.c` (aoc:u), `time.c` (time:u), `account.c` (local user id), `stubs.c` (named stubs) | ours (main/boot/cfg adapted from TotK, attributed in headers) |
+| `runtime/mlb/` | MLB layer: `main.c` (log, crash reporter, runtime services of the generated code), `boot.c` (rtld replacement, `nn::init::Start`, NPDM service list), `cfg.c` (environment settings), `services.c` (service table; lm, apm, ectx:aw, pctl), `am.c` (appletOE), `aoc.c` (aoc:u), `time.c` (time:u), `game.c` (NACP figures for fs), `account.c` (local user id), `stubs.c` (named stubs) | ours (main/boot/cfg adapted from TotK, attributed in headers) |
 | `tools/build.py` | Writes `work/build/modules.c` and `build.ninja`, compiles with LLVM clang, links `work/build/mlb.exe` with lld | ours |
 | `tools/data/expected-1.0.15.json` | ExeFS hashes the loader checks | ours |
 
@@ -39,6 +39,20 @@ that another title couldn't replace.
   mapping. That fits blocks the host writes and the guest reads (time now; hid and applet resources later). Guest
   writes stay in their own mapping (`mem_shmem_read` reads the first one back). QueryMemory reports mappings as
   Shared, and heap growth, stack moves and MapPhysicalMemory refuse to overlap them.
+- `memory.c` QueryMemory: **host-owned gaps read Inaccessible**, not TotK's Code/RX. SDK 19.3.11's
+  `nn::ro::detail::GetExceptionInfo` (the process name for log observers, found from `nnMain`'s address) walks back
+  from a code address while the regions read Code with R or X **[C, disassembly]**. The Code gap below `main` made
+  `main`'s "module" start at the gap's base, and `FindModuleHeader` read unmapped host memory there.
+- `runtime/core/fs_host.c` (new, from TotK `fs_host.c`) and `fs.h`: **nn::fs by symbol override**, the TotK way:
+  `main` imports 29 `nn::fs` functions and calls them through its GOT. Save, temporary and cache storage are TotK's
+  host directories with the journaled save commit. Changes:
+  - the RomFS is a read-only mount kind of the extracted directory instead of TotK's indexed `romfs.bin`
+    (`romfs.c` is not vendored), so `OpenDirectory` works on it too;
+  - the title's id and save/temporary sizes come from `fs_title` (`runtime/mlb/game.c`, from the NACP);
+  - MLB's extra overloads are added: `GetFreeSpaceSize`, `ExtendSaveData`/`GetSaveDataSize` (sizes kept in
+    `<profile>/save-size`), `MountCacheStorage(name)`, `DeleteDirectory`, `GetDirectoryEntryCount`,
+    `QueryMountRomCacheSize(size_t *, int)`, `EnableGlobalFileDataCache`;
+  - the probe checks the RomFS mount against `romfs_list.tsv`.
 
 ## Building and running
 
@@ -47,6 +61,19 @@ that another title couldn't replace.
 .venv/Scripts/python -I tools/build.py
 work/build/mlb.exe
 ```
+
+The game's RomFS must be extracted first (37.4 GB, 84,634 files; about 3.5 minutes at 190 MiB/s). Extraction is
+resumable, and it writes `work/romfs/romfs.complete` only once every listed file is there at its size; `MountRom`
+refuses to start without that marker:
+
+```bash
+.venv/Scripts/python -I tools/romfs_dump.py --keys "$APPDATA/Ryujinx/system/prod.keys" --titlekeys "$APPDATA/Ryujinx/system/title.keys" --extract-all "gamefiles/<base>.nsp" "gamefiles/<update>.nsp" work/romfs
+```
+
+`work/build/mlb.exe --probe-fs` checks the `nn::fs` overrides without running guest code. It covers all 84,634
+RomFS entries, 64 sampled files read whole through each `ReadFile` overload and compared with an independent read, a
+RomFS listing, refused RomFS writes, and TotK's save-transaction and storage checks in a temporary profile (including
+a crash at each step of a Commit). Status: 108 of 108 checks pass.
 
 Generation takes about 50 s. A clean build takes about 2.5 min with 10 parallel jobs; after that, runtime-only
 changes relink in seconds. Settings come from the environment: `MLB_TRACE=svc,host,ipc,fs,sched,all`,
@@ -89,9 +116,12 @@ The toolchain is LLVM clang 23 (`x86_64-pc-windows-msvc`) with lld and Ninja fro
    and `ToPosixTimeWithMyRule` are served; explicit time-zone rules (`LoadTimeZoneRule`) are not yet.
 10. `nn::init::Start` runs **module constructors**: `main` DT_INIT (1,025 init_array entries), then `sdk` (87). Both
     leave their constructor flag at 2. ✔
-11. **`nnMain` runs.** ✔ The game's first SDK call is `nn::fs::QueryMountRomCacheSize`, and
-    `nn::fs::detail::GetFileSystemProxyServiceObject` opens **`fsp-srv`**. ✘ **Current stop:**
-    `sm: service "fsp-srv" is not implemented`.
+11. **`nnMain` runs.** ✔ Its first SDK call was `nn::fs::QueryMountRomCacheSize`, which went to `fsp-srv` until
+    the `nn::fs` overrides took it.
+12. **fs**: the game mounts the RomFS as `FS_Rom` and temporary storage as `FS_Temp`, reads
+    `FS_Rom:/BOOT/CONFIG_MAIN.TXT`, and logs its own start-up lines (`[lm 0] Compiler: ...`). ✔
+13. Graphics start-up opens **`nvdrv`** (from `main+0x59f974`). ✘ **Current stop:**
+    `sm: service "nvdrv" is not implemented`. This is the NVN bootstrap: the next phase is the graphics back end.
 
 Commands each service has not been seen to use stop with a named fatal (`ipc_unimplemented`), so every new one is
 found where it is first needed; commands that only pass a setting are accepted and logged under `MLB_TRACE=ipc`.
@@ -99,7 +129,7 @@ found where it is first needed; commands that only pass a setting are accepted a
 `tools/disasm.py` disassembles a module range or symbol (with PLT call targets named) for reading SDK code paths
 such as the ones above.
 
-Still ahead: the game's own use of fs (RomFS + save), hid, audio, account, NVN bootstrap and so on.
+Still ahead: NVN and the graphics back end, then hid, audio, account, and the save path as the game first uses it.
 
 ## Approach for services
 

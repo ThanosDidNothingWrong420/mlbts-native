@@ -3,7 +3,7 @@
 // generated code calls (cpu.h), the crash reporter. Dropped: TotK's settings file, probes, Discord, play time,
 // resolution hooks and the graphics modes.
 //
-// mlb.exe [--exefs DIR] [--romfs DIR] [--profile DIR] [--boot]
+// mlb.exe [--exefs DIR] [--romfs DIR] [--profile DIR] [--boot | --probe-fs]
 // Without arguments the paths come from MLB_EXEFS / MLB_ROMFS / MLB_PROFILE, else work/update/exefs, work/romfs/romfs
 // and work/profile under the current directory.
 #include <stdio.h>
@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "cfg.h"
+#include "fs.h"
 #include "host.h"
 #include "platform/platform.h"
 #include "sha256.h"
@@ -220,7 +221,7 @@ static void crash_handler(const PlatCrash *x) {
 }
 
 static int usage(const char *argv0) {
-    fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--boot]\n", argv0);
+    fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--boot | --probe-fs]\n", argv0);
     return 2;
 }
 
@@ -235,6 +236,7 @@ int main(int argc, char **argv) {
                      .romfs = cfg_get("MLB_ROMFS") ? cfg_get("MLB_ROMFS") : rt_default_romfs,
                      .profile = cfg_get("MLB_PROFILE") ? cfg_get("MLB_PROFILE") : rt_default_profile,
                      .gpu = "null"};
+    int probe = 0;
     for (int i = 1; i < argc; i++) {
         const char **path = !strcmp(argv[i], "--exefs") ? &cfg.exefs : !strcmp(argv[i], "--romfs") ? &cfg.romfs
                           : !strcmp(argv[i], "--profile") ? &cfg.profile : NULL;
@@ -243,11 +245,14 @@ int main(int argc, char **argv) {
             *path = argv[i];
         } else if (!strcmp(argv[i], "--boot")) {
             cfg.boot = 1;
+        } else if (!strcmp(argv[i], "--probe-fs")) {   // fs_host.c: the nn::fs overrides on the RomFS and in a
+            probe = 1;                                 // temporary profile; no guest code runs
         } else {
             return usage(argv[0]);
         }
     }
     log_open();
+    if (probe) return probe_fs();
     rt_boot();
     return 0;
 }

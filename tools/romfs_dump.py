@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import random
+import time
 import sys
 from pathlib import Path
 
@@ -103,20 +104,43 @@ def main():
     print(json.dumps(rep, indent=1))
     pats = a.extract
     if a.extract_all or pats:
-        done = 0
+        # Resumable: a file is written to <name>.part and renamed when complete; complete files are skipped.
+        done = skipped = 0
+        written = 0
+        t0 = time.monotonic()
         for p, off, size in sorted(files, key=lambda x: x[1]):
             if not a.extract_all and not any(fnmatch.fnmatch(p.lower(), g.lower()) for g in pats):
                 continue
             dst = out / "romfs" / p.lstrip("/")
+            if dst.exists() and dst.stat().st_size == size:
+                skipped += 1
+                continue
             dst.parent.mkdir(parents=True, exist_ok=True)
-            with open(dst, "wb") as w:
+            part = dst.with_name(dst.name + ".part")
+            with open(part, "wb") as w:
                 pos = 0
                 while pos < size:
                     n = min(16 << 20, size - pos)
                     w.write(romfs.read(off + pos, n))
                     pos += n
+            os.replace(part, dst)
             done += 1
-        print("extracted", done, "files")
+            written += size
+            if done % 500 == 0:
+                rate = written / max(time.monotonic() - t0, 1e-3) / 2**20
+                print(f"extracted {done} files ({skipped} already there), {written / 2**30:.1f} GiB, {rate:.0f} MiB/s",
+                      flush=True)
+        print("extracted", done, "files;", skipped, "were already complete")
+        if a.extract_all:   # the runtime mounts the directory only once this marker is there (fs_host.c mount_rom)
+            def complete(p, size):
+                f = out / "romfs" / p.lstrip("/")
+                return f.is_file() and f.stat().st_size == size
+            missing = [p for p, _, size in files if not complete(p, size)]
+            if missing:
+                raise SystemExit(f"{len(missing)} files missing or short, e.g. {missing[0]}: not marking complete")
+            marker = out / "romfs.complete"
+            marker.write_text(json.dumps({"file_count": len(files), "total_bytes": sum(s for _, _, s in files)}) + "\n")
+            print("RomFS complete:", marker)
 
 
 if __name__ == "__main__":

@@ -28,8 +28,7 @@ void nfp_user_manager_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *
 uint64_t res_heap_extra_bytes(void) { return 0; }
 uint64_t res_tex_heap_extra_bytes(void) { return 0; }
 
-// ---- svc.c ExitProcess: nothing to flush until saves (fs), play time and the profiler are ported
-void fs_save_flush(void) {}
+// ---- svc.c ExitProcess: nothing to flush until play time and the profiler are ported
 void playtime_save(void) {}
 void prof_write(void) {}
 

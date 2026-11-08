@@ -1,8 +1,8 @@
 // Adapted from MacNativeGames games/totk/runtime/fs_host.h @ b75be8cf (MIT, Copyright (c) 2026 MacNativeGames
 // contributors).
-// The nn::fs host layer: the read-only RomFS (romfs.c) and writable save, temporary and
-// cache storage under the profile directory (fs_host.c). Both register their nn::fs overrides with HOST_OVERRIDE;
-// this header is what the two files and the probe share.
+// The nn::fs host layer (fs_host.c): the read-only RomFS and writable save, temporary and cache storage under the
+// profile directory, registered as nn::fs overrides with HOST_OVERRIDE. mlbts-native: TotK's romfs.c interface is
+// gone (the RomFS is a mount kind of fs_host.c), fs_title added.
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -23,35 +23,18 @@
 enum { FS_OPEN_READ = 1, FS_OPEN_WRITE = 2, FS_OPEN_APPEND = 4 };   // nn::fs::OpenMode
 enum { FS_ENTRY_DIRECTORY = 0, FS_ENTRY_FILE = 1 };                 // nn::fs::DirectoryEntryType
 
-// ---- romfs.c
-// Handles 0x1_0000_0000 + j; host storage uses 0x2_0000_0000 + j (files) and 0x3_0000_0000 + j (directories).
-#define ROMFS_HANDLE_BASE 0x100000000ull
-int romfs_owns(const char *path);                          // path is on the mounted RomFS ("<mount>:...")
-int romfs_handle(uint64_t h);                              // h is a RomFS file handle
-uint32_t romfs_mount(const char *name);                    // nn::fs::MountRom; a second name is fatal
-uint32_t romfs_open(uint64_t *out, const char *path, int mode);
-uint32_t romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buffer, uint64_t size);
-uint32_t romfs_size(int64_t *out, uint64_t h);
-void romfs_close(uint64_t h);
-uint32_t romfs_entry_type(int *out, const char *path);
-uint64_t romfs_file_count(void);                           // files in the index (fs_init first)
-const char *romfs_entry(uint64_t i, uint64_t *offset, uint64_t *size);   // path, image offset and size of index row i
-const char *romfs_image_path(void);                        // the romfs.bin path fs_init opened
-size_t romfs_overlay_count(void);
-int romfs_patches_loaded(void);                            // a romfs-patches manifest gave at least one file
-// The button prompts (input_prompts_folder): the folder loaded at start, NULL for the game's own prompts; whether a
-// folder had a manifest at start; and why the folder the settings asked for at start was not loaded (ROMFS_PROMPTS_OK
-// for any other folder: it was not asked for). romfs-patches-pc goes by that name also where romfs-patches-pc-<w>x<h>
-// stands in for it (romfs.c overlay_init).
-enum { ROMFS_PROMPTS_OK, ROMFS_PROMPTS_MISSING, ROMFS_PROMPTS_FAILED, ROMFS_PROMPTS_SHAPE, ROMFS_PROMPTS_MODS,
-       ROMFS_PROMPTS_PATCHES };
-const char *romfs_prompts(void);
-int romfs_prompts_ready(const char *folder);
-int romfs_prompts_off(const char *folder);
-const char *romfs_overlay(size_t k, const char **file, uint64_t *size, int *is_added);   // RomFS path of overlay k
-void fs_trace(const char *what, const char *path);         // TOTK_TRACE=fs: one line per open
+// ---- mlbts-native: the title's figures from its NACP, which the game layer supplies (runtime/mlb/game.c)
+typedef struct {
+    uint64_t program_id;                   // save data owner: IsSaveDataExisting, MountSaveDataReadOnly
+    int64_t save_size, save_journal;       // user account save data, before any ExtendSaveData
+    int64_t save_size_max, save_journal_max;
+    int64_t temp_size;                     // temporary storage (GetFreeSpaceSize)
+} FsTitle;
+extern const FsTitle fs_title;
+void fs_trace(const char *what, const char *path);         // MLB_TRACE=fs: one line per open
 
 // ---- fs_host.c
+int probe_fs(void);                                        // --probe-fs; 0 when every check passed
 void fs_host_set_profile(const char *dir);                 // profile directory; before the first storage mount only
                                                            // (default rt_config()->profile)
 int fs_save_busy(void);                                    // a save is being written: a save file open for writing,
