@@ -1464,6 +1464,11 @@ int vk_texture_slot_desc(int id, tex_t *out) {
     return ok;
 }
 
+// mlbts-native: whether the descriptor registered at pool slot id is a buffer texture; the texture lock is held.
+int vk_texture_slot_is_buffer_locked(int id) {
+    return id >= 0 && id < ntslots && tslots[id].used && tslots[id].t.d.target == NVN_TEXTURE_TARGET_BUFFER;
+}
+
 void vk_texture_register(int id, const tex_t *t, const view_t *v) {
     if (id < 0 || id >= (1 << 20)) rt_fatal("vk: texture slot %d out of range", id);
     lock();

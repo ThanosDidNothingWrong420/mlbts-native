@@ -741,7 +741,14 @@ static void slot_mask_learn(uint64_t serial, int st, const GfxShader *s) {
     slotm[slotm_idx(serial, st)] = (typeof(slotm[0])){serial, st, gfx_shader_slot_mask(s)};
 }
 
+int vk_texture_slot_is_buffer_locked(int id);   // vk_texture.c
+
+// mlbts-native: a buffer texture has no image, so its type was left unanswered and the translator took the texture for
+// 2D: a texel fetch from it (MLB's face skinning reads the base positions that way, compute 28aa4521) bound no data and
+// read zeros, which put every face vertex on its head bone. It is answered "buffer", so the shader declares a
+// samplerBuffer / imageBuffer and the binding gets texel_view.
 static uint8_t type_of_handle(uint64_t h) {   // texture lock held
+    if (h && vk_texture_slot_is_buffer_locked((int)(h & 0xfffff))) return GFX_TEX_BUFFER;
     view_t v;
     int hv;
     const VkTexImage *img = h ? vk_texture_by_id_locked((int)(h & 0xfffff), &v, &hv) : NULL;
@@ -3240,6 +3247,20 @@ static int dq_open = -1;
 // Each query's draw: where its attribute 0 comes from (stream address + attribute offset), the stride and format, so
 // vk_drawq_report can show the first vertices of a draw that wrote nothing (end-of-frame contents).
 static struct { uint64_t addr; uint32_t stride, fmt; } dq_a0[DQ_N];
+// And the vertex stage's c3..c5 (first 16 words, as the replay binds them at the draw: the submit's snapshot or guest
+// memory, then this submission's updates so far) and its storage buffers 0-3, so a draw that wrote nothing can be set
+// against a draw of the same object that did (same bone palette, storage buffer 1).
+static struct { float c[3][16]; uint64_t vss[4]; } dq_vs[DQ_N];
+
+static void dq_cb_now(const VkExec *ex, const p_bind_buf *u, float out[16]) {
+    memset(out, 0, 64);
+    uint32_t n = u->size < 64 ? (uint32_t)u->size : 64;
+    if (!u->addr || !n) return;
+    const uint8_t *b = vk_usnap_bytes(u->addr, n);
+    if (b) memcpy(out, b, n);
+    else if (plat_mem_readable(u->addr, n)) memcpy(out, (const void *)(uintptr_t)u->addr, n);
+    upd_apply(ex, u->addr, (uint8_t *)out, n);
+}
 
 static int dq_ready(void) {
     if (dq_state) return dq_state > 0;
@@ -3271,6 +3292,8 @@ static int dq_begin(VkExec *ex) {
     dq_a0[dq_n].addr = on && ex->vbuf[va.stream & 15].address ? ex->vbuf[va.stream & 15].address + va.offset : 0;
     dq_a0[dq_n].stride = on ? ex->pipe.vstream[va.stream & 15].stride : 0;
     dq_a0[dq_n].fmt = on ? va.fmt : 0;
+    for (int k = 0; k < 3; k++) dq_cb_now(ex, &ex->ubo[NVN_STAGE_VS][k], dq_vs[dq_n].c[k]);
+    for (int k = 0; k < 4; k++) dq_vs[dq_n].vss[k] = ex->ssbo[NVN_STAGE_VS][k].addr;
     return (int)dq_n++;
 }
 
@@ -3310,9 +3333,37 @@ static void dq_peek(uint32_t q) {
     rt_log("%s", line);
 }
 
+// A draw's vertex constants c3..c5, and the translations of the first 16 matrices (64 bytes each, column 3) of its
+// storage buffer 1 (the bone palette of MLB's skinned shaders) once per buffer.
+static void dq_vs_log(uint32_t q, uint64_t samples) {
+    for (int k = 0; k < 3; k++) {
+        char line[512];
+        int o = snprintf(line, sizeof line, "drawq   q %u samples %llu vs c%d:", q, (unsigned long long)samples, k + 3);
+        for (int i = 0; i < 16; i++) o += snprintf(line + o, sizeof line - o, " %g", dq_vs[q].c[k][i]);
+        rt_log("%s", line);
+    }
+    static uint64_t seen[64];
+    static uint32_t nseen;
+    uint64_t a = dq_vs[q].vss[1];
+    if (!a) return;
+    for (uint32_t i = 0; i < nseen; i++)
+        if (seen[i] == a) return;
+    if (nseen < 64) seen[nseen++] = a;
+    float m[16 * 16];
+    if (!vk_capture_read(a, m, sizeof m)) return;
+    char line[900];
+    int o = snprintf(line, sizeof line, "drawq   vssbo1 %#llx translations:", (unsigned long long)a);
+    for (int b = 0; b < 16; b++) o += snprintf(line + o, sizeof line - o, " (%g %g %g)", m[b * 16 + 12], m[b * 16 + 13], m[b * 16 + 14]);
+    rt_log("%s", line);
+}
+
 void vk_drawq_report(void) {
     if (!dq_n || dq_state <= 0) return;
     VkDevice dev = vk_ctx()->device;
+    static uint64_t res[DQ_N][2];
+    if (vkGetQueryPoolResults(dev, dq_pool, 0, dq_n, sizeof res, res, sizeof res[0],
+                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) < 0)
+        memset(res, 0, sizeof res);
     rt_log("drawq: %u draws queried; samples passed per query, 16 a line", dq_n);
     for (uint32_t i = 0; i < dq_n; i += 16) {
         uint64_t v[32];
@@ -3328,6 +3379,23 @@ void vk_drawq_report(void) {
         for (uint32_t k = 0; k < n; k++)
             if (v[2 * k + 1] && !v[2 * k]) dq_peek(i + k);
     }
+    // Draws with a stride-16 RGBA32F position (MLB's face meshes, positions from a compute pass) that wrote nothing,
+    // and every draw sharing their storage buffer 1: vertex constants, bones, first vertices.
+    uint64_t pal[64];
+    uint32_t np = 0;
+    for (uint32_t q = 0; q < dq_n; q++)
+        if (res[q][1] && !res[q][0] && dq_a0[q].fmt == 0x2e && dq_a0[q].stride == 16 && dq_vs[q].vss[1] && np < 64) {
+            uint32_t j = 0;
+            while (j < np && pal[j] != dq_vs[q].vss[1]) j++;
+            if (j == np) pal[np++] = dq_vs[q].vss[1];
+        }
+    for (uint32_t q = 0; q < dq_n; q++)
+        for (uint32_t j = 0; j < np; j++)
+            if (res[q][1] && dq_vs[q].vss[1] == pal[j]) {
+                if (res[q][0]) dq_peek(q);
+                dq_vs_log(q, res[q][0]);
+                break;
+            }
     vkResetQueryPool(dev, dq_pool, 0, dq_n);
     dq_n = 0;
 }
@@ -3529,10 +3597,18 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     if (d->x <= 0 || d->y <= 0 || d->z <= 0) return;
     ex->prog = ex->prog_cs;   // mlbts-native: the compute stage's program (vk_exec.h stage_prog)
     if (!ex->prog) return warn_once(W_PROGRAM, "a dispatch without a bound program is skipped");
+    uint32_t csh = 0;
+    if (drawlog_now_l()) {   // mlbts-native: the compute shader's hash (FNV-1a of its code, as draw_note's vs/fs)
+        const uint8_t *ctl, *code; uint32_t len;
+        if (find_stage(ex->prog, NVN_STAGE_CS, &ctl, &code, &len)) {
+            csh = 2166136261u;
+            for (uint32_t i = 0; i < len; i++) csh = (csh ^ code[i]) * 16777619u;
+        }
+    }
     if (drawlog_now_l())   // mlbts-native: drawlog frame
-        rt_log("drawlog dispatch %dx%dx%d prog %llu img %llx %llx tex %llx %llx ssbo %#llx+%#llx %#llx+%#llx %#llx+%#llx "
+        rt_log("drawlog dispatch %dx%dx%d prog %llu cs %08x img %llx %llx tex %llx %llx ssbo %#llx+%#llx %#llx+%#llx %#llx+%#llx "
                "%#llx+%#llx", d->x, d->y, d->z,
-               (unsigned long long)ex->prog->serial, (unsigned long long)ex->img[NVN_STAGE_CS][0],
+               (unsigned long long)ex->prog->serial, csh, (unsigned long long)ex->img[NVN_STAGE_CS][0],
                (unsigned long long)ex->img[NVN_STAGE_CS][1], (unsigned long long)ex->tex[NVN_STAGE_CS][0],
                (unsigned long long)ex->tex[NVN_STAGE_CS][1],
                (unsigned long long)ex->ssbo[NVN_STAGE_CS][0].addr, (unsigned long long)ex->ssbo[NVN_STAGE_CS][0].size,
