@@ -48,23 +48,32 @@ static _Thread_local int x_here;   // this thread is inside vk_exec_record (vk_e
 // ---- TOTK_TRACE=gfx frame counters
 
 VkExecFrame vk_exec_frame;
-static struct { const uint8_t *mem; uint32_t w, h, fmt, n; } fw[64];   // textures written this frame
+static struct { const uint8_t *mem; uint32_t w, h, fmt, n; const tex_t *t; } fw[64];   // textures written this frame (mlbts-native: t, for vk_capture.c)
 static int nfw;
 
 uint64_t vk_exec_recording_fence(void) { return x_here ? X.fence : 0; }
 
+long vk_drawlog_frame(void);   // vk_exec_draw.c: the frame F12 / MLB_DRAWLOG asks for, -1 none
 void vk_exec_frame_written(const tex_t *t) {
-    if (!(rt_trace & RT_TRACE_GFX) || !t) return;
+    long cap = vk_drawlog_frame();   // mlbts-native: also listed in the capture frame (vk_capture.c)
+    int capturing = cap >= 0 && (long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1 == cap;
+    if ((!(rt_trace & RT_TRACE_GFX) && !capturing) || !t) return;
     for (int i = 0; i < nfw; i++)
         if (fw[i].mem == t->mem) { fw[i].n++; return; }
     if (nfw == 64) return;
-    fw[nfw].mem = t->mem, fw[nfw].w = t->d.width, fw[nfw].h = t->d.height, fw[nfw].fmt = (uint32_t)t->d.format;
+    fw[nfw].mem = t->mem, fw[nfw].w = t->d.width, fw[nfw].h = t->d.height, fw[nfw].fmt = (uint32_t)t->d.format, fw[nfw].t = t;
     fw[nfw++].n = 1;
 }
 
-long vk_drawlog_frame(void);   // vk_exec_draw.c: the frame F12 / MLB_DRAWLOG asks for, -1 none
+void vk_capture_targets(const tex_t *const *ts, int n, uint64_t frame);   // vk_capture.c
 void vk_exec_frame_log(const tex_t *p, uint64_t frame) {
     VkExecFrame *f = &vk_exec_frame;
+    long cap = vk_drawlog_frame();
+    if (cap >= 0 && (uint64_t)cap == frame) {   // mlbts-native: the capture frame's render targets as PNGs
+        const tex_t *ts[64];
+        for (int i = 0; i < nfw; i++) ts[i] = fw[i].t;
+        vk_capture_targets(ts, nfw, frame);
+    }
     if (!(rt_trace & RT_TRACE_GFX)) {   // mlbts-native: the summary of the drawlog frame too, counted from the one before
         long want = vk_drawlog_frame();
         if (want < 0 || (uint64_t)want != frame) {
