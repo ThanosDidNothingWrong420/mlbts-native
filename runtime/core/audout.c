@@ -54,6 +54,7 @@ static struct {
     _Atomic uint64_t played, queued;
     PlatMutex push;
     volatile int64_t overruns;
+    volatile int64_t underruns, missing;   // mlbts-native: pulls the ring could not fill, and the frames short
     volatile int64_t appends, releases, zero_releases;
     double level_sum, level_peak;
     uint64_t level_count;
@@ -149,6 +150,7 @@ static void audout_pull(void *user, float *dst, uint32_t total) {
             tmp[2 * i + 1] = out.ring[2 * k + 1];
         }
         if (n < frames) memset(tmp + 2 * n, 0, (size_t)(frames - n) * 2 * sizeof(float));
+        if (n < frames && queued > 1) plat_inc64(&out.underruns), plat_add64(&out.missing, frames - n);   // mlbts-native
         played += (uint64_t)n;
         atomic_store_explicit(&out.played, played, memory_order_release);
         dst += 2 * frames;
@@ -354,11 +356,11 @@ static void out_append(AudoutOut *o, const IpcRequest *rq, IpcResponse *rs) {
         uint64_t played = atomic_load_explicit(&out.played, memory_order_acquire);
         uint64_t queued_now = atomic_load_explicit(&out.queued, memory_order_acquire);
         rt_log("audout: level rms %.4f peak %.4f over %.1f s; %lld buffers appended, %lld released (%lld empty), "
-               "%llu frames queued, %.1f ms in the ring, %lld overruns",
+               "%llu frames queued, %.1f ms in the ring, %lld overruns, %lld underruns (%lld frames short)",
                sqrt(out.level_sum / (double)out.level_count), out.level_peak, out.level_count / 2.0 / AUDOUT_RATE,
                (long long)out.appends, (long long)out.releases, (long long)out.zero_releases,
                (unsigned long long)(queued_now - 1), (queued_now - played) * 1000.0 / AUDOUT_RATE,
-               (long long)out.overruns);
+               (long long)out.overruns, (long long)out.underruns, (long long)out.missing);
         out.level_sum = out.level_peak = 0;
         out.level_count = 0;
     }

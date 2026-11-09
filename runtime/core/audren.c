@@ -95,6 +95,14 @@ static void update_voice(AudioRenderer *r, const AudrenVoiceIn *in) {
     v->in = *in;
     v->use_float_biquads = 0;
     if (!in->in_use) return;
+    if (rt_trace & RT_TRACE_AUDIO) {   // mlbts-native: each sample format and channel count, once (audio_mixer.c sample_at)
+        static volatile uint32_t seen[16];
+        unsigned f = in->sample_format < 16 ? in->sample_format : 15, bit = in->channel_count < 32 ? 1u << in->channel_count : 1;
+        if (!(__atomic_fetch_or(&seen[f], bit, __ATOMIC_RELAXED) & bit))
+            rt_log("audren: first voice with sample format %u (%s), %u channels, %u Hz", in->sample_format,
+                   in->sample_format >= 1 && in->sample_format <= 6 ? "decoded" : "NOT decoded: plays silence",
+                   in->channel_count, in->sample_rate);
+    }
     need(in->wave_buffer_index < 4, "wave buffer index");
     // The play state as the DSP keeps it (Ryujinx VoiceInfo.UpdatePlayState): Stop on a voice that is not stopped
     // becomes Stopping, which the next render frame turns into Stopped after giving back every queued buffer.

@@ -3592,7 +3592,7 @@ static void op_update_ub(VkExec *ex, const p_update_ub *u) {
 // ---- bind ops
 
 static void bind_handles(uint64_t *dst, int cap, const p_bind_handles *b) {
-    if (b->stage < 0 || b->stage >= 6 || b->first < 0 || b->n < 0 || b->n > 32 || b->first + b->n > cap) {
+    if (b->stage < 0 || b->stage >= 6 || b->first < 0 || b->n < 0 || b->n > 128 || b->first + b->n > cap) {   // mlbts-native: 128 (nvn_obj.h)
         warn_once(W_BIND, "a bind of %d handles at %d of stage %d is out of range: ignored", b->n, b->first, b->stage);
         return;
     }

@@ -1037,7 +1037,9 @@ NVN_API(nvnCommandBufferBindStorageBuffers) { bind_buffers(c, OP_BIND_SSBO); }
 // reads the handles when the command buffer is submitted, and the game fills its material handle tables after
 // recording and before the submit (nvn_submit_prepare). hw_bytes: the hardware size of the plain variant.
 static void bind_handles(cmd_t *o, uint32_t op, int st, int first, int n, const uint64_t *h, int deferred, size_t hw_bytes) {
-    if (n < 0 || n > 32) { rt_log("nvn: bind of %d handles", n); return; }
+    // mlbts-native: up to 128 (separate textures and samplers have 128 slots per stage; MLB's materials bind 119 at
+    // once, and dropping those left every 3D draw with dummy textures)
+    if (n < 0 || n > 128) { rt_log("nvn: bind of %d handles", n); return; }
     p_bind_handles *r = RECN(o, op, p_bind_handles, h, n);
     r->stage = st;
     r->first = first;
@@ -1049,7 +1051,7 @@ static void bind_handles(cmd_t *o, uint32_t op, int st, int first, int n, const 
 static void bind_handle_array(const Cpu *c, uint32_t op, int deferred, int wide) {   // (cmd, stage, first, n, handles)
     int n = (int)arg_x(c, 3);
     bind_handles(cmd_of(c), op, (int)arg_x(c, 1), (int)arg_x(c, 2), n, arg_p(c, 4), deferred,
-                 wide && n >= 0 && n <= 32 ? 16 + 8 * (size_t)n : 0);
+                 wide && n >= 0 && n <= 128 ? 16 + 8 * (size_t)n : 0);
 }
 static void bind_one_handle(const Cpu *c, uint32_t op, size_t hw_bytes) {   // (cmd, stage, index, handle)
     uint64_t v = arg_x(c, 3);
@@ -1265,9 +1267,9 @@ static int resolve_deferred(const uint8_t *p, int depth) {   // returns the numb
             nd += resolve_deferred((const uint8_t *)(uintptr_t)t, depth + 1);
         } else if (h.op == OP_BIND_TEX || h.op == OP_BIND_IMG || h.op == OP_BIND_SAMP) {
             p_bind_handles *b = (p_bind_handles *)(uintptr_t)(p + 8);
-            if (b->src && b->n > 0 && b->n <= 32) {
+            if (b->src && b->n > 0 && b->n <= 128) {   // mlbts-native: 128 (bind_handles)
                 nd++;
-                uint64_t cur[32];
+                uint64_t cur[128];
                 memcpy(cur, (const void *)(uintptr_t)b->src, 8 * (size_t)b->n);
                 __atomic_fetch_add(&def_reads, 1, __ATOMIC_RELAXED);
                 if (memcmp(cur, b->h, 8 * (size_t)b->n)) {
