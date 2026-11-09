@@ -2168,7 +2168,7 @@ typedef struct {
     VkDeviceSize held;   // staging and scratch bytes freed when the batch completes (vk_upload_held)
 } Batch;
 
-enum { DEAD_IMAGE = 1, DEAD_IMAGE_VMA, DEAD_VIEW, DEAD_BUFFER_VMA, DEAD_HOST };   // DEAD_HOST: free(handle)
+enum { DEAD_IMAGE = 1, DEAD_IMAGE_VMA, DEAD_VIEW, DEAD_BUFFER_VMA, DEAD_HOST, DEAD_BUFFER_VIEW };   // DEAD_HOST: free(handle); mlbts-native: DEAD_BUFFER_VIEW
 typedef struct { int kind; uint64_t handle; VmaAllocation alloc; uint64_t seq, tl; } Dead;
 
 static PlatRMutex cmd_lock;
@@ -2229,6 +2229,10 @@ static void collect_locked(VkCtx *c) {
         if (d->seq > done_seq || d->tl > tl) { dead[k++] = *d; continue; }
         if (d->kind == DEAD_HOST) {
             free((void *)(uintptr_t)d->handle);
+            continue;
+        }
+        if (d->kind == DEAD_BUFFER_VIEW) {   // mlbts-native: texel buffer views (vk_exec_draw.c texel_view)
+            vkDestroyBufferView(c->device, (VkBufferView)(uintptr_t)d->handle, NULL);
             continue;
         }
         rec_check_handle(d->kind == DEAD_VIEW ? REC_VIEW : d->kind == DEAD_BUFFER_VMA ? REC_BUFFER : REC_IMAGE, d->handle, 1,
@@ -2435,7 +2439,7 @@ static void defer(int kind, uint64_t handle, VmaAllocation alloc) {
     uint64_t tl = tl_noted;
     if (kind != DEAD_HOST && tl > vk_sync_issued() && tl_noted_here != tl) n_cross_defer++, cross_defer_tl = tl;
     dead[ndead++] = (Dead){kind, handle, alloc, open_active ? open_b.seq : next_seq, tl};
-    if (kind != DEAD_HOST)
+    if (kind != DEAD_HOST && kind != DEAD_BUFFER_VIEW)
         rec_check_handle(kind == DEAD_VIEW ? REC_VIEW : kind == DEAD_BUFFER_VMA ? REC_BUFFER : REC_IMAGE, handle, 0, tl,
                          vk_sync_fence_done());
     plat_rmutex_unlock(&cmd_lock);
@@ -2453,6 +2457,7 @@ void vk_defer_image(VkImage img, VmaAllocation alloc) {
     if (img) defer(alloc ? DEAD_IMAGE_VMA : DEAD_IMAGE, (uint64_t)(uintptr_t)img, alloc);
 }
 void vk_defer_view(VkImageView view) { if (view) defer(DEAD_VIEW, (uint64_t)(uintptr_t)view, NULL); }
+void vk_defer_buffer_view(VkBufferView view) { if (view) defer(DEAD_BUFFER_VIEW, (uint64_t)(uintptr_t)view, NULL); }   // mlbts-native
 void vk_defer_buffer(VkBuffer buf, VmaAllocation alloc) {
     if (buf) defer(DEAD_BUFFER_VMA, (uint64_t)(uintptr_t)buf, alloc);
 }

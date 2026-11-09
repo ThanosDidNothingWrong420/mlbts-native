@@ -1455,6 +1455,15 @@ void vk_texture_range_gone(uint64_t lo, uint64_t size, VmaAllocation alloc) {
 }
 
 // ---------------------------------------------------------------- descriptor slots
+// mlbts-native: the descriptor registered at pool slot id (vk_exec_draw.c texel_view); 0 when none.
+int vk_texture_slot_desc(int id, tex_t *out) {
+    lock();
+    int ok = id >= 0 && id < ntslots && tslots[id].used;
+    if (ok) *out = tslots[id].t;
+    unlock();
+    return ok;
+}
+
 void vk_texture_register(int id, const tex_t *t, const view_t *v) {
     if (id < 0 || id >= (1 << 20)) rt_fatal("vk: texture slot %d out of range", id);
     lock();

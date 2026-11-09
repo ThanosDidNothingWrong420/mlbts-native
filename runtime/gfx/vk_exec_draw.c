@@ -27,6 +27,8 @@
 #include "nvn_hmap.h"
 #include "vk.h"
 #include "vk_exec.h"
+#include "tex.h"      // mlbts-native: TexVkFormat, tex_vk_format (texel_view)
+#include "nvn_tex.h"  // mlbts-native: nvn_fmt_bpb (texel_view)
 #include "platform/platform.h"
 #include "vk_dlaa.h"
 
@@ -1234,6 +1236,59 @@ static void feedback_written(VkExec *ex, const VkPipeState *s) {
         if (ex->color[i].image && !(ex->fb_dirty >> i & 1) && vk_pipeline_target_wmask(s, (int)i)) ex->fb_dirty |= 1u << i;
 }
 
+// mlbts-native: buffer textures and buffer images (samplerBuffer / imageBuffer). The descriptor registered at the pool
+// slot of the handle names the storage (tex_t.mem, which is its GPU address here), the element count (d.width) and the
+// format; the view covers that range of the backing buffer, resolved like a storage buffer, and an image's writes count
+// as GPU writes to it (write-back of mirrors, texture freshness). Views go to the deferred-destroy queue at once and
+// live until this submission is done. MLB's compute passes write skinned and simulated vertices through imageBuffers;
+// bound to the zero view, as TotK left them, the writes went nowhere and the close-up players' bodies drew from stale
+// data (missing or exploded).
+int vk_texture_slot_desc(int id, tex_t *out);        // vk_texture.c
+void vk_defer_buffer_view(VkBufferView view);        // vk_memory.c
+static void note_written(VkExec *ex, uint64_t addr, uint64_t n);
+static VkBufferView texel_view(VkExec *ex, uint64_t h, int written) {
+    static VkDeviceSize align;
+    VkCtx *c = vk_ctx();
+    if (!align) {
+        VkPhysicalDeviceProperties p;
+        vkGetPhysicalDeviceProperties(c->phys, &p);
+        align = p.limits.minTexelBufferOffsetAlignment ? p.limits.minTexelBufferOffsetAlignment : 16;
+    }
+    tex_t t;
+    if (!h || !vk_texture_slot_desc((int)(h & 0xfffff), &t) || t.d.target != NVN_TEXTURE_TARGET_BUFFER || !t.mem)
+        return Z.zview;
+    TexVkFormat f;
+    int bw, bh, bpb = nvn_fmt_bpb(t.d.format, &bw, &bh);
+    if (!tex_vk_format(t.d.format, &f) || f.vk == VK_FORMAT_UNDEFINED || bpb <= 0 || !t.d.width) {
+        warn_once(W_BIND, "buffer texture of format %#x: a zero view is bound", (unsigned)t.d.format);
+        return Z.zview;
+    }
+    uint64_t addr = (uint64_t)(uintptr_t)t.mem, bytes = (uint64_t)t.d.width * (uint64_t)bpb;
+    VkMemSpan sp;
+    if (!vk_mem_resolve(addr, 1, &sp) || sp.offset % align) {
+        warn_once(W_BIND, "buffer texture at %#llx is not backed or not aligned: a zero view is bound", (unsigned long long)addr);
+        return Z.zview;
+    }
+    if (bytes > sp.avail) bytes = sp.avail / (uint64_t)bpb * (uint64_t)bpb;
+    VK_MEM_USE(sp);
+    VkBufferViewCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = sp.buffer, .format = f.vk,
+                                 .offset = sp.offset, .range = bytes};
+    VkBufferView v;
+    if (!bytes || vkCreateBufferView(c->device, &ci, NULL, &v) != VK_SUCCESS) {
+        warn_once(W_BIND, "a texel buffer view (format %d, %llu bytes) could not be created: a zero view is bound",
+                  (int)f.vk, (unsigned long long)bytes);
+        return Z.zview;
+    }
+    vk_defer_buffer_view(v);
+    RS.volatile_ = 1;   // a new view each time: a kept descriptor set would name a destroyed one
+    if (written) {
+        vk_mem_gpu_wrote_shader(&sp, bytes), vk_usnap_drop(addr, bytes), vk_exec_ub_foreign(ex, addr, bytes);
+        note_written(ex, addr, bytes);
+    }
+    VK_MEM_BOUND(sp);
+    return v;
+}
+
 // mlbts-native: the texture handle a TEX resource reads, as the shader would form it: the texture word, ORed with the
 // sampler word bound at its separate sampler slot when it has one (gfx.h samp_type; Ryujinx TextureHandle
 // ReadPackedId). The texture word's own sampler bits are replaced then.
@@ -1908,10 +1963,13 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
             int img = b->kind == GFX_RES_IMG;
             if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || b->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
                 kind = 2;
-                for (uint32_t k = 0; k < cnt; k++) {   // buffer textures are not replayed yet
+                for (uint32_t k = 0; k < cnt; k++) {   // mlbts-native: texel_view (was the zero view)
+                    int slot = r->slot + (int)k;
+                    uint64_t h = img ? (slot >= 0 && slot < 32 ? ex->img[st][slot] : 0) : res_tex_handle(ex, st, r, (int)k);
+                    VkBufferView v = texel_view(ex, h, img && b->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER);
                     o[k].w[0] = 0, o[k].w[1] = 0, o[k].w[2] = 0;
-                    o[k].view = Z.zview;
-                    if (need_w) bv[nd + k] = Z.zview;
+                    o[k].view = v;
+                    if (need_w) bv[nd + k] = v;
                 }
             } else {
                 kind = 1;
