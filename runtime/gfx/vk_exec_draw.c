@@ -3120,9 +3120,20 @@ static void bind_index(VkExec *ex, const void *data, uint64_t bytes, VkIndexType
 // mlbts-native diagnosis: MLB_DRAWLOG=<frame> logs every draw of that presented frame: pass, formats, program and a
 // hash of each stage's code, blend and mask state, the fragment stage's first texture and sampler handles, and what
 // the textures resolve to (size, storage address, a byte sum of their storage). Off unless set.
+// F12 in the game window arms it for the frame after the current one (vk_drawlog_arm, from gfx_stubs.c).
+static volatile long drawlog_want = -2;
+void vk_drawlog_arm(void) {
+    long f = (long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 2;
+    __atomic_store_n(&drawlog_want, f, __ATOMIC_RELAXED);
+    rt_log("drawlog: frame %ld", f);
+}
 static void draw_note(VkExec *ex, const char *kind, int prim, int count) {
-    static long want = -2;
-    if (want == -2) { const char *e = cfg_get("MLB_DRAWLOG"); want = e ? atol(e) : -1; }
+    long want = __atomic_load_n(&drawlog_want, __ATOMIC_RELAXED);
+    if (want == -2) {
+        const char *e = cfg_get("MLB_DRAWLOG");
+        want = e ? atol(e) : -1;
+        __atomic_store_n(&drawlog_want, want, __ATOMIC_RELAXED);
+    }
     if (want < 0 || (long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1 != want) return;
     uint32_t h[2] = {0, 0};
     for (int st = 0; st < 2; st++) {

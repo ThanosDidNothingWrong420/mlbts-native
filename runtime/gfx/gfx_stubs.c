@@ -211,9 +211,22 @@ void vk_hdr_to_srgb8(const uint8_t *in, uint8_t *out, size_t px, int a2r) { (voi
 void menu_overlay_draw(VkCommandBuffer cb) { (void)cb; }
 // No overlay. mlbts-native: MLB_SHOT=<frame>[,<frame>...] saves the presented picture of those frames as
 // <profile>/shot-<frame>.png through gfx_present.c's capture path (the one TotK's menu test shots use).
+void vk_drawlog_arm(void);   // vk_exec_draw.c
 int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot) {
     (void)t;
     static char path[1100];
+    // F12 in the game window: log the next frame's draws (MLB_DRAWLOG) and save it as <profile>/shot-<frame>.png
+    static int f12_was;
+    HWND fg = GetForegroundWindow();
+    DWORD pid = 0;
+    if (fg) GetWindowThreadProcessId(fg, &pid);
+    int f12 = pid == GetCurrentProcessId() && (GetAsyncKeyState(VK_F12) & 0x8000);
+    if (f12 && !f12_was) {
+        vk_drawlog_arm();
+        snprintf(path, sizeof path, "%s/shot-%llu.png", rt_config()->profile, (unsigned long long)frame);
+        *shot = path;
+    }
+    f12_was = f12;
     const char *list = cfg_get("MLB_SHOT");
     for (const char *q = list; q && *q;) {
         char *end;

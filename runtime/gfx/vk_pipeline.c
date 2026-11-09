@@ -960,19 +960,41 @@ static int add_stage(Bindings *B, const GfxShader *s, uint32_t off) {
 
 // The first binding a module's resource variables use that the binding list b[0..n) lacks (module bindings >= 1 moved
 // by off), or -1. A reflection that misses a resource would otherwise hand the driver an invalid layout.
+// mlbts-native: only variables some instruction uses count. Ryujinx declares a constant buffer as soon as its binding is
+// asked for, and its texture-array pass asks for c2 (the handle bank) and then rewrites the reads, so some of MLB's
+// fragment shaders declare an unused c2 at binding 1 that the reflection rightly leaves out; Vulkan needs only
+// statically used resources in the layout. Those pipelines were refused and every draw with them skipped.
 static int module_binding_missing(const GfxShader *s, const VkDescriptorSetLayoutBinding *b, uint32_t n, uint32_t off) {
     uint64_t words = 0;
     const uint32_t *w = gfx_shader_spirv(s, &words);
+    uint32_t bound = w && words > 5 ? w[3] : 0;
+    uint8_t *used = bound ? calloc(bound, 1) : NULL;
+    for (uint64_t i = 5; used && i < words;) {   // ids appearing as operands outside names, decorations and declarations
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > words) break;
+        if (op != 5 && op != 6 && op != SPV_OP_DECORATE && op != 72 && op != 59)
+            for (uint32_t k = 1; k < len; k++)
+                if (w[i + k] < bound) used[w[i + k]] = 1;
+        i += len;
+    }
     for (uint64_t i = 5; w && i < words;) {
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
         if (!len || i + len > words) break;
+        if (op == SPV_OP_DECORATE && len >= 4 && w[i + 2] == SPV_DEC_BINDING && used && w[i + 1] < bound && !used[w[i + 1]]) {
+            i += len;   // declared, never used
+            continue;
+        }
         if (op == SPV_OP_DECORATE && len >= 4 && w[i + 2] == SPV_DEC_BINDING) {
             uint32_t want = w[i + 3] + (w[i + 3] >= 1 ? off : 0), j = 0;
             while (j < n && b[j].binding != want) j++;
-            if (j == n) return (int)w[i + 3];
+            if (j == n) {
+                free(used);
+                return (int)w[i + 3];
+            }
         }
         i += len;
     }
+    free(used);
     return -1;
 }
 
