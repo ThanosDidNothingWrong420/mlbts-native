@@ -691,16 +691,36 @@ static int fmt_code(const char *name) {
 
 // c2 slot of a texture or image handle (Service.cs of MNG's totk_xlate: combined handles at 0x20, 32 slots; images at
 // 0x120; separate textures at 0x168), -1 outside those ranges or for a handle in another constant buffer.
-// mlbts-native: a texture with its own sampler word (handle type 1-3 in bits 28+, gfx.h samp_type) takes its texture
-// from the separate texture range like a separate one; MLB's movie and UI shaders sample that way (Ryujinx
-// TextureHandle.ReadPackedId ORs the two words on the host). cbuf_slot is Ryujinx PackSlots: texture buffer in the low
-// 16 bits, sampler buffer + 1 above (0: the same).
-static int handle_slot(int kind, int cbuf_slot, int handle, int separate) {
+// mlbts-native: MLB samples through separate texture and sampler words (Ryujinx handle types 1-3, bits 28+; the
+// hardware ORs the two c2 words, Ryujinx TextureHandle.ReadPackedId). The two words come in the order the shader
+// read them, so either one may be the texture: each is placed by its range, separate textures at 0x168 + 8 slot,
+// separate samplers at 0x568 + 8 slot. A combined handle (type 0) read from the separate texture range is a texture
+// used without a sampler (texel fetches). cbuf_slot is Ryujinx PackSlots: texture buffer in the low 16 bits, sampler
+// buffer + 1 above (0: the same). Before this, a pair with the sampler word first, and such fetches, resolved to no
+// slot and sampled a black dummy (the in-game scene composite among them).
+static int sep_tex_slot(int bytes) { return bytes >= 0x168 && bytes < 0x568 && !((bytes - 0x168) % 8) ? (bytes - 0x168) / 8 : -1; }
+static int sep_samp_slot(int bytes) { return bytes >= 0x568 && bytes < 0x568 + 8 * 128 && !((bytes - 0x568) % 8) ? (bytes - 0x568) / 8 : -1; }
+
+static int handle_slot(int kind, int cbuf_slot, int handle, int separate, int16_t *samp_slot) {
+    *samp_slot = -1;
     if (cbuf_slot >= 0 && (cbuf_slot & 0xffff) != 2) return -1;
-    int bytes = (handle & 0x3fff) * 4;
+    int bytes = (handle & 0x3fff) * 4, type = (int)((unsigned)handle >> 28);
     if (kind == GFX_RES_IMG) return bytes >= 0x120 && bytes < 0x168 ? (bytes - 0x120) / 8 : -1;
-    if (separate || (unsigned)handle >> 28) return bytes >= 0x168 && bytes < 0x568 ? (bytes - 0x168) / 8 : -1;
-    return bytes >= 0x20 && bytes < 0x120 ? (bytes - 0x20) / 8 : -1;
+    if (type == 1 || type == 2) {
+        int sbuf = cbuf_slot < 0 ? 2 : (cbuf_slot >> 16 & 0xffff) ? (cbuf_slot >> 16 & 0xffff) - 1 : (cbuf_slot & 0xffff);
+        int other = (handle >> 14 & 0x3fff) * 4;
+        if (sbuf != 2) return sep_tex_slot(bytes);
+        if (sep_tex_slot(bytes) >= 0 && sep_samp_slot(other) >= 0) return *samp_slot = (int16_t)sep_samp_slot(other), sep_tex_slot(bytes);
+        if (sep_tex_slot(other) >= 0 && sep_samp_slot(bytes) >= 0) return *samp_slot = (int16_t)sep_samp_slot(bytes), sep_tex_slot(other);
+        return sep_tex_slot(bytes);
+    }
+    if (type == 3) {   // SeparateConstantSamplerHandle: the sampler id is the immediate (gfx.h samp_slot)
+        *samp_slot = (int16_t)(handle >> 14 & 0x3fff);
+        return sep_tex_slot(bytes);
+    }
+    if (separate) return sep_tex_slot(bytes);
+    if (bytes >= 0x20 && bytes < 0x120) return (bytes - 0x20) / 8;
+    return sep_tex_slot(bytes);
 }
 
 static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
@@ -728,17 +748,9 @@ static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
     r->handle = (uint32_t)handle;
     r->count = (uint16_t)json_int(o, e, "array", 1);
     r->separate = sep && *sep == 't';
-    r->slot = (int16_t)handle_slot(kind, r->cbuf_slot, handle, r->separate);
+    // cbuf_slot from the JSON in full: r->cbuf_slot keeps only its low byte
+    r->slot = (int16_t)handle_slot(kind, (int)json_int(o, e, "cbuf_slot", -1), handle, r->separate, &r->samp_slot);
     r->samp_type = kind == GFX_RES_TEX ? (uint8_t)((unsigned)handle >> 28) : 0;
-    r->samp_slot = -1;
-    if (r->samp_type == 3) {
-        r->samp_slot = (int16_t)(handle >> 14 & 0x3fff);
-    } else if (r->samp_type) {
-        int64_t slots = json_int(o, e, "cbuf_slot", -1);
-        int sbuf = slots < 0 ? 2 : (int)(slots >> 16 & 0xffff) ? (int)(slots >> 16 & 0xffff) - 1 : (int)(slots & 0xffff);
-        int sbytes = (handle >> 14 & 0x3fff) * 4;
-        if (sbuf == 2 && sbytes >= 0x568 && sbytes < 0x568 + 8 * 128) r->samp_slot = (int16_t)((sbytes - 0x568) / 8);
-    }
 }
 
 // SPIR-V opcodes and enumerants used below (SPIR-V 1.6 specification, section 3).

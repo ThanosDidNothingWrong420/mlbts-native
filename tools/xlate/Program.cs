@@ -46,11 +46,18 @@ static class SwshXlate
         public int QueryTextureArrayLengthFromPool() => 32;
 
         string Get(string table, int slot) => _job[table] is JsonObject t && t[slot.ToString()] is JsonNode n ? (n is JsonObject o ? (string)o["type"] : (string)n) : null;
+        // mlbts-native: with a separate sampler word (handle types 1-2) either word may be the texture, in the order the
+        // shader read them; the one in the separate texture range is (runtime/gfx/gfx_shader.c handle_slot).
         int TexSlot(int handle, int cbufSlot)
         {
-            (int off0, _, _) = TextureHandle.UnpackOffsets(handle);
-            int bytes = off0 * 4;
-            return (cbufSlot < 0 || (cbufSlot & 0xffff) == 2) && bytes >= TexBase && bytes < SampBase && (bytes - TexBase) % 8 == 0 ? (bytes - TexBase) / 8 : -1;
+            (int off0, int off1, TextureHandleType type) = TextureHandle.UnpackOffsets(handle);
+            if (!(cbufSlot < 0 || (cbufSlot & 0xffff) == 2)) return -1;
+            foreach (int off in type is TextureHandleType.SeparateSamplerHandle or TextureHandleType.SeparateSamplerId ? new[] { off0, off1 } : new[] { off0 })
+            {
+                int bytes = off * 4;
+                if (bytes >= TexBase && bytes < SampBase && (bytes - TexBase) % 8 == 0) return (bytes - TexBase) / 8;
+            }
+            return -1;
         }
         public SamplerType QuerySamplerType(int handle, int cbufSlot = -1)
         {
