@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "host.h"
+#include "nvn_api.h"
 #include "nvn_obj.h"
 #include "vk.h"
 
@@ -86,6 +87,61 @@ done:
 
 // The GPU's bytes of [addr, addr+n) (a mirror's device-local copy when the pool has one), copied through a host buffer.
 // The queue must be idle (vk_drawq_report runs after vk_capture_targets). 0 when the range is not backed.
+// Level 0 of a sampled image as the GPU holds it: byte sum and nonzero bytes (layout-independent, so comparable with the
+// guest's tiled storage) over its packed size *bytes. Images stay in GENERAL. 0 when it could not be read.
+int vk_capture_image_sum(const VkTexImage *im, uint64_t *sum, uint64_t *nz, uint64_t *bytes) {
+    VkCtx *c = vk_ctx();
+    if (!c || !im || !im->image || (im->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT) || im->samples > 1) return 0;
+    int bc8 = (im->format >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && im->format <= VK_FORMAT_BC1_RGBA_SRGB_BLOCK) ||
+              im->format == VK_FORMAT_BC4_UNORM_BLOCK || im->format == VK_FORMAT_BC4_SNORM_BLOCK;
+    int bc = im->format >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && im->format <= VK_FORMAT_BC7_SRGB_BLOCK;
+    uint64_t n = bc ? (uint64_t)((im->width + 3) / 4) * ((im->height + 3) / 4) * (bc8 ? 8 : 16)
+                    : (uint64_t)im->width * im->height * 16;   // uncompressed: an upper bound, the tail stays zero
+    if (n > (64u << 20)) return 0;
+    VkBuffer buf = VK_NULL_HANDLE;
+    VmaAllocation ba = NULL;
+    VmaAllocationInfo info;
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                  .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+    if (vmaCreateBuffer(c->vma, &bi, &ai, &buf, &ba, &info) != VK_SUCCESS || !info.pMappedData) return 0;
+    memset(info.pMappedData, 0, n);
+    VkCommandPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                  .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, .queueFamilyIndex = c->gfx_family};
+    VkCommandPool pool;
+    int ok = 0;
+    if (vkCreateCommandPool(c->device, &pi, NULL, &pool) == VK_SUCCESS) {
+        VkCommandBufferAllocateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pool,
+                                          .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+        VkCommandBuffer cb;
+        if (vkAllocateCommandBuffers(c->device, &ci, &cb) == VK_SUCCESS) {
+            VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                              .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+            vkBeginCommandBuffer(cb, &begin);
+            VkBufferImageCopy cp = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                    .imageExtent = {im->width, im->height, 1}};
+            vkCmdCopyImageToBuffer(cb, im->image, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &cp);
+            vkEndCommandBuffer(cb);
+            VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
+            vk_queue_lock();
+            VkResult r = vkQueueSubmit(c->gfx_queue, 1, &si, VK_NULL_HANDLE);
+            if (r == VK_SUCCESS) r = vkQueueWaitIdle(c->gfx_queue);
+            vk_queue_unlock();
+            if (r == VK_SUCCESS) {
+                vmaInvalidateAllocation(c->vma, ba, 0, VK_WHOLE_SIZE);
+                const uint8_t *b = info.pMappedData;
+                uint64_t s = 0, z = 0;
+                for (uint64_t i = 0; i < n; i++) s += b[i], z += b[i] != 0;
+                *sum = s, *nz = z, *bytes = n;
+                ok = 1;
+            }
+        }
+        vkDestroyCommandPool(c->device, pool, NULL);
+    }
+    vmaDestroyBuffer(c->vma, buf, ba);
+    return ok;
+}
+
 int vk_capture_read(uint64_t addr, void *out, uint32_t n) {
     VkCtx *c = vk_ctx();
     VkMemSpan sp;
@@ -127,6 +183,30 @@ int vk_capture_read(uint64_t addr, void *out, uint32_t n) {
     }
     vmaDestroyBuffer(c->vma, buf, ba);
     return ok;
+}
+
+// mlbts-native diagnosis (black heads): images the address watch keeps (vk_watch_keep) are saved as PNGs at the
+// present of the frame WK_DELAY frames after the one that armed it, once per run.
+enum { WK_DELAY = 30 };
+enum { WK_N = 10 };
+static tex_t wk[WK_N];
+static int wk_set[WK_N], wk_done;
+void vk_capture_targets(const tex_t *const *ts, int n, uint64_t frame);
+static uint64_t wk_due;
+void vk_watch_keep(const tex_t *t, int i, int arm) {
+    if (wk_done || i < 0 || i >= WK_N) return;
+    wk[i] = *t, wk_set[i] = 1;
+    if (arm) wk_due = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + WK_DELAY;
+}
+void vk_watch_frame(uint64_t frame) {
+    if (wk_done || !wk_due || frame < wk_due) return;
+    wk_done = 1;
+    const tex_t *ts[WK_N];
+    int n = 0;
+    for (int i = 0; i < WK_N; i++)
+        if (wk_set[i]) ts[n++] = &wk[i];
+    rt_log("watch: saving %d kept image(s) at frame %llu", n, (unsigned long long)frame);
+    vk_capture_targets(ts, n, frame);
 }
 
 void vk_capture_targets(const tex_t *const *ts, int n, uint64_t frame) {

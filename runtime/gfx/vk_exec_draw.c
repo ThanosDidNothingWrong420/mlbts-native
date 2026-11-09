@@ -315,7 +315,10 @@ static uint8_t *scratch(VkExec *ex, uint64_t size, VkBuffer *buf, VkDeviceSize *
 static int ub_bind(VkExec *ex, uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out);
 static void ub_written(VkExec *ex, uint64_t addr, uint64_t n);
 
+int vk_watch_hit(uint64_t a, uint64_t n);   // vk_texture.c (mlbts-native diagnosis)
 static void note_written(VkExec *ex, uint64_t addr, uint64_t size) {
+    if (vk_watch_hit(addr, size))
+        rt_log("watch: a shader writes buffer range %#llx+%#llx", (unsigned long long)addr, (unsigned long long)size);
     CbRes *r = cb_res(ex);
     for (int i = 0; i < r->nwritten; i++)
         if (r->written[i].addr == addr && r->written[i].size == size) return;
@@ -537,6 +540,33 @@ static nvn_hmap views_by_image;          // VkImage -> its first ViewNode
 
 // An image view of a registered texture for a shader resource of type `rtype` (GfxShaderRes.type); VK_NULL_HANDLE when
 // the image cannot serve it (the caller binds a stand-in). Texture lock held.
+// mlbts-native: the format of a sampled view. A view format (nvnTextureViewSetFormat) that is the image format's sRGB
+// or linear twin (the same bytes, only the decode differs) is the view's; images of colour formats are MUTABLE_FORMAT
+// (vk_texture.c create_tex). Before, sampled views always took the image's format: MLB samples its created-player face
+// atlas, an RGBA8 sRGB texture, through an RGBA8 view, and the sRGB decode darkened the faces to near black. Other
+// reinterpreting views keep the image's format, as before.
+static VkFormat srgb_twin(VkFormat f) {
+    static const VkFormat pairs[][2] = {
+        {VK_FORMAT_R8_UNORM, VK_FORMAT_R8_SRGB}, {VK_FORMAT_R8G8_UNORM, VK_FORMAT_R8G8_SRGB},
+        {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB}, {VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_SRGB},
+        {VK_FORMAT_A8B8G8R8_UNORM_PACK32, VK_FORMAT_A8B8G8R8_SRGB_PACK32},
+        {VK_FORMAT_BC1_RGB_UNORM_BLOCK, VK_FORMAT_BC1_RGB_SRGB_BLOCK}, {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_BC1_RGBA_SRGB_BLOCK},
+        {VK_FORMAT_BC2_UNORM_BLOCK, VK_FORMAT_BC2_SRGB_BLOCK}, {VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_BC3_SRGB_BLOCK},
+        {VK_FORMAT_BC7_UNORM_BLOCK, VK_FORMAT_BC7_SRGB_BLOCK}};
+    for (unsigned i = 0; i < sizeof pairs / sizeof pairs[0]; i++) {
+        if (pairs[i][0] == f) return pairs[i][1];
+        if (pairs[i][1] == f) return pairs[i][0];
+    }
+    return VK_FORMAT_UNDEFINED;
+}
+
+static VkFormat sampled_view_format(const VkTexImage *img, const view_t *v, int hv) {
+    if (!hv || !v->set_format || !(img->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) return img->format;
+    TexVkFormat b;
+    if (!tex_vk_format(v->format, &b) || b.vk != b.ideal) return img->format;
+    return b.vk != img->format && b.vk == srgb_twin(img->format) ? b.vk : img->format;
+}
+
 static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, int hv, uint16_t rtype, int storage) {
     VkImageViewType vt = res_view_type(rtype);
     int ms = (rtype & 0x200) != 0;
@@ -585,12 +615,13 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
             }
     }
     uint32_t swz = (uint32_t)sw[0] | (uint32_t)sw[1] << 8 | (uint32_t)sw[2] << 16 | (uint32_t)sw[3] << 24;
-    ViewKey k = {img->image, img->format, vt, aspect, l0, nl, y0, ny, swz};
+    VkFormat vf = storage ? img->format : sampled_view_format(img, v, hv);
+    ViewKey k = {img->image, vf, vt, aspect, l0, nl, y0, ny, swz};
     if (!view_of.klen) nvn_hm_init(&view_of, sizeof(ViewKey)), nvn_hm_init(&views_by_image, sizeof(VkImage));
     VkImageView found = (VkImageView)nvn_hm_get(&view_of, &k);
     if (found) return found;
     VkImageViewCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img->image, .viewType = vt,
-                                .format = img->format,
+                                .format = vf,
                                 .components = {swz_of(sw[0]), swz_of(sw[1]), swz_of(sw[2]), swz_of(sw[3])},
                                 .subresourceRange = {aspect, l0, nl, y0, ny}};
     VkImageViewUsageCreateInfo use = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
@@ -1335,12 +1366,14 @@ static VkBufferView texel_view(VkExec *ex, uint64_t h, int written) {
 // The texture slot element k of a TEX resource reads: slot + k, or for a handle-table array (gfx.h table) the slot of
 // c2 entry slot + k: separate textures are entries 45-172 (byte 0x168 on), combined handles entries 4-35 (0x20 on).
 static int tex_slot_of(const GfxShaderRes *r, int k) {
+    if (r->img_handle) return -1;   // an image slot (res_tex_handle)
     if (!r->table) return r->slot + k;
     int e = r->slot + k;
     return e >= 45 && e < 173 ? e - 45 : e >= 4 && e < 36 ? e - 4 : -1;
 }
 
 static uint64_t res_tex_handle(const VkExec *ex, int st, const GfxShaderRes *r, int k) {
+    if (r->img_handle) return r->slot + k >= 0 && r->slot + k < 32 ? ex->img[st][r->slot + k] : 0;
     int slot = tex_slot_of(r, k);
     uint64_t h = slot >= 0 && slot < 128 ? ex->tex[st][slot] : 0;
     if (!h || !r->samp_type) return h;
@@ -1402,6 +1435,7 @@ static void tex_info_lookup(VkExec *ex, const GfxShaderRes *r, uint64_t h, int s
                       .separate = (uint8_t)separate, .valid = 1, .image = image, .out = *out};
 }
 
+static int watch_dispatch;   // mlbts-native: the dispatch being bound stores into the watched range (vk_watch_hit)
 static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage, int separate,
                           VkDescriptorImageInfo *out, VkImage *image) {
     int ms = (r->type & 0x200) != 0;
@@ -1414,7 +1448,10 @@ static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int sto
         int hv;
         const VkTexImage *img = vk_texture_by_id_locked((int)(h & 0xfffff), &v, &hv);
         if (img) view = get_view(ex, img, &v, hv, r->type, storage), *image = img->image;
-        if (img && storage) vk_texture_storage_bound_locked(img);
+        if (img && storage) vk_texture_storage_bound_locked(img, (r->flags & 4) != 0);   // 4: image store
+        if (img && storage && (r->flags & 4) && vk_watch_hit(img->addr, 1))
+            watch_dispatch = 1, rt_log("watch:   storage view b%d: base level %u of %u", (int)r->binding,
+                                       hv && v.set_levels ? v.base_level : 0, img->levels);
         if (img && !storage && ex->nfbl && in_fbl(ex, img->image)) layout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
         if (!storage && !separate) {
             // A depth texture sampled without a compare reads one texel on the Switch, whatever the sampler's filter:
@@ -1837,6 +1874,8 @@ static const RsList *rs_list(const VkExec *ex, const VkPipeInfo *info) {
                 for (uint32_t k = 0; k < cnt; k++) {
                     int slot = img ? r->slot + (int)k : tex_slot_of(r, (int)k);   // mlbts-native: handle tables
                     if (slot >= 0 && slot < cap) rs_add(tmp, &n, ex, img ? &ex->img[st][slot] : &ex->tex[st][slot], 8);
+                    else if (!img && r->img_handle && r->slot + (int)k >= 0 && r->slot + (int)k < 32)
+                        rs_add(tmp, &n, ex, &ex->img[st][r->slot + (int)k], 8);   // a size query of a bound image
                 }
                 // mlbts-native: a separate sampler word is read too (res_tex_handle)
                 if (!img && (r->samp_type == 1 || r->samp_type == 2) && r->samp_slot >= 0 && r->samp_slot < 128) {
@@ -3282,6 +3321,9 @@ static struct { uint64_t addr; uint32_t stride, fmt; } dq_a0[DQ_N];
 // memory, then this submission's updates so far) and its storage buffers 0-3, so a draw that wrote nothing can be set
 // against a draw of the same object that did (same bone palette, storage buffer 1).
 static struct { float c[3][16]; uint64_t vss[4]; } dq_vs[DQ_N];
+// A face draw's fragment textures (pool slot ids, bindings): their contents are compared in vk_drawq_report.
+static struct { uint32_t id[24]; uint8_t bind[24], n; } dq_ft[DQ_N];
+int vk_capture_image_sum(const VkTexImage *im, uint64_t *sum, uint64_t *nz, uint64_t *bytes);   // vk_capture.c
 
 static void dq_cb_now(const VkExec *ex, const p_bind_buf *u, float out[16]) {
     memset(out, 0, 64);
@@ -3391,10 +3433,8 @@ static void dq_vs_log(uint32_t q, uint64_t samples) {
 void vk_drawq_report(void) {
     if (!dq_n || dq_state <= 0) return;
     VkDevice dev = vk_ctx()->device;
-    static uint64_t res[DQ_N][2];
-    if (vkGetQueryPoolResults(dev, dq_pool, 0, dq_n, sizeof res, res, sizeof res[0],
-                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) < 0)
-        memset(res, 0, sizeof res);
+    static uint64_t res[DQ_N][2];   // filled from the reads below (one read of all, taken first, found most not ready)
+    memset(res, 0, sizeof res);
     rt_log("drawq: %u draws queried; samples passed per query, 16 a line", dq_n);
     for (uint32_t i = 0; i < dq_n; i += 16) {
         uint64_t v[32];
@@ -3404,11 +3444,47 @@ void vk_drawq_report(void) {
         if (vkGetQueryPoolResults(dev, dq_pool, i, n, sizeof v, v, 2 * sizeof v[0],
                                   VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) < 0)
             n = 0;
-        for (uint32_t k = 0; k < n; k++)
+        for (uint32_t k = 0; k < n; k++) {
             o += snprintf(line + o, sizeof line - o, v[2 * k + 1] ? " %llu" : " ?", (unsigned long long)v[2 * k]);
+            res[i + k][0] = v[2 * k], res[i + k][1] = v[2 * k + 1];
+        }
         rt_log("%s", line);
         for (uint32_t k = 0; k < n; k++)
             if (v[2 * k + 1] && !v[2 * k]) dq_peek(i + k);
+    }
+    for (uint32_t q = 0; q < dq_n; q++) {
+        if (!res[q][0] || dq_a0[q].fmt != 0x2e || dq_a0[q].stride != 16) continue;
+        float pz[4];
+        if (vk_capture_read(dq_a0[q].addr, pz, 16)) {   // where the face is on screen
+            const float *m = dq_vs[q].c[0];
+            float cx = pz[0] * m[0] + pz[1] * m[4] + pz[2] * m[8] + m[12],
+                  cy = pz[0] * m[1] + pz[1] * m[5] + pz[2] * m[9] + m[13],
+                  cw = pz[0] * m[3] + pz[1] * m[7] + pz[2] * m[11] + m[15];
+            rt_log("drawq   q %u face at ndc %.3f %.3f (w %.2f) samples %llu", q, cw ? cx / cw : 0, cw ? cy / cw : 0, cw,
+                   (unsigned long long)res[q][0]);
+        }
+        for (int t = 0; t < dq_ft[q].n; t++) {   // CPU-written textures up to 512x512: GPU image vs guest storage
+            view_t v;
+            int hv;
+            const VkTexImage *im = vk_texture_by_id((int)dq_ft[q].id[t], &v, &hv);
+            if (!im) {
+                rt_log("drawq   q %u tex b%u id %#x: unresolved", q, (unsigned)dq_ft[q].bind[t], dq_ft[q].id[t]);
+                continue;
+            }
+            if (!im->mirrored || im->width > 512 || im->height > 512) continue;
+            uint64_t gs = 0, gz = 0, n = 0, cs = 0, cz = 0;
+            if (!vk_capture_image_sum(im, &gs, &gz, &n)) {
+                rt_log("drawq   q %u tex b%u id %#x: image not readable", q, (unsigned)dq_ft[q].bind[t], dq_ft[q].id[t]);
+                continue;
+            }
+            const uint8_t *g = (const uint8_t *)(uintptr_t)im->addr;
+            if (plat_mem_readable(im->addr, n))
+                for (uint64_t k = 0; k < n; k++) cs += g[k], cz += g[k] != 0;
+            rt_log("drawq   q %u tex b%u %ux%u vkfmt %d addr %#llx: gpu sum %llu nonzero %llu / %llu bytes; guest sum %llu nonzero %llu",
+                   q, (unsigned)dq_ft[q].bind[t], im->width, im->height, (int)im->format, (unsigned long long)im->addr,
+                   (unsigned long long)gs, (unsigned long long)gz, (unsigned long long)n, (unsigned long long)cs,
+                   (unsigned long long)cz);
+        }
     }
     // Draws with a stride-16 RGBA32F position (MLB's face meshes, positions from a compute pass) that wrote nothing,
     // and every draw sharing their storage buffer 1: vertex constants, bones, first vertices.
@@ -3431,9 +3507,106 @@ void vk_drawq_report(void) {
     dq_n = 0;
 }
 
+// mlbts-native diagnosis (black heads): a draw into a watched render target (vk_watch_hit), with what its fragment
+// shader reads; the textures of the first such draw are kept for the watch's PNGs (vk_capture.c vk_watch_keep).
+static void watch_draw(VkExec *ex, const char *kind, int count) {
+    int hit = -1;
+    for (uint32_t i = 0; i < ex->pass_ncolor && i < 8; i++)
+        if (ex->color[i].tex && ex->color[i].tex->mem &&
+            vk_watch_hit((uint64_t)(uintptr_t)ex->color[i].tex->mem, ex->color[i].tex->L.size)) {
+            hit = (int)i;
+            break;
+        }
+    if (hit < 0) return;
+    static int kept;
+    uint32_t h[2] = {0, 0};
+    for (int st = 0; st < 2; st++) {
+        const uint8_t *ctl, *code; uint32_t len;
+        if (ex->prog && find_stage(ex->prog, st, &ctl, &code, &len)) {
+            uint32_t x = 2166136261u;
+            for (uint32_t i = 0; i < len; i++) x = (x ^ code[i]) * 16777619u;
+            h[st] = x;
+        }
+    }
+    const tex_t *ct = ex->color[hit].tex;
+    rt_log("watch: draw %s count %d into target %d at %#llx (nvn fmt %#x %ux%u level %u, view fmt %d) prog %llu vs %08x "
+           "fs %08x; blend en %u src %u/%u dst %u/%u op %u/%u chmask %#x; targets %u",
+           kind, count, hit, (unsigned long long)(uintptr_t)ct->mem, (unsigned)ct->d.format, (unsigned)ct->d.width,
+           (unsigned)ct->d.height, ex->color[hit].level, ex->pipe.color_fmt[hit],
+           (unsigned long long)(ex->prog ? ex->prog->serial : 0), h[0], h[1], (unsigned)ex->pipe.color.blend_en,
+           (unsigned)ex->pipe.blend[hit].src_rgb, (unsigned)ex->pipe.blend[hit].src_a, (unsigned)ex->pipe.blend[hit].dst_rgb,
+           (unsigned)ex->pipe.blend[hit].dst_a, (unsigned)ex->pipe.blend[hit].eq_rgb, (unsigned)ex->pipe.blend[hit].eq_a,
+           ex->pipe.chmask.mask, ex->pass_ncolor);
+    if (!B.st_valid || !B.st.fs) {
+        rt_log("watch:   no fragment shader state");
+        return;
+    }
+    const GfxShaderRes *tr;
+    int nt = gfx_shader_resources(B.st.fs, GFX_RES_TEX, &tr);
+    for (int i = 0; i < nt; i++) {
+        uint64_t th = res_tex_handle(ex, NVN_STAGE_FS, &tr[i], 0);
+        view_t v;
+        int hv;
+        const VkTexImage *im = th ? vk_texture_by_id((int)(th & 0xfffff), &v, &hv) : NULL;
+        tex_t t;
+        uint64_t nz = 0, n = 0, sum[4] = {0};
+        int got = im && vk_texture_slot_desc((int)(th & 0xfffff), &t) && t.mem;
+        if (got) {
+            n = t.L.size < (4u << 20) ? t.L.size : (4u << 20);
+            for (uint64_t b = 0; b < n; b++) nz += t.mem[b] != 0, sum[b & 3] += t.mem[b];
+            if (!kept && 2 + i < 10) {
+                void vk_watch_keep(const tex_t *t, int i, int arm);   // vk_capture.c
+                vk_watch_keep(&t, 2 + i, 0);
+            }
+        }
+        const uint8_t *sw = hv && v.set_swizzle ? v.swz : im ? im->swz : (const uint8_t *)"\0\0\0\0";
+        rt_log("watch:   fs tex b%d slot %d type %#x: h %#llx%s nvn fmt %#x view fmt %#x %ux%u vkfmt %d lv %u swz %u%u%u%u "
+               "addr %#llx mir %u gpu %u; storage %llu of %llu bytes non-zero, byte sums by offset mod 4 %llu %llu %llu %llu",
+               (int)tr[i].binding, (int)tr[i].slot, (unsigned)tr[i].type, (unsigned long long)th, im ? "" : " unresolved",
+               got ? (unsigned)t.d.format : 0, hv && v.set_format ? (unsigned)v.format : 0, im ? im->width : 0,
+               im ? im->height : 0, im ? (int)im->format : 0, im ? im->levels : 0, sw[0], sw[1], sw[2], sw[3],
+               im ? (unsigned long long)im->addr : 0ull, im ? im->mirrored : 0, im ? im->gpu_owned : 0,
+               (unsigned long long)nz, (unsigned long long)n, (unsigned long long)sum[0], (unsigned long long)sum[1],
+               (unsigned long long)sum[2], (unsigned long long)sum[3]);
+    }
+    kept = 1;
+    const GfxShaderRes *ur;
+    int nu = gfx_shader_resources(B.st.fs, GFX_RES_UBO, &ur);
+    for (int i = 0; i < nu; i++) {
+        int sl = ur[i].slot;
+        if (sl < 0 || sl >= 16) continue;
+        const p_bind_buf *b = &ex->ubo[NVN_STAGE_FS][sl];
+        char hex[3 * 128 + 1] = {0};
+        VkMemSpan sp;
+        if (b->addr && vk_mem_resolve(b->addr, 128, &sp))
+            for (int k = 0; k < 128; k++) snprintf(hex + 3 * k, 4, "%02x ", ((const uint8_t *)(uintptr_t)b->addr)[k]);
+        rt_log("watch:   fs ubo c%d %#llx+%#llx: %s", sl, (unsigned long long)b->addr, (unsigned long long)b->size, hex);
+    }
+}
+
 static void draw_note(VkExec *ex, const char *kind, int prim, int count) {
+    watch_draw(ex, kind, count);
     if (!drawlog_now()) return;
     int q = dq_begin(ex);
+    if (q >= 0 && dq_a0[q].fmt == 0x2e && dq_a0[q].stride == 16 && B.st_valid && B.st.fs) {
+        // mlbts-native: a face draw (positions from the face skinning pass): every texture its fragment shader reads,
+        // resolved as the binding resolves it (black heads: which one differs between players).
+        const GfxShaderRes *tr;
+        int nt = gfx_shader_resources(B.st.fs, GFX_RES_TEX, &tr);
+        dq_ft[q].n = 0;
+        for (int i = 0; i < nt; i++) {
+            uint64_t h = res_tex_handle(ex, NVN_STAGE_FS, &tr[i], 0);
+            if (h && dq_ft[q].n < 24) dq_ft[q].id[dq_ft[q].n] = (uint32_t)(h & 0xfffff), dq_ft[q].bind[dq_ft[q].n++] = (uint8_t)tr[i].binding;
+            view_t v;
+            int hv;
+            const VkTexImage *im = h ? vk_texture_by_id((int)(h & 0xfffff), &v, &hv) : NULL;
+            rt_log("drawlog   q %d fstex b%d slot %d type %#x: h %#llx%s %ux%u vkfmt %d lv %u addr %#llx mir %u gpu %u",
+                   q, (int)tr[i].binding, (int)tr[i].slot, (unsigned)tr[i].type, (unsigned long long)h,
+                   im ? "" : " unresolved", im ? im->width : 0, im ? im->height : 0, im ? (int)im->format : 0,
+                   im ? im->levels : 0, im ? (unsigned long long)im->addr : 0ull, im ? im->mirrored : 0,
+                   im ? im->gpu_owned : 0);
+        }
+    }
     uint32_t h[2] = {0, 0};
     for (int st = 0; st < 2; st++) {
         const uint8_t *ctl, *code; uint32_t len;
@@ -3662,6 +3835,55 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     twin_dispatch = 1;
     bind_resources(ex, info);
     twin_dispatch = 0;
+    if (watch_dispatch) {   // mlbts-native: what a dispatch storing into the watched range reads
+        watch_dispatch = 0;
+        const uint8_t *ctl, *code;
+        uint32_t len, h32 = 2166136261u;
+        if (find_stage(ex->prog, NVN_STAGE_CS, &ctl, &code, &len))
+            for (uint32_t i = 0; i < len; i++) h32 = (h32 ^ code[i]) * 16777619u;
+        rt_log("watch: dispatch %dx%dx%d prog %llu cs %08x stores into the watched range", d->x, d->y, d->z,
+               (unsigned long long)ex->prog->serial, h32);
+        const GfxShaderRes *tr;
+        int nt = gfx_shader_resources(cs, GFX_RES_TEX, &tr);
+        for (int i = 0; i < nt; i++) {
+            uint64_t h = res_tex_handle(ex, NVN_STAGE_CS, &tr[i], 0);
+            view_t v;
+            int hv;
+            const VkTexImage *im = h ? vk_texture_by_id((int)(h & 0xfffff), &v, &hv) : NULL;
+            tex_t t;
+            uint64_t nz = 0, n = 0;
+            if (im && vk_texture_slot_desc((int)(h & 0xfffff), &t) && t.mem) {
+                void vk_watch_keep(const tex_t *t, int i, int arm);   // vk_capture.c
+                if (!tr[i].img_handle) vk_watch_keep(&t, 0, 0);       // the image the dispatch reads
+                n = t.L.size < (4u << 20) ? t.L.size : (4u << 20);
+                for (uint64_t b = 0; b < n; b++) nz += t.mem[b] != 0;
+            }
+            rt_log("watch:   tex b%d slot %d type %#x: h %#llx%s nvn fmt %#x %ux%u vkfmt %d lv %u addr %#llx mir %u gpu %u; "
+                   "storage %llu of %llu bytes non-zero",
+                   (int)tr[i].binding, (int)tr[i].slot, (unsigned)tr[i].type, (unsigned long long)h,
+                   im ? "" : " unresolved", im ? (unsigned)t.d.format : 0, im ? im->width : 0, im ? im->height : 0,
+                   im ? (int)im->format : 0, im ? im->levels : 0, im ? (unsigned long long)im->addr : 0ull,
+                   im ? im->mirrored : 0, im ? im->gpu_owned : 0, (unsigned long long)nz, (unsigned long long)n);
+        }
+        const GfxShaderRes *ur;
+        int nu = gfx_shader_resources(cs, GFX_RES_UBO, &ur);
+        for (int i = 0; i < nu; i++) {
+            int sl = ur[i].slot;
+            if (sl < 0 || sl >= 16) continue;
+            const p_bind_buf *b = &ex->ubo[NVN_STAGE_CS][sl];
+            char hex[3 * 64 + 1] = {0};
+            VkMemSpan sp;
+            if (b->addr && vk_mem_resolve(b->addr, 64, &sp))
+                for (int k = 0; k < 64; k++)
+                    snprintf(hex + 3 * k, 4, "%02x ", ((const uint8_t *)(uintptr_t)b->addr)[k]);
+            rt_log("watch:   ubo c%d %#llx+%#llx: %s", sl, (unsigned long long)b->addr, (unsigned long long)b->size, hex);
+        }
+        const GfxShaderRes *sr;
+        int ns = gfx_shader_resources(cs, GFX_RES_SSBO, &sr);
+        for (int i = 0; i < ns; i++)
+            rt_log("watch:   ssbo slot %d cbuf c%d+%#x flags %u", (int)sr[i].slot, (int)sr[i].cbuf_slot,
+                   (unsigned)sr[i].handle, (unsigned)sr[i].flags);
+    }
     VkPassMark *m = dispatch_mark(ex, cs, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     vkCmdDispatch(ex->cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     vk_pass_mark_end(ex->cb, m);
@@ -3692,6 +3914,7 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     B.c0_valid[2] = 0;   // a fresh c0 range: the copy below must not change one an earlier dispatch reads
     twin_dispatch = 1;
     bind_resources(ex, info);
+    if (watch_dispatch) watch_dispatch = 0, rt_log("watch: an indirect dispatch (prog %llu) stores into the watched range", (unsigned long long)ex->prog->serial);
     twin_dispatch = 0;
     if (B.c0_valid[2]) {   // the shader binds c0
         VkBufferCopy cp = {ip.offset, B.c0_off[2] + 0x200, sizeof(VkDispatchIndirectCommand)};

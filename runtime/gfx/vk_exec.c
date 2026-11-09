@@ -66,7 +66,9 @@ void vk_exec_frame_written(const tex_t *t) {
 }
 
 void vk_capture_targets(const tex_t *const *ts, int n, uint64_t frame);   // vk_capture.c
+void vk_watch_frame(uint64_t frame);   // vk_capture.c
 void vk_exec_frame_log(const tex_t *p, uint64_t frame) {
+    vk_watch_frame(frame);
     VkExecFrame *f = &vk_exec_frame;
     long cap = vk_drawlog_frame();
     if (cap >= 0 && (uint64_t)cap == frame) {   // mlbts-native: the capture frame's render targets as PNGs

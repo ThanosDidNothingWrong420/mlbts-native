@@ -759,6 +759,13 @@ static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
     r->separate = sep && *sep == 't';
     // cbuf_slot from the JSON in full: r->cbuf_slot keeps only its low byte
     r->slot = (int16_t)handle_slot(kind, (int)json_int(o, e, "cbuf_slot", -1), handle, r->separate, &r->samp_slot);
+    // mlbts-native: a combined texture handle read from the image range (Maxwell: an image handle is a texture pool id,
+    // and a TXQ on it reads the image's size). Before, it resolved to no slot and read a dummy's size, 0x0: MLB's BC7
+    // encoder then wrote zero blocks and created players' faces were black.
+    int hb = (handle & 0x3fff) * 4, cs = (int)json_int(o, e, "cbuf_slot", -1);
+    if (kind == GFX_RES_TEX && r->slot < 0 && !((unsigned)handle >> 28) && (cs < 0 || (cs & 0xffff) == 2) &&
+        hb >= 0x120 && hb < 0x168 && !((hb - 0x120) % 8))
+        r->img_handle = 1, r->slot = (int16_t)((hb - 0x120) / 8);
     int entry = table_entry(kind, (int)json_int(o, e, "cbuf_slot", -1), handle, r->count);
     if (entry >= 0 && r->slot < 0) r->table = 1, r->slot = (int16_t)entry;
     r->samp_type = kind == GFX_RES_TEX ? (uint8_t)((unsigned)handle >> 28) : 0;

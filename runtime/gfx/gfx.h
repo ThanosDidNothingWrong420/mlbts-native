@@ -111,6 +111,9 @@ typedef struct {
     // mlbts-native: a texture array read from the c2 handle table (Ryujinx BindlessToArray): element k is c2 entry
     // slot + k (8 bytes each from c2 byte 0), not texture slot slot + k (vk_exec_draw.c tex_slot_of)
     uint8_t table;
+    // mlbts-native: TEX whose handle is an image slot's c2 word (0x120 + 8 slot): a size query of a bound image (MLB's
+    // BC7 encoder of created-player faces asks the size of the level it writes). slot is that image slot.
+    uint8_t img_handle;
 } GfxShaderRes;
 typedef struct { uint8_t type, comps, packed; } GfxShaderIo;   // GFX_TYPE_*, components, 1 with a Component decoration
 int gfx_shader_stage(const GfxShader *s);                   // GFX_STAGE_VS, GFX_STAGE_FS or GFX_STAGE_CS

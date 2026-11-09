@@ -1221,6 +1221,13 @@ NVN_API(nvnCommandBufferCopyTextureToTexture) {
     o->sr = *(const NVNcopyRegion *)arg_p(c, 3);
     o->dr = *(const NVNcopyRegion *)arg_p(c, 6);
     o->flags = (int)arg_x(c, 7);
+    static volatile int32_t n;   // mlbts-native diagnosis (black faces): the first 400 copies
+    if (plat_inc32(&n) <= 400 && o->src && o->dst)
+        rt_log("texels: CopyTextureToTexture %#llx fmt %#x %ux%u -> %#llx fmt %#x %ux%u, region %dx%d at %d,%d -> %dx%d at %d,%d flags %#x",
+               (unsigned long long)(uintptr_t)o->src->mem, (unsigned)o->src->d.format, (unsigned)o->src->d.width,
+               (unsigned)o->src->d.height, (unsigned long long)(uintptr_t)o->dst->mem, (unsigned)o->dst->d.format,
+               (unsigned)o->dst->d.width, (unsigned)o->dst->d.height, o->sr.width, o->sr.height, o->sr.xoffset,
+               o->sr.yoffset, o->dr.width, o->dr.height, o->dr.xoffset, o->dr.yoffset, o->flags);
 }
 // void nvnCommandBufferDownsample(NVNcommandBuffer *cmd, const NVNtexture *src, const NVNtexture *dst): level 0 of src
 // into level 0 of dst, whole extents, filtered. Recorded as a linear-filter texture copy: copy_t2t resolves a

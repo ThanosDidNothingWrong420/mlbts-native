@@ -697,7 +697,10 @@ static void stamp_range(uint64_t lo, uint64_t hi, uint32_t g) {
     for (uint64_t a = lo; a < hi; a += 1ull << GEN_PAGE_SHIFT) stamp_page(a, g);
 }
 
+int vk_watch_hit(uint64_t a, uint64_t n);   // vk_texture.c (mlbts-native diagnosis)
 void vk_guest_written(uint64_t addr, uint64_t size) {
+    if (vk_watch_hit(addr, size))
+        rt_log("watch: guest wrote %#llx+%#llx (flush or write notice)", (unsigned long long)addr, (unsigned long long)size);
     if (!size || nvn_gpu_only(addr)) return;
     uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
     plat_mutex_lock(&gen_lock);

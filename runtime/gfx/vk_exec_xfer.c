@@ -482,6 +482,12 @@ static void copy_b2b(VkExec *ex, const p_copy_b2b *p) {
     if (vk_drawlog_now())   // mlbts-native: drawlog frame
         rt_log("drawlog copybuf %#llx -> %#llx +%#llx", (unsigned long long)p->src, (unsigned long long)p->dst,
                (unsigned long long)p->size);
+    {
+        int vk_watch_hit(uint64_t a, uint64_t n);   // vk_texture.c (mlbts-native diagnosis)
+        if (vk_watch_hit(p->dst, p->size))
+            rt_log("watch: buffer copy %#llx -> %#llx +%#llx", (unsigned long long)p->src, (unsigned long long)p->dst,
+                   (unsigned long long)p->size);
+    }
     uint64_t src = p->src, dst = p->dst, left = p->size;
     int started = 0;
     while (left) {

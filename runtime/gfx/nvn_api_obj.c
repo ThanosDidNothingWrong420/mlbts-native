@@ -298,6 +298,20 @@ static void texel_strides(const tex_t *o, const NVNcopyRegion *r, uint64_t *row,
     if (!*img) *img = *row * hb;
     if (*row < wb || *img < *row * hb) rt_fatal("nvn: %s: stride smaller than the region", what);
 }
+// mlbts-native diagnosis (black faces): ReadTexels / WriteTexels calls, the first 400 of each kind: texture storage,
+// format and size, region, and the byte sum of the texels moved.
+static void texels_log(const char *what, const tex_t *o, const NVNcopyRegion *r, const uint8_t *p, uint64_t row,
+                       uint64_t img) {
+    static volatile int32_t n[2];
+    if (plat_inc32(&n[what[0] == 'W']) > 400) return;
+    uint64_t bytes = img * (uint64_t)(r->depth > 0 ? r->depth : 1), sum = 0, nz = 0;
+    if (bytes > (16u << 20)) bytes = 16u << 20;
+    for (uint64_t i = 0; p && i < bytes; i++) sum += p[i], nz += p[i] != 0;
+    rt_log("texels: %s storage %#llx fmt %#x %ux%u target %d, region %d,%d,%d %dx%dx%d row %llu: sum %llu nonzero %llu of %llu",
+           what, (unsigned long long)(uintptr_t)o->mem, (unsigned)o->d.format, (unsigned)o->d.width, (unsigned)o->d.height,
+           (int)o->d.target, r->xoffset, r->yoffset, r->zoffset, r->width, r->height, r->depth, (unsigned long long)row,
+           (unsigned long long)sum, (unsigned long long)nz, (unsigned long long)bytes);
+}
 // void nvnTextureReadTexels[Strided](const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, void *dst
 // [, ptrdiff_t row, ptrdiff_t img])
 static void read_texels(Cpu *c, int strided) {
@@ -307,6 +321,7 @@ static void read_texels(Cpu *c, int strided) {
     texel_strides(o, r, &row, &img, "ReadTexels");
     NVN_BLOCKING();
     gfx_backend()->read_texels(o, arg_p(c, 1), r, arg_p(c, 3), row, img);
+    texels_log("ReadTexels", o, r, arg_p(c, 3), row, img);
 }
 // void nvnTextureWriteTexels[Strided](const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, const void
 // *src[, ptrdiff_t row, ptrdiff_t img])
@@ -318,6 +333,7 @@ static void write_texels(Cpu *c, int strided) {
     texel_strides(o, r, &row, &img, "WriteTexels");
     if (v && v->set_format && v->format != o->d.format) rt_fatal("nvn: WriteTexels: format-reinterpreting view not supported");
     NVN_BLOCKING();
+    texels_log("WriteTexels", o, r, arg_p(c, 3), row, img);
     gfx_backend()->write_texels(o, v, r, arg_p(c, 3), row, img);
 }
 NVN_API(nvnTextureReadTexels) { read_texels(c, 0); }
