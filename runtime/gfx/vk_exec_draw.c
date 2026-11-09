@@ -15,6 +15,7 @@
 // 9365-9488, 9489-9921, 10013-10079 @ b75be8cf (MIT, Copyright (c) 2026 jhaizhou); the uniform-buffer spans, texture and
 // sampler descriptor lookups and the dispatch flow follow LAS Recomp runtime/nvn/vulkan/exec.c:1851-1908, 2300-2516
 // @ da35b83a (MIT, Copyright (c) 2026 Peiikai). The support buffer layout is Ryujinx's SupportBuffer.cs (MIT).
+#include <math.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -562,8 +563,11 @@ static VkFormat srgb_twin(VkFormat f) {
 
 static VkFormat sampled_view_format(const VkTexImage *img, const view_t *v, int hv) {
     if (!hv || !v->set_format || !(img->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) return img->format;
+    // The host formats decide: an ASTC texture decoded to RGBA8 sRGB, viewed as linear ASTC (decoded to RGBA8 UNORM),
+    // is the same case (MLB's RTTS room: material maps of ASTC sRGB storage sampled linear; decoded as sRGB they were
+    // darker, the surfaces smoother and more metallic, and the room a mirror once its reflection probe had content).
     TexVkFormat b;
-    if (!tex_vk_format(v->format, &b) || b.vk != b.ideal) return img->format;
+    if (!tex_vk_format(v->format, &b) || b.depth || b.stencil || b.expand_rgb) return img->format;
     return b.vk != img->format && b.vk == srgb_twin(img->format) ? b.vk : img->format;
 }
 
@@ -3316,13 +3320,13 @@ static uint32_t dq_n;         // queries begun in the drawlog frame
 static int dq_open = -1;
 // Each query's draw: where its attribute 0 comes from (stream address + attribute offset), the stride and format, so
 // vk_drawq_report can show the first vertices of a draw that wrote nothing (end-of-frame contents).
-static struct { uint64_t addr; uint32_t stride, fmt; } dq_a0[DQ_N];
+static struct { uint64_t addr, size; uint32_t stride, fmt; } dq_a0[DQ_N];
 // And the vertex stage's c3..c5 (first 16 words, as the replay binds them at the draw: the submit's snapshot or guest
 // memory, then this submission's updates so far) and its storage buffers 0-3, so a draw that wrote nothing can be set
 // against a draw of the same object that did (same bone palette, storage buffer 1).
 static struct { float c[3][16]; uint64_t vss[4]; } dq_vs[DQ_N];
 // A face draw's fragment textures (pool slot ids, bindings): their contents are compared in vk_drawq_report.
-static struct { uint32_t id[24]; uint8_t bind[24], n; } dq_ft[DQ_N];
+static struct { uint32_t id[24]; uint8_t bind[24], n, save; } dq_ft[DQ_N];
 int vk_capture_image_sum(const VkTexImage *im, uint64_t *sum, uint64_t *nz, uint64_t *bytes);   // vk_capture.c
 
 static void dq_cb_now(const VkExec *ex, const p_bind_buf *u, float out[16]) {
@@ -3365,6 +3369,7 @@ static int dq_begin(VkExec *ex) {
     dq_a0[dq_n].addr = on && ex->vbuf[va.stream & 15].address ? ex->vbuf[va.stream & 15].address + va.offset : 0;
     dq_a0[dq_n].stride = on ? ex->pipe.vstream[va.stream & 15].stride : 0;
     dq_a0[dq_n].fmt = on ? va.fmt : 0;
+    dq_a0[dq_n].size = on && ex->vbuf[va.stream & 15].size > va.offset ? ex->vbuf[va.stream & 15].size - va.offset : 0;
     for (int k = 0; k < 3; k++) dq_cb_now(ex, &ex->ubo[NVN_STAGE_VS][k], dq_vs[dq_n].c[k]);
     for (int k = 0; k < 4; k++) dq_vs[dq_n].vss[k] = ex->ssbo[NVN_STAGE_VS][k].addr;
     return (int)dq_n++;
@@ -3374,6 +3379,11 @@ int vk_drawlog_now(void) { return drawlog_now(); }
 
 // The first four vertices' attribute 0 of a draw that wrote no pixel: as floats (RGBA32F 0x2e, RGB32F 0x22, RGBA16F
 // 0x29) and the first words raw.
+int cmpf(const void *a, const void *b) {
+    float x = *(const float *)a, y = *(const float *)b;
+    return x < y ? -1 : x > y;
+}
+
 static void dq_peek(uint32_t q) {
     uint64_t a = dq_a0[q].addr;
     uint32_t st = dq_a0[q].stride ? dq_a0[q].stride : 16, f = dq_a0[q].fmt;
@@ -3486,6 +3496,83 @@ void vk_drawq_report(void) {
                    (unsigned long long)cz);
         }
     }
+    for (uint32_t q = 0, shown = 0; q < dq_n && shown < 96; q++) {   // mlbts-native: compute-skinned positions
+        if (!res[q][0] || dq_a0[q].fmt != 0x2e || dq_a0[q].stride < 16 || !dq_a0[q].addr || !dq_a0[q].size) continue;
+        uint32_t st = dq_a0[q].stride, nv = (uint32_t)(dq_a0[q].size / st);
+        if (nv > 65536) nv = 65536;
+        uint8_t *b = malloc((size_t)nv * st);
+        float *ax[3] = {malloc(nv * sizeof(float)), malloc(nv * sizeof(float)), malloc(nv * sizeof(float))};
+        if (!b || !ax[0] || !ax[1] || !ax[2] || !vk_capture_read(dq_a0[q].addr, b, nv * st)) {
+            rt_log("drawq   q %u positions %#llx: not readable", q, (unsigned long long)dq_a0[q].addr);
+            free(b), free(ax[0]), free(ax[1]), free(ax[2]);
+            continue;
+        }
+        shown++;
+        uint32_t zero = 0, bad = 0, nf = 0;
+        for (uint32_t i = 0; i < nv; i++) {
+            float x[3];
+            memcpy(x, b + (size_t)i * st, 12);
+            if (x[0] == 0 && x[1] == 0 && x[2] == 0) { zero++; continue; }
+            if (!(x[0] == x[0] && x[1] == x[1] && x[2] == x[2]) || x[0] * x[0] > 1e12f || x[1] * x[1] > 1e12f ||
+                x[2] * x[2] > 1e12f) { bad++; continue; }
+            for (int k = 0; k < 3; k++) ax[k][nf] = x[k];
+            nf++;
+        }
+        float med[3] = {0}, mx = 0;
+        for (int k = 0; k < 3 && nf; k++) {   // median per axis (partial selection sort is too slow: qsort)
+
+            qsort(ax[k], nf, sizeof(float), cmpf);
+            med[k] = ax[k][nf / 2];
+        }
+        uint32_t far = 0, far_i[3] = {0};
+        float far_d[3] = {0};
+        for (uint32_t i = 0; i < nv; i++) {
+            float x[3];
+            memcpy(x, b + (size_t)i * st, 12);
+            float d = (x[0] - med[0]) * (x[0] - med[0]) + (x[1] - med[1]) * (x[1] - med[1]) + (x[2] - med[2]) * (x[2] - med[2]);
+            if (!(d == d)) continue;
+            if (d > mx) mx = d;
+            if (d > 9.0f) far++;   // over 3 units from the median vertex: a person is about 2 tall
+            for (int k = 0; k < 3; k++)
+                if (d > far_d[k]) {
+                    for (int j = 2; j > k; j--) far_d[j] = far_d[j - 1], far_i[j] = far_i[j - 1];
+                    far_d[k] = d, far_i[k] = i;
+                    break;
+                }
+        }
+        char fl[400];
+        int o = 0;
+        for (int k = 0; k < 3; k++) {
+            float x[4];
+            memcpy(x, b + (size_t)far_i[k] * st, 16);
+            o += snprintf(fl + o, sizeof fl - o, " v%u [%g %g %g %g]", far_i[k], x[0], x[1], x[2], x[3]);
+        }
+        rt_log("drawq   q %u positions %#llx+%#llx/%u: %u vertices, %u zero, %u non-finite or huge, %u over 3 from the "
+               "median (%g %g %g), farthest %g:%s", q, (unsigned long long)dq_a0[q].addr,
+               (unsigned long long)dq_a0[q].size, st, nv, zero, bad, far, med[0], med[1], med[2], mx > 0 ? sqrtf(mx) : 0, fl);
+        free(b), free(ax[0]), free(ax[1]), free(ax[2]);
+    }
+    {   // mlbts-native: the textures of the MLB_DRAWTEX draws as PNGs (vk_capture.c), each once
+        static tex_t ts[64];
+        const tex_t *tp[64];
+        uint32_t ids[64];
+        int n = 0;
+        for (uint32_t q = 0; q < dq_n && n < 64; q++) {
+            if (!dq_ft[q].save) continue;
+            for (int t = 0; t < dq_ft[q].n && n < 64; t++) {
+                int j = 0;
+                while (j < n && ids[j] != dq_ft[q].id[t]) j++;
+                if (j < n || !vk_texture_slot_desc((int)dq_ft[q].id[t], &ts[n])) continue;
+                rt_log("drawq   saved texture %d: id %#x first in q %u b%u, nvn fmt %#x %ux%u at %#llx", n,
+                       dq_ft[q].id[t], q, (unsigned)dq_ft[q].bind[t], (unsigned)ts[n].d.format, (unsigned)ts[n].d.width,
+                       (unsigned)ts[n].d.height, (unsigned long long)(uintptr_t)ts[n].mem);
+                ids[n] = dq_ft[q].id[t], tp[n] = &ts[n], n++;
+            }
+        }
+        void vk_capture_targets(const tex_t *const *ts, int n, uint64_t frame);
+        if (n) vk_capture_targets(tp, n, 1000000 + (uint64_t)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED));
+        for (uint32_t q = 0; q < dq_n; q++) dq_ft[q].save = 0, dq_ft[q].n = 0;
+    }
     // Draws with a stride-16 RGBA32F position (MLB's face meshes, positions from a compute pass) that wrote nothing,
     // and every draw sharing their storage buffer 1: vertex constants, bones, first vertices.
     uint64_t pal[64];
@@ -3546,7 +3633,7 @@ static void watch_draw(VkExec *ex, const char *kind, int count) {
     for (int i = 0; i < nt; i++) {
         uint64_t th = res_tex_handle(ex, NVN_STAGE_FS, &tr[i], 0);
         view_t v;
-        int hv;
+        int hv = 0;
         const VkTexImage *im = th ? vk_texture_by_id((int)(th & 0xfffff), &v, &hv) : NULL;
         tex_t t;
         uint64_t nz = 0, n = 0, sum[4] = {0};
@@ -3584,29 +3671,30 @@ static void watch_draw(VkExec *ex, const char *kind, int count) {
     }
 }
 
+// mlbts-native: MLB_DRAWTEX=<fs hash>[,<fs hash>...] (hex, as drawlog prints them): draws of the drawlog frame with one
+// of those fragment shaders list their textures, and the capture saves those textures as PNGs (vk_drawq_report).
+static int drawtex_match(uint32_t fs) {
+    static uint32_t want[16];
+    static int n = -1;
+    if (n < 0) {
+        n = 0;
+        const char *e = cfg_get("MLB_DRAWTEX");
+        if (!e) e = "d3b91243,4db69cf5,ebeb772c";   // for now: the RTTS player body and face, the room
+        while (e && *e && n < 16) {
+            char *end;
+            want[n++] = (uint32_t)strtoul(e, &end, 16);
+            e = *end == ',' ? end + 1 : NULL;
+        }
+    }
+    for (int i = 0; i < n; i++)
+        if (want[i] == fs) return 1;
+    return 0;
+}
+
 static void draw_note(VkExec *ex, const char *kind, int prim, int count) {
     watch_draw(ex, kind, count);
     if (!drawlog_now()) return;
     int q = dq_begin(ex);
-    if (q >= 0 && dq_a0[q].fmt == 0x2e && dq_a0[q].stride == 16 && B.st_valid && B.st.fs) {
-        // mlbts-native: a face draw (positions from the face skinning pass): every texture its fragment shader reads,
-        // resolved as the binding resolves it (black heads: which one differs between players).
-        const GfxShaderRes *tr;
-        int nt = gfx_shader_resources(B.st.fs, GFX_RES_TEX, &tr);
-        dq_ft[q].n = 0;
-        for (int i = 0; i < nt; i++) {
-            uint64_t h = res_tex_handle(ex, NVN_STAGE_FS, &tr[i], 0);
-            if (h && dq_ft[q].n < 24) dq_ft[q].id[dq_ft[q].n] = (uint32_t)(h & 0xfffff), dq_ft[q].bind[dq_ft[q].n++] = (uint8_t)tr[i].binding;
-            view_t v;
-            int hv;
-            const VkTexImage *im = h ? vk_texture_by_id((int)(h & 0xfffff), &v, &hv) : NULL;
-            rt_log("drawlog   q %d fstex b%d slot %d type %#x: h %#llx%s %ux%u vkfmt %d lv %u addr %#llx mir %u gpu %u",
-                   q, (int)tr[i].binding, (int)tr[i].slot, (unsigned)tr[i].type, (unsigned long long)h,
-                   im ? "" : " unresolved", im ? im->width : 0, im ? im->height : 0, im ? (int)im->format : 0,
-                   im ? im->levels : 0, im ? (unsigned long long)im->addr : 0ull, im ? im->mirrored : 0,
-                   im ? im->gpu_owned : 0);
-        }
-    }
     uint32_t h[2] = {0, 0};
     for (int st = 0; st < 2; st++) {
         const uint8_t *ctl, *code; uint32_t len;
@@ -3616,9 +3704,36 @@ static void draw_note(VkExec *ex, const char *kind, int prim, int count) {
             h[st] = x;
         }
     }
-    rt_log("drawlog %s q %d prim %d count %d pass %ux%u fmt %d/%d prog %llu vs %08x fs %08x blend0 en %u src %u dst %u "
-           "chmask %#x tex1 %llx %llx %llx %llx samp1 %llx %llx ubo1 %llx+%llx",
+    int face = q >= 0 && dq_a0[q].fmt == 0x2e && dq_a0[q].stride == 16;
+    if (q >= 0 && (face || drawtex_match(h[1])) && B.st_valid && B.st.fs) {
+        // mlbts-native: a face draw (positions from the face skinning pass) or an MLB_DRAWTEX shader's: every texture
+        // its fragment shader reads, resolved as the binding resolves it, with its NVN and view formats.
+        const GfxShaderRes *tr;
+        int nt = gfx_shader_resources(B.st.fs, GFX_RES_TEX, &tr);
+        dq_ft[q].n = 0;
+        dq_ft[q].save = drawtex_match(h[1]);
+        for (int i = 0; i < nt; i++) {
+            uint64_t h = res_tex_handle(ex, NVN_STAGE_FS, &tr[i], 0);
+            if (h && dq_ft[q].n < 24) dq_ft[q].id[dq_ft[q].n] = (uint32_t)(h & 0xfffff), dq_ft[q].bind[dq_ft[q].n++] = (uint8_t)tr[i].binding;
+            view_t v;
+            int hv = 0;
+            const VkTexImage *im = h ? vk_texture_by_id((int)(h & 0xfffff), &v, &hv) : NULL;
+            tex_t t;
+            int got = im && vk_texture_slot_desc((int)(h & 0xfffff), &t);
+            const uint8_t *sw = hv && v.set_swizzle ? v.swz : im ? im->swz : (const uint8_t *)"\0\0\0\0";
+            rt_log("drawlog   q %d fstex b%d slot %d type %#x: h %#llx%s %ux%u nvn fmt %#x view fmt %#x vkfmt %d lv %u swz %u%u%u%u "
+                   "addr %#llx mir %u gpu %u",
+                   q, (int)tr[i].binding, (int)tr[i].slot, (unsigned)tr[i].type, (unsigned long long)h,
+                   im ? "" : " unresolved", im ? im->width : 0, im ? im->height : 0, got ? (unsigned)t.d.format : 0,
+                   hv && v.set_format ? (unsigned)v.format : 0, im ? (int)im->format : 0, im ? im->levels : 0,
+                   sw[0], sw[1], sw[2], sw[3], im ? (unsigned long long)im->addr : 0ull, im ? im->mirrored : 0,
+                   im ? im->gpu_owned : 0);
+        }
+    }
+    rt_log("drawlog %s q %d prim %d count %d pass %ux%u fmt %d/%d ds %#llx L%u+%u prog %llu vs %08x fs %08x blend0 en %u "
+           "src %u dst %u chmask %#x tex1 %llx %llx %llx %llx samp1 %llx %llx ubo1 %llx+%llx",
            kind, q, prim, count, ex->pass_w, ex->pass_h, ex->pipe.color_fmt[0], ex->pipe.depth_fmt,
+           (unsigned long long)(uintptr_t)(ex->depth.tex ? ex->depth.tex->mem : NULL), ex->depth.base_layer, ex->depth.layers,
            (unsigned long long)(ex->prog ? ex->prog->serial : 0), h[0], h[1], (unsigned)ex->pipe.color.blend_en,
            (unsigned)ex->pipe.blend[0].src_rgb, (unsigned)ex->pipe.blend[0].dst_rgb, ex->pipe.chmask.mask,
            (unsigned long long)ex->tex[1][0], (unsigned long long)ex->tex[1][1], (unsigned long long)ex->tex[1][2],
@@ -3810,6 +3925,15 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
             for (uint32_t i = 0; i < len; i++) csh = (csh ^ code[i]) * 16777619u;
         }
     }
+    if (drawlog_now_l())   // mlbts-native: the buffer textures the dispatch's images 0 and 1 name
+        for (int k = 0; k < 2; k++) {
+            uint64_t hi = ex->img[NVN_STAGE_CS][k];
+            tex_t t;
+            int bw, bh;
+            if (hi && vk_texture_slot_desc((int)(hi & 0xfffff), &t) && t.d.target == NVN_TEXTURE_TARGET_BUFFER)
+                rt_log("drawlog   dispatch img %d: buffer %#llx+%#llx fmt %#x", k, (unsigned long long)(uintptr_t)t.mem,
+                       (unsigned long long)t.d.width * (uint64_t)nvn_fmt_bpb(t.d.format, &bw, &bh), (unsigned)t.d.format);
+        }
     if (drawlog_now_l())   // mlbts-native: drawlog frame
         rt_log("drawlog dispatch %dx%dx%d prog %llu cs %08x img %llx %llx tex %llx %llx ssbo %#llx+%#llx %#llx+%#llx %#llx+%#llx "
                "%#llx+%#llx", d->x, d->y, d->z,
@@ -3820,6 +3944,23 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
                (unsigned long long)ex->ssbo[NVN_STAGE_CS][1].addr, (unsigned long long)ex->ssbo[NVN_STAGE_CS][1].size,
                (unsigned long long)ex->ssbo[NVN_STAGE_CS][2].addr, (unsigned long long)ex->ssbo[NVN_STAGE_CS][2].size,
                (unsigned long long)ex->ssbo[NVN_STAGE_CS][3].addr, (unsigned long long)ex->ssbo[NVN_STAGE_CS][3].size);
+    if (drawlog_now_l() && (csh == 0x94216d5bu || csh == 0xc907a6dbu)) {
+        // mlbts-native (stretched torsos): MLB's skinning passes read 64-byte bone matrices from storage slot 0; the
+        // translation part of each as the guest holds it now (row 3 and column 3: either layout)
+        const p_bind_buf *b = &ex->ssbo[NVN_STAGE_CS][0];
+        VkMemSpan sp;
+        uint32_t nb = b->size / 64 < 64 ? (uint32_t)(b->size / 64) : 64;
+        if (b->addr && nb && vk_mem_resolve(b->addr, nb * 64, &sp)) {
+            char line[64 * 72 + 64];
+            int o = snprintf(line, sizeof line, "drawlog   bones %#llx:", (unsigned long long)b->addr);
+            for (uint32_t k = 0; k < nb && o < (int)sizeof line - 80; k++) {
+                const float *m = (const float *)(uintptr_t)(b->addr + 64ull * k);
+                o += snprintf(line + o, sizeof line - o, " %u[%.2f %.2f %.2f|%.2f %.2f %.2f]", k, m[12], m[13], m[14], m[3],
+                              m[7], m[11]);
+            }
+            rt_log("%s", line);
+        }
+    }
     vk_contact_flush(ex);
     cb_res(ex);
     dummies_init();

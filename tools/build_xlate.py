@@ -28,7 +28,8 @@ XLATE = ROOT / "tools" / "xlate"
 BUILD = ROOT / "work" / "xlate"
 EXE = "totk_xlate.exe"
 VSWHERE_DIR = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio" / "Installer"
-PATCHES = 13   # TotK's 15 less 0010 (PCSS sun shadows) and 0011 (shadow filter spread): TotK's look, not Maxwell's
+PATCHES = 14   # TotK's 15 less 0010 (PCSS sun shadows) and 0011 (shadow filter spread): TotK's look, not Maxwell's;
+               # plus mlbts-native 0017 (memory loads stay in place)
 
 
 def tree_hashes(base: Path) -> dict:

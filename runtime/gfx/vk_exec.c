@@ -811,6 +811,11 @@ static void clear_ds(VkExec *ex, const p_clear_ds *c) {
     if (!asp) return;
     float d = c->depth < 0.0f ? 0.0f : c->depth > 1.0f ? 1.0f : c->depth;
     VkClearDepthStencilValue v = {d, (uint32_t)c->stencil & 0xff};
+    if (vk_drawlog_now())   // mlbts-native: the drawlog frame's depth clears
+        rt_log("drawlog clear depth %g (game %g) mask %d stencil %u/%#x target %#llx %ux%u level %u layers %u+%u %s",
+               d, c->depth, c->depth_mask, (unsigned)c->stencil & 0xff, sm,
+               (unsigned long long)(uintptr_t)(t->tex ? t->tex->mem : NULL), t->width, t->height, t->level,
+               t->base_layer, t->layers, whole_target(ex, t) ? "whole" : "scissored");
     if (whole_target(ex, t)) {
         vk_exec_barrier(ex);
         VkImageSubresourceRange r = {asp, t->level, 1, t->base_layer, t->layers};
