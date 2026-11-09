@@ -184,8 +184,10 @@ static struct {
     struct { uint64_t lo, hi; } f[OV_FOREIGN];   // GPU writes of other kinds
     // since the last perf line (vk_exec_ub_perf)
     uint64_t c_update, c_overlaid, c_overlaid_out, c_flush, c_bind, c_merged, c_mixed, c_inpass, c_outside, c_early,
-        c_order;
+        c_order, c_big, b_merged;
 } OV = {.mode = -1};
+// mlbts-native: a merged copy larger than this brings the overlays' copies forward instead (ub_bind).
+#define OV_MERGE_MAX (64u << 10)
 
 // A binding without a size reaches to the end of its backing: as far as the overlays go, for ov_at.
 static uint64_t ov_rest(uint64_t addr) { return addr < OV.hi ? OV.hi - addr : 1; }
@@ -3645,11 +3647,13 @@ void vk_exec_ub_perf(void) {
     const double k = 1 / 600.0;
     rt_log("perf: uniform updates per submission %.1f: %.1f overlaid (%.1f of them between passes; copied in %.2f "
            "batches), %.1f copied in a pass, %.1f outside one; bindings from an overlay %.1f (%.1f merged, %.1f over "
-           "other GPU writes), %.2f batches brought forward for a storage write, %.2f barriers between overlapping copies",
+           "other GPU writes; %.1f KiB copied per merge), %.2f batches brought forward for a storage write, %.2f for a "
+           "binding over %u KiB, %.2f barriers between overlapping copies",
            OV.c_update * k, OV.c_overlaid * k, OV.c_overlaid_out * k, OV.c_flush * k, OV.c_inpass * k, OV.c_outside * k,
-           OV.c_bind * k, OV.c_merged * k, OV.c_mixed * k, OV.c_early * k, OV.c_order * k);
+           OV.c_bind * k, OV.c_merged * k, OV.c_mixed * k, OV.c_merged ? OV.b_merged / 1024.0 / OV.c_merged : 0.0,
+           OV.c_early * k, OV.c_big * k, OV_MERGE_MAX >> 10, OV.c_order * k);
     OV.c_update = OV.c_overlaid = OV.c_overlaid_out = OV.c_flush = OV.c_bind = OV.c_merged = OV.c_mixed = 0;
-    OV.c_inpass = OV.c_outside = OV.c_early = OV.c_order = 0;
+    OV.c_inpass = OV.c_outside = OV.c_early = OV.c_order = OV.c_big = OV.b_merged = 0;
 }
 
 // The scratch bytes of a uniform or storage binding [addr, addr+n) an overlay of this submission touches: 1 with *out
@@ -3669,6 +3673,19 @@ static int ub_bind(VkExec *ex, uint64_t addr, uint64_t n, uint64_t align, VkDesc
             return 1;
         }
     }
+    // mlbts-native: a large binding over the overlays (MLB binds storage buffers of hundreds of KiB to megabytes that
+    // hold the blocks it updates between draws, about 300 such bindings a submission in the pause menu) would copy all
+    // of it for each draw: the replay spent most of a 100-200 ms frame in those copies. Instead the overlays' copies
+    // are recorded now, behind a barrier (the pass ends and restarts, as for ub_written), and the binding reads the
+    // real buffer, which holds the same bytes from then on. Only where bind_range can bind the backing directly.
+    VkMemSpan sp;
+    if (n > OV_MERGE_MAX && vk_mem_resolve(addr, 1, &sp) && sp.offset % align == 0) {
+        int reopen = ex->in_pass;
+        vk_exec_barrier(ex);   // records the pending copies (vk_exec_ub_flush) and clears the overlays
+        if (reopen) vk_exec_pass_begin(ex);
+        OV.c_big++;
+        return 0;
+    }
     // Merged: the bytes as of the submit call (the snapshot, else guest memory), then this submission's updates in
     // order. A transient copy, so the descriptor build skip leaves the draw after it alone (RS.volatile_). Bytes a copy
     // or a storage write of this submission produced are not in either source: counted.
@@ -3676,8 +3693,8 @@ static int ub_bind(VkExec *ex, uint64_t addr, uint64_t n, uint64_t align, VkDesc
     VkDeviceSize o;
     uint8_t *dst = scratch(ex, n, &b, &o);
     RS.volatile_ = 1;
+    OV.b_merged += n;
     const uint8_t *base = vk_usnap_bytes(addr, n);
-    VkMemSpan sp;
     if (base) memcpy(dst, base, n);
     else if (vk_mem_resolve(addr, n, &sp)) memcpy(dst, (const void *)(uintptr_t)addr, n);
     else memset(dst, 0, n);
