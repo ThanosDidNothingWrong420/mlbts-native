@@ -19,8 +19,10 @@ static const CfgMeta metas[] = {
     // mlbts-native rows
     {"LANGUAGE", "en-US", NULL, RESTART},   // am.c GetDesiredLanguage; the NACP lists American English only
     {"TIMEZONE", "local", "local|utc", RESTART},   // time.c: the host time zone, or UTC
-    {"SPIN", "1", "0|1", RESTART},
-    {"NICKNAME", "Player", NULL, RESTART},   // account.c GetNickname (up to 32 bytes of UTF-8)   // kernel.c spin-wait gates (TotK reads it without a row)
+    {"SPIN", "1", "0|1", RESTART},   // kernel.c spin-wait gates (TotK reads it without a row)
+    {"NICKNAME", "Player", NULL, RESTART},   // account.c GetNickname (up to 32 bytes of UTF-8)
+    {"PAD_MAP", "label", "label|position", LIVE},   // hid.c: XInput face buttons by label or by place
+    {"RUMBLE", "1", "0|1", LIVE},   // hid.c: vibration on the XInput pad
     // TotK Recomp's rows (cfg.c @ ae30a61); the TotK-only ones are read by nothing here
     // Screen
     {"FULLSCREEN", "0", "0|1", LIVE}, {"WINDOW_SIZE", "1920x1080", NULL, LIVE},

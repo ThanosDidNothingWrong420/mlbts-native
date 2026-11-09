@@ -252,7 +252,12 @@ void mem_init(void) {
     cfg_init();
     const char *pool = cfg_get("TOTK_APP_POOL");
     L = (RtGuestLayout){
-        .aslr = {low, RT_ADDRESS_LIMIT - low},
+        // mlbts-native: the ASLR region ends with the alias region, not at 2^39. SDK 19.3.11's os::MapSharedMemory
+        // (AslrSpaceManager) picks random addresses across the whole region and gives up after a fixed number of
+        // tries; with [low, 2^39) only the ~2 GiB of the block outside the heap reads Free, so about one run in
+        // eight failed (time's SharedMemoryClient, NotNull). Heap and alias are its forbidden regions [H: per
+        // Atmosphere's os_aslr_space_manager], so the hit rate is now that 2 GiB over ~70 GiB per try.
+        .aslr = {low, alias + ALIAS_SIZE - low},
         .stack = {low + STACK_OFF, STACK_SIZE},
         .heap = {low + HEAP_OFF, HEAP_CAP + res_tex_heap_extra_bytes()},
         .alias = {alias, ALIAS_SIZE},

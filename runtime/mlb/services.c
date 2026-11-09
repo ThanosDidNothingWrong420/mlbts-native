@@ -8,6 +8,7 @@
 
 #include "host.h"
 #include "ipc.h"
+#include "platform/platform.h"
 
 // ---- lm: ILogService / ILogger
 // A log packet: a 0x18-byte header (process id, thread id, flags, level, verbosity, payload size), then chunks of
@@ -166,8 +167,42 @@ static void pctl_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
 
 // ---- nifm:u: the network interface manager. Offline: no network is ever available. Only the commands MLB was seen
 // to use are served; the rest stop with a named fatal.
+// IRequest: a request for a network connection. Offline it never leaves the Free state (nn::nifm::RequestState 1:
+// not on hold, not accepted), whether submitted or not, and its two events never fire.
+static uint32_t nifm_event(uint32_t *w) {
+    if (!*w) *w = kern_event_new();
+    return kern_event_readable(*w);
+}
+
+static void nifm_request_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    static uint32_t ev_state, ev_other;
+    switch (rq->cmd) {
+    case 0: {   // GetRequestState -> u32
+        uint32_t free_state = 1;
+        IPC_OUT(rs, free_state);
+        return;
+    }
+    case 1:     // GetResult: why there is no connection. nifm (module 110) description 1111, network communication
+                // disabled, as with networking switched off [H: the code from yuzu's behaviour, not checked on a console]
+        rs->result = 0x8AE6Eu;
+        return;
+    case 2:     // GetSystemEventReadableHandles -> two copy handles
+        rs->copy[rs->ncopy++] = nifm_event(&ev_state);
+        rs->copy[rs->ncopy++] = nifm_event(&ev_other);
+        return;
+    case 3: case 4: return;   // Cancel, Submit
+    case 6: case 8: case 10: case 11: case 12: case 13: case 14: case 15: case 16: case 17: case 23:
+        return;   // SetRequirementPreset, SetPriority, SetRejectable, SetConnectionConfirmationOption, SetPersistent,
+                  // SetInstant, SetSustainable, SetRawPriority, SetGreedy, SetSharable, SetKeptInSleep
+    default: ipc_unimplemented(s, rq);
+    }
+}
+
 static void nifm_general_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
     switch (rq->cmd) {
+    case 4:   // CreateRequest(s32 requirement preset) -> IRequest
+        rs->move[rs->nmove++] = ipc_session_new("nifm:IRequest", nifm_request_handler, NULL, NULL);
+        return;
     default: ipc_unimplemented(s, rq);
     }
 }
@@ -194,6 +229,90 @@ static void bsd_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
     }
 }
 
+// ---- ssl: TLS for the online modes (nn::ssl::Initialize). Offline: the service starts; contexts are not served.
+static void ssl_context_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    (void)rs;
+    ipc_unimplemented(s, rq);
+}
+
+static void ssl_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    switch (rq->cmd) {
+    case 0:   // CreateContext(u32 ssl version, u64, pid) -> ISslContext
+        rs->move[rs->nmove++] = ipc_session_new("ssl:ISslContext", ssl_context_handler, NULL, NULL);
+        return;
+    case 5: return;   // SetInterfaceVersion(u32)
+    default: ipc_unimplemented(s, rq);
+    }
+}
+
+// ---- csrng: cryptographically random bytes (nn::crypto::GenerateCryptographicallyRandomBytes), from the OS
+static void csrng_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    (void)rs;
+    switch (rq->cmd) {
+    case 0: {   // GenerateRandomBytes(buffer 6 out)
+        const IpcBuffer *b = rq->nb && rq->b[0].size ? &rq->b[0] : NULL;
+        if (!b) rt_fatal("csrng: GenerateRandomBytes without an output buffer");
+        if (!plat_random(ipc_guest(b->addr, b->size), b->size)) rt_fatal("csrng: no random bytes from the system");
+        return;
+    }
+    default: ipc_unimplemented(s, rq);
+    }
+}
+
+// ---- ngc:u: the profanity filter (nn::ngc::ProfanityFilter). There is no word list on this host: no text is flagged.
+static void ngc_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    switch (rq->cmd) {
+    case 0: {   // GetContentVersion -> u32
+        uint32_t v = 0;
+        IPC_OUT(rs, v);
+        return;
+    }
+    case 3: return;   // Reload
+    default: ipc_unimplemented(s, rq);
+    }
+}
+
+// ---- friend:u: friends (online). The service creator hands out sessions; their commands are served as MLB uses them.
+static void friend_service_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    (void)rs;
+    ipc_unimplemented(s, rq);
+}
+
+static void friend_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    switch (rq->cmd) {
+    case 0:   // CreateFriendService -> IFriendService
+        rs->move[rs->nmove++] = ipc_session_new("friend:IFriendService", friend_service_handler, NULL, NULL);
+        return;
+    case 1:   // CreateNotificationService(Uid) -> INotificationService
+        rs->move[rs->nmove++] = ipc_session_new("friend:INotificationService", friend_service_handler, NULL, NULL);
+        return;
+    default: ipc_unimplemented(s, rq);
+    }
+}
+
+// ---- nim:eca: the eShop access server (nn::ec). Online only; the server object is handed out and its commands
+// are served as MLB uses them.
+static void eca_server_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    (void)rs;
+    ipc_unimplemented(s, rq);
+}
+
+static void eca_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    switch (rq->cmd) {
+    case 0:   // CreateServerInterface(pid, copy transfer memory, u64 size) -> IShopServiceAccessServer
+    case 5:   // the form SDK 19.3.11's Proxy::CreateServerInterface sends (24 bytes, copy transfer memory) [C]
+        rs->move[rs->nmove++] = ipc_session_new("nim:IShopServiceAccessServer", eca_server_handler, NULL, NULL);
+        return;
+    case 4: {   // (u64, u32) -> bool. SDK 19.3.11's ShopServiceAccessServer::Proxy::Initialize reconnects to nim:eca
+                // when it reads true and keeps its session when false [C, disassembly]; the name is not known.
+        uint8_t v = 0;
+        IPC_OUT(rs, v);
+        return;
+    }
+    default: ipc_unimplemented(s, rq);
+    }
+}
+
 // ---- table
 void am_applet_oe_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs);   // am.c
 void aoc_u_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs);          // aoc.c
@@ -209,6 +328,11 @@ static const struct { const char *name; IpcHandler handler; } services[] = {
     {"time:u", time_u_handler},
     {"nifm:u", nifm_handler},
     {"bsd:u", bsd_handler},
+    {"ssl", ssl_handler},
+    {"csrng", csrng_handler},
+    {"ngc:u", ngc_handler},
+    {"friend:u", friend_handler},
+    {"nim:eca", eca_handler},
 };
 
 IpcHandler rt_service_handler(const char *name, const char **stable_name) {

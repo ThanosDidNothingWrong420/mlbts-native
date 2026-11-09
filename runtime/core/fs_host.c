@@ -695,7 +695,16 @@ static uint32_t host_path_kind(const char *path, char *out, size_t cap, int *kin
     plat_mutex_unlock_shared(&lock);
     if (k == M_FREE) return FS_R_PATH_NOT_FOUND;
     if (kind) *kind = k;
-    const char *rest = colon + 1;
+    // mlbts-native: repeated separators collapse to one, as nn::fs's path normalisation does (MLB opens
+    // "FS_Rom:/NSW//LIVECONTENT"); other empty, "." or ".." components are still refused.
+    char rest[PATH_CAP];
+    size_t rn = 0;
+    for (const char *q = colon + 1; *q; q++) {
+        if (*q == '/' && rn && rest[rn - 1] == '/') continue;
+        if (rn + 1 >= sizeof rest) return FS_R_INVALID_PATH;
+        rest[rn++] = *q;
+    }
+    rest[rn] = 0;
     for (const char *q = rest + 1; *q;) {
         const char *e = strchr(q, '/');
         size_t len = e ? (size_t)(e - q) : strlen(q);
@@ -1060,10 +1069,10 @@ static uint32_t delete_recursive(const char *path) {
 
 static uint32_t open_directory(uint64_t *out, const char *path, int mode) {
     char p[PATH_CAP];
+    fs_trace("dir", path);
     uint32_t r = host_path(path, p, sizeof p);
     if (r) return r;
     if (!out || mode < 1 || mode > 3) return FS_R_INVALID_ARGUMENT;
-    fs_trace("dir", path);
     if (plat_fs_kind(p) != PLAT_FS_DIR) return FS_R_PATH_NOT_FOUND;
     Listing l;
     int e = list_dir(p, &l);
