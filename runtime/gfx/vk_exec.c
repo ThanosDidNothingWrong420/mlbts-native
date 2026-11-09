@@ -62,9 +62,16 @@ void vk_exec_frame_written(const tex_t *t) {
     fw[nfw++].n = 1;
 }
 
+long vk_drawlog_frame(void);   // vk_exec_draw.c: the frame F12 / MLB_DRAWLOG asks for, -1 none
 void vk_exec_frame_log(const tex_t *p, uint64_t frame) {
-    if (!(rt_trace & RT_TRACE_GFX)) return;
     VkExecFrame *f = &vk_exec_frame;
+    if (!(rt_trace & RT_TRACE_GFX)) {   // mlbts-native: the summary of the drawlog frame too, counted from the one before
+        long want = vk_drawlog_frame();
+        if (want < 0 || (uint64_t)want != frame) {
+            if (want > 0 && (uint64_t)want == frame + 1) memset(f, 0, sizeof *f), nfw = 0;
+            return;
+        }
+    }
     int hit = 0;
     char list[512] = "";
     size_t o = 0;

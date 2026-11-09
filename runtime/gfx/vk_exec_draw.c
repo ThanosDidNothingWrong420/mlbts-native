@@ -2210,7 +2210,24 @@ static int pipe_memo_on(void) {
 }
 
 // Pass, shaders, pipeline, fixed state and resources for a draw. 0: the draw is skipped.
+static int prepare_draw_inner(VkExec *ex, int prim, int32_t count, int restart);
+static long drawlog_now_l(void);
+// mlbts-native: in the drawlog frame, a draw prepare_draw_inner turns away is logged with what it can tell of why
 static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
+    int ok = prepare_draw_inner(ex, prim, count, restart);
+    if (!ok && drawlog_now_l()) {
+        VkRect2D sc = vk_exec_scissor(ex);
+        const char *why = ex->render_disabled ? "rendering disabled (render enable / conditional render)"
+                        : !sc.extent.width || !sc.extent.height ? "empty scissor"
+                        : !ex->prog ? "no program"
+                        : "shader or pipeline not ready, or failed";
+        rt_log("drawlog SKIPPED prim %d count %d pass %ux%u fmt %d/%d prog %llu: %s", prim, count, ex->pass_w,
+               ex->pass_h, ex->pipe.color_fmt[0], ex->pipe.depth_fmt,
+               (unsigned long long)(ex->prog ? ex->prog->serial : 0), why);
+    }
+    return ok;
+}
+static int prepare_draw_inner(VkExec *ex, int prim, int32_t count, int restart) {
     if (ex->render_disabled) return 0;
     cb_res(ex);
     dummies_init();
@@ -3127,14 +3144,23 @@ void vk_drawlog_arm(void) {
     __atomic_store_n(&drawlog_want, f, __ATOMIC_RELAXED);
     rt_log("drawlog: frame %ld", f);
 }
-static void draw_note(VkExec *ex, const char *kind, int prim, int count) {
+long vk_drawlog_frame(void) {
     long want = __atomic_load_n(&drawlog_want, __ATOMIC_RELAXED);
     if (want == -2) {
         const char *e = cfg_get("MLB_DRAWLOG");
         want = e ? atol(e) : -1;
         __atomic_store_n(&drawlog_want, want, __ATOMIC_RELAXED);
     }
-    if (want < 0 || (long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1 != want) return;
+    return want;
+}
+static int drawlog_now(void);
+static long drawlog_now_l(void) { return drawlog_now(); }
+static int drawlog_now(void) {
+    long want = vk_drawlog_frame();
+    return want >= 0 && (long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1 == want;
+}
+static void draw_note(VkExec *ex, const char *kind, int prim, int count) {
+    if (!drawlog_now()) return;
     uint32_t h[2] = {0, 0};
     for (int st = 0; st < 2; st++) {
         const uint8_t *ctl, *code; uint32_t len;
@@ -3286,6 +3312,11 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     if (d->x <= 0 || d->y <= 0 || d->z <= 0) return;
     ex->prog = ex->prog_cs;   // mlbts-native: the compute stage's program (vk_exec.h stage_prog)
     if (!ex->prog) return warn_once(W_PROGRAM, "a dispatch without a bound program is skipped");
+    if (drawlog_now_l())   // mlbts-native: drawlog frame
+        rt_log("drawlog dispatch %dx%dx%d prog %llu img %llx %llx tex %llx %llx", d->x, d->y, d->z,
+               (unsigned long long)ex->prog->serial, (unsigned long long)ex->img[NVN_STAGE_CS][0],
+               (unsigned long long)ex->img[NVN_STAGE_CS][1], (unsigned long long)ex->tex[NVN_STAGE_CS][0],
+               (unsigned long long)ex->tex[NVN_STAGE_CS][1]);
     vk_contact_flush(ex);
     cb_res(ex);
     dummies_init();
