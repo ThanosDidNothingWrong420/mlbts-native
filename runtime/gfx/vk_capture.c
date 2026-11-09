@@ -84,6 +84,51 @@ done:
     if (tmp) vmaDestroyImage(c->vma, tmp, tmp_a);
 }
 
+// The GPU's bytes of [addr, addr+n) (a mirror's device-local copy when the pool has one), copied through a host buffer.
+// The queue must be idle (vk_drawq_report runs after vk_capture_targets). 0 when the range is not backed.
+int vk_capture_read(uint64_t addr, void *out, uint32_t n) {
+    VkCtx *c = vk_ctx();
+    VkMemSpan sp;
+    if (!c || !n || !vk_mem_resolve(addr, n, &sp)) return 0;
+    VkBuffer buf = VK_NULL_HANDLE;
+    VmaAllocation ba = NULL;
+    VmaAllocationInfo info;
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                  .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+    if (vmaCreateBuffer(c->vma, &bi, &ai, &buf, &ba, &info) != VK_SUCCESS || !info.pMappedData) return 0;
+    VkCommandPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                  .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, .queueFamilyIndex = c->gfx_family};
+    VkCommandPool pool;
+    int ok = 0;
+    if (vkCreateCommandPool(c->device, &pi, NULL, &pool) == VK_SUCCESS) {
+        VkCommandBufferAllocateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pool,
+                                          .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+        VkCommandBuffer cb;
+        if (vkAllocateCommandBuffers(c->device, &ci, &cb) == VK_SUCCESS) {
+            VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                              .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+            vkBeginCommandBuffer(cb, &begin);
+            VkBufferCopy cp = {sp.offset, 0, n};
+            vkCmdCopyBuffer(cb, sp.buffer, buf, 1, &cp);
+            vkEndCommandBuffer(cb);
+            VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
+            vk_queue_lock();
+            VkResult r = vkQueueSubmit(c->gfx_queue, 1, &si, VK_NULL_HANDLE);
+            if (r == VK_SUCCESS) r = vkQueueWaitIdle(c->gfx_queue);
+            vk_queue_unlock();
+            if (r == VK_SUCCESS) {
+                vmaInvalidateAllocation(c->vma, ba, 0, VK_WHOLE_SIZE);
+                memcpy(out, info.pMappedData, n);
+                ok = 1;
+            }
+        }
+        vkDestroyCommandPool(c->device, pool, NULL);
+    }
+    vmaDestroyBuffer(c->vma, buf, ba);
+    return ok;
+}
+
 void vk_capture_targets(const tex_t *const *ts, int n, uint64_t frame) {
     VkCtx *c = vk_ctx();
     if (!c || !n) return;

@@ -213,4 +213,7 @@ void vk_exec_oq_draw(VkExec *ex);
 void vk_exec_oq_pass_end(VkExec *ex);
 int vk_exec_oq_active(void);       // mlbts-native: a game samples-passed query is open in the pass
 void vk_exec_dq_end(VkExec *ex);   // mlbts-native: the drawlog frame's per-draw query ends (vk_exec_draw.c)
-void vk_drawq_report(void);        // mlbts-native: logs the drawlog frame's per-draw samples, after the queue is idle
+void vk_drawq_report(void);
+int vk_drawlog_now(void);           // mlbts-native: the frame being replayed is the drawlog frame
+int vk_capture_read(uint64_t addr, void *out, uint32_t n);   // mlbts-native vk_capture.c: GPU bytes at addr (queue idle)
+        // mlbts-native: logs the drawlog frame's per-draw samples, after the queue is idle

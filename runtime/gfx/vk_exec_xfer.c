@@ -479,6 +479,9 @@ static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
 // ---- buffer to buffer
 
 static void copy_b2b(VkExec *ex, const p_copy_b2b *p) {
+    if (vk_drawlog_now())   // mlbts-native: drawlog frame
+        rt_log("drawlog copybuf %#llx -> %#llx +%#llx", (unsigned long long)p->src, (unsigned long long)p->dst,
+               (unsigned long long)p->size);
     uint64_t src = p->src, dst = p->dst, left = p->size;
     int started = 0;
     while (left) {
@@ -514,6 +517,9 @@ static void copy_b2b(VkExec *ex, const p_copy_b2b *p) {
 // vk_guest_written at the fence, as copies do. Works in CPU-invisible pools.
 
 static void clear_buf(VkExec *ex, const p_clear_buf *p) {
+    if (vk_drawlog_now())   // mlbts-native: drawlog frame
+        rt_log("drawlog clearbuf %#llx +%#llx value %#x", (unsigned long long)p->addr, (unsigned long long)p->size,
+               (unsigned)p->value);
     if ((p->addr | p->size) & 3) {
         warn_once(W_BUFFER, "buffer fill at %#llx of %llu bytes is not 4-byte aligned: skipped", (unsigned long long)p->addr,
                   (unsigned long long)p->size);

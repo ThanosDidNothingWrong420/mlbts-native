@@ -3237,6 +3237,9 @@ static VkQueryPool dq_pool;
 static int dq_state;          // 0 not set up, 1 ready, -1 unavailable
 static uint32_t dq_n;         // queries begun in the drawlog frame
 static int dq_open = -1;
+// Each query's draw: where its attribute 0 comes from (stream address + attribute offset), the stride and format, so
+// vk_drawq_report can show the first vertices of a draw that wrote nothing (end-of-frame contents).
+static struct { uint64_t addr; uint32_t stride, fmt; } dq_a0[DQ_N];
 
 static int dq_ready(void) {
     if (dq_state) return dq_state > 0;
@@ -3262,7 +3265,49 @@ static int dq_begin(VkExec *ex) {
     vkCmdBeginQuery(ex->cb, dq_pool, dq_n, 0);
     ex->recorded++;
     dq_open = (int)dq_n;
+    va_st va;
+    memcpy(&va, &ex->pipe.vattr[0], sizeof va);
+    int on = ex->pipe.vattr[0] != 0;
+    dq_a0[dq_n].addr = on && ex->vbuf[va.stream & 15].address ? ex->vbuf[va.stream & 15].address + va.offset : 0;
+    dq_a0[dq_n].stride = on ? ex->pipe.vstream[va.stream & 15].stride : 0;
+    dq_a0[dq_n].fmt = on ? va.fmt : 0;
     return (int)dq_n++;
+}
+
+int vk_drawlog_now(void) { return drawlog_now(); }
+
+// The first four vertices' attribute 0 of a draw that wrote no pixel: as floats (RGBA32F 0x2e, RGB32F 0x22, RGBA16F
+// 0x29) and the first words raw.
+static void dq_peek(uint32_t q) {
+    uint64_t a = dq_a0[q].addr;
+    uint32_t st = dq_a0[q].stride ? dq_a0[q].stride : 16, f = dq_a0[q].fmt;
+    if (!a) return;
+    uint8_t b[4 * 64];
+    uint32_t n = 3 * st + 16 <= sizeof b ? 3 * st + 16 : sizeof b;
+    if (!vk_capture_read(a, b, n)) {
+        rt_log("drawq   q %u a0 %#llx: not readable", q, (unsigned long long)a);
+        return;
+    }
+    char line[600];
+    int o = snprintf(line, sizeof line, "drawq   q %u a0 %#llx fmt %#x stride %u:", q, (unsigned long long)a, f, st);
+    for (int v = 0; v < 4 && (uint32_t)v * st + 16 <= n; v++) {
+        const uint8_t *p = b + v * st;
+        float x[4] = {0};
+        if (f == 0x2e || f == 0x22) memcpy(x, p, f == 0x2e ? 16 : 12);
+        else if (f == 0x29)
+            for (int k = 0; k < 4; k++) {
+                uint16_t h;
+                memcpy(&h, p + 2 * k, 2);
+                uint32_t sgn = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 1023, bits;
+                bits = e == 0 ? (sgn << 31) : e == 31 ? (sgn << 31 | 0xffu << 23 | m << 13) : (sgn << 31 | (e + 112) << 23 | m << 13);
+                memcpy(&x[k], &bits, 4);
+            }
+        uint32_t w[4];
+        memcpy(w, p, 16);
+        o += snprintf(line + o, sizeof line - o, " [%g %g %g %g | %08x %08x %08x %08x]", x[0], x[1], x[2], x[3], w[0],
+                      w[1], w[2], w[3]);
+    }
+    rt_log("%s", line);
 }
 
 void vk_drawq_report(void) {
@@ -3280,6 +3325,8 @@ void vk_drawq_report(void) {
         for (uint32_t k = 0; k < n; k++)
             o += snprintf(line + o, sizeof line - o, v[2 * k + 1] ? " %llu" : " ?", (unsigned long long)v[2 * k]);
         rt_log("%s", line);
+        for (uint32_t k = 0; k < n; k++)
+            if (v[2 * k + 1] && !v[2 * k]) dq_peek(i + k);
     }
     vkResetQueryPool(dev, dq_pool, 0, dq_n);
     dq_n = 0;
