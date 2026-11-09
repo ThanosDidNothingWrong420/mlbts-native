@@ -290,7 +290,8 @@ static uint8_t *scratch(VkExec *ex, uint64_t size, VkBuffer *buf, VkDeviceSize *
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n,
                                  .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                           VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+                                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                          VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT};   // mlbts-native: texel_view copies
         // HOST_COHERENT: the CPU fills these chunks and never flushes them. Intel's integrated GPUs (ANV, Meteor Lake)
         // offer host-cached memory only without coherence, which VMA picks for random host access: the GPU then read
         // what an earlier submission left in the chunk (an UpdateUniformBuffer payload of another draw: a lighting
@@ -1274,14 +1275,35 @@ static VkBufferView texel_view(VkExec *ex, uint64_t h, int written) {
     }
     uint64_t addr = (uint64_t)(uintptr_t)t.mem, bytes = (uint64_t)t.d.width * (uint64_t)bpb;
     VkMemSpan sp;
-    if (!vk_mem_resolve(addr, 1, &sp) || sp.offset % align) {
+    if (!vk_mem_resolve(addr, 1, &sp) || (written && sp.offset % align)) {
         warn_once(W_BIND, "buffer texture at %#llx is not backed or not aligned: a zero view is bound", (unsigned long long)addr);
         return Z.zview;
     }
     if (bytes > sp.avail) bytes = sp.avail / (uint64_t)bpb * (uint64_t)bpb;
     VK_MEM_USE(sp);
-    VkBufferViewCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = sp.buffer, .format = f.vk,
-                                 .offset = sp.offset, .range = bytes};
+    VkBuffer vb = sp.buffer;
+    VkDeviceSize vo = sp.offset;
+    if (sp.offset % align && bytes) {
+        // A sampled buffer texture off the view alignment (16 bytes on NVIDIA): MLB packs the base positions of the
+        // eyes, teeth and the rest of a face after the head's at 4-byte offsets. Its bytes are copied on the GPU, after
+        // the writes before it, to scratch (256-aligned) and the view made there; a pass in progress ends and restarts
+        // around the copy as for ub_bind. Images (written) keep the zero view.
+        int reopen = ex->in_pass;
+        if (reopen) vk_exec_barrier(ex);
+        scratch(ex, bytes, &vb, &vo);
+        VkBufferCopy cp = {sp.offset, vo, bytes};
+        vkCmdCopyBuffer(ex->cb, sp.buffer, vb, 1, &cp);
+        VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+                               .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                               .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                               .dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT};
+        VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+        vkCmdPipelineBarrier2(ex->cb, &di);
+        ex->recorded += 2;
+        if (reopen) vk_exec_pass_begin(ex);
+    }
+    VkBufferViewCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = vb, .format = f.vk,
+                                 .offset = vo, .range = bytes};
     VkBufferView v;
     if (!bytes || vkCreateBufferView(c->device, &ci, NULL, &v) != VK_SUCCESS) {
         warn_once(W_BIND, "a texel buffer view (format %d, %llu bytes) could not be created: a zero view is bound",
