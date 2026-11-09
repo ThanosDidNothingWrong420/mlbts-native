@@ -35,7 +35,7 @@ void nvn_called(uint8_t *seen, const char *name) {
     }
     if (__atomic_load_n(seen, __ATOMIC_RELAXED) || __atomic_exchange_n(seen, 1, __ATOMIC_RELAXED)) return;
     uint64_t n = __atomic_add_fetch(&gfx_counters.nvn_distinct, 1, __ATOMIC_RELAXED);
-    NVN_LOG("first call %llu: %s", (unsigned long long)n, name);
+    rt_log("nvn: first call %llu: %s", (unsigned long long)n, name);   // mlbts-native: always (once per proc)
 }
 
 uint64_t nvn_new_serial(void) {

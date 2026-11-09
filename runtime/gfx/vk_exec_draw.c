@@ -3190,6 +3190,25 @@ static void draw_note(VkExec *ex, const char *kind, int prim, int count) {
                (int)ex->scissor.x, (int)ex->scissor.y, (int)ex->scissor.w, (int)ex->scissor.h, ex->has_scissor,
                (unsigned)ex->pipe.depth_minus_w, (unsigned long long)*(const uint32_t *)&ex->pipe.poly);
     }
+    {   // vertex input and the vertex stage's storage buffers (mlbts-native)
+        char line[700];
+        int o = snprintf(line, sizeof line, "drawlog   vin:");
+        for (int i = 0; i < 8; i++) {
+            va_st va;
+            memcpy(&va, &ex->pipe.vattr[i], sizeof va);
+            if (!ex->pipe.vattr[i]) continue;
+            o += snprintf(line + o, sizeof line - o, " a%d=f%#x+%u@s%u", i, (unsigned)va.fmt, (unsigned)va.offset, (unsigned)va.stream);
+        }
+        for (int i = 0; i < 4; i++)
+            if (ex->vbuf[i].address)
+                o += snprintf(line + o, sizeof line - o, " s%d=%#llx+%#llx/%u", i, (unsigned long long)ex->vbuf[i].address,
+                              (unsigned long long)ex->vbuf[i].size, ex->pipe.vstream[i].stride);
+        for (int i = 0; i < 4 && o < (int)sizeof line - 40; i++)
+            if (ex->ssbo[NVN_STAGE_VS][i].addr)
+                o += snprintf(line + o, sizeof line - o, " vssbo%d=%#llx+%#llx", i, (unsigned long long)ex->ssbo[NVN_STAGE_VS][i].addr,
+                              (unsigned long long)ex->ssbo[NVN_STAGE_VS][i].size);
+        rt_log("%s", line);
+    }
     for (int slot = 0; slot < 3; slot++) {   // fragment constant buffers c3..c5: the first floats (guest memory)
         const p_bind_buf *u = &ex->ubo[1][slot];
         if (!u->addr || !u->size || !plat_mem_readable(u->addr, u->size < 64 ? u->size : 64)) continue;
@@ -3319,6 +3338,7 @@ static void op_draw_idx_ind(VkExec *ex, const p_draw_idx_ind *d) {
         return warn_once(W_INDEX, "index buffer %#llx is not backed or not aligned: indirect draws skipped", (unsigned long long)d->ibuf);
     if (!prepare_draw(ex, d->prim, 0x7fffffff, restart_for(ex, d->prim, d->itype))) return;
     vk_exec_frame.draws++;
+    draw_note(ex, "indirect-indexed", d->prim, -1);   // mlbts-native
     VK_MEM_USE(ip);
     VK_MEM_USE(ib);
     vkCmdBindIndexBuffer(ex->cb, ib.buffer, ib.offset, d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
@@ -3336,10 +3356,15 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     ex->prog = ex->prog_cs;   // mlbts-native: the compute stage's program (vk_exec.h stage_prog)
     if (!ex->prog) return warn_once(W_PROGRAM, "a dispatch without a bound program is skipped");
     if (drawlog_now_l())   // mlbts-native: drawlog frame
-        rt_log("drawlog dispatch %dx%dx%d prog %llu img %llx %llx tex %llx %llx", d->x, d->y, d->z,
+        rt_log("drawlog dispatch %dx%dx%d prog %llu img %llx %llx tex %llx %llx ssbo %#llx+%#llx %#llx+%#llx %#llx+%#llx "
+               "%#llx+%#llx", d->x, d->y, d->z,
                (unsigned long long)ex->prog->serial, (unsigned long long)ex->img[NVN_STAGE_CS][0],
                (unsigned long long)ex->img[NVN_STAGE_CS][1], (unsigned long long)ex->tex[NVN_STAGE_CS][0],
-               (unsigned long long)ex->tex[NVN_STAGE_CS][1]);
+               (unsigned long long)ex->tex[NVN_STAGE_CS][1],
+               (unsigned long long)ex->ssbo[NVN_STAGE_CS][0].addr, (unsigned long long)ex->ssbo[NVN_STAGE_CS][0].size,
+               (unsigned long long)ex->ssbo[NVN_STAGE_CS][1].addr, (unsigned long long)ex->ssbo[NVN_STAGE_CS][1].size,
+               (unsigned long long)ex->ssbo[NVN_STAGE_CS][2].addr, (unsigned long long)ex->ssbo[NVN_STAGE_CS][2].size,
+               (unsigned long long)ex->ssbo[NVN_STAGE_CS][3].addr, (unsigned long long)ex->ssbo[NVN_STAGE_CS][3].size);
     vk_contact_flush(ex);
     cb_res(ex);
     dummies_init();
