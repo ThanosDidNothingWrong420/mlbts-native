@@ -3178,6 +3178,29 @@ static void draw_note(VkExec *ex, const char *kind, int prim, int count) {
            (unsigned long long)ex->tex[1][0], (unsigned long long)ex->tex[1][1], (unsigned long long)ex->tex[1][2],
            (unsigned long long)ex->tex[1][3], (unsigned long long)ex->samp[1][0], (unsigned long long)ex->samp[1][1],
            (unsigned long long)ex->ubo[1][3].addr, (unsigned long long)ex->ubo[1][3].size);
+    {   // depth / stencil and the viewport (mlbts-native)
+        const ds_st *d = &ex->pipe.ds;
+        rt_log("drawlog   ds: depth test %u write %u func %u; stencil %u funcs %u/%u ops f%u/zf%u/zp%u ref %u/%u vmask %#x/%#x "
+               "wmask %#x/%#x; vp0 %.0f,%.0f %.0fx%.0f z %.3f..%.3f, range %.3f..%.3f; scissor %d,%d %dx%d (set %d); "
+               "depth_minus_w %u, poly cull %#llx",
+               (unsigned)d->dt, (unsigned)d->dw, (unsigned)d->df, (unsigned)d->st, (unsigned)d->sf_f, (unsigned)d->sf_b,
+               (unsigned)d->fail_f, (unsigned)d->zfail_f, (unsigned)d->zpass_f, ex->st_ref[0], ex->st_ref[1],
+               ex->st_vmask[0], ex->st_vmask[1], ex->st_wmask[0], ex->st_wmask[1], ex->vp[0][0], ex->vp[0][1],
+               ex->vp[0][2], ex->vp[0][3], ex->vp[0][4], ex->vp[0][5], ex->depth_range[0], ex->depth_range[1],
+               (int)ex->scissor.x, (int)ex->scissor.y, (int)ex->scissor.w, (int)ex->scissor.h, ex->has_scissor,
+               (unsigned)ex->pipe.depth_minus_w, (unsigned long long)*(const uint32_t *)&ex->pipe.poly);
+    }
+    for (int slot = 0; slot < 3; slot++) {   // fragment constant buffers c3..c5: the first floats (guest memory)
+        const p_bind_buf *u = &ex->ubo[1][slot];
+        if (!u->addr || !u->size || !plat_mem_readable(u->addr, u->size < 64 ? u->size : 64)) continue;
+        const float *f = (const float *)(uintptr_t)u->addr;
+        int n = u->size / 4 < 16 ? (int)(u->size / 4) : 16;
+        char line[512];
+        int o = snprintf(line, sizeof line, "drawlog   c%d %#llx+%#llx:", slot + 3, (unsigned long long)u->addr,
+                         (unsigned long long)u->size);
+        for (int i = 0; i < n && o < (int)sizeof line - 16; i++) o += snprintf(line + o, sizeof line - o, " %g", f[i]);
+        rt_log("%s", line);
+    }
     for (int k = 0; k < 4; k++) {
         if (!ex->tex[1][k]) continue;
         view_t v; int hv;
