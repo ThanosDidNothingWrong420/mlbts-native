@@ -23,6 +23,7 @@ static const CfgMeta metas[] = {
     {"NICKNAME", "Player", NULL, RESTART},   // account.c GetNickname (up to 32 bytes of UTF-8)
     {"PAD_MAP", "label", "label|position", LIVE},   // hid.c: XInput face buttons by label or by place
     {"RUMBLE", "1", "0|1", LIVE},   // hid.c: vibration on the XInput pad
+    {"GPU", "vulkan", "vulkan|null", RESTART},   // main.c: the graphics back end (gfx_null.c chooses by it)
     // TotK Recomp's rows (cfg.c @ ae30a61); the TotK-only ones are read by nothing here
     // Screen
     {"FULLSCREEN", "0", "0|1", LIVE}, {"WINDOW_SIZE", "1920x1080", NULL, LIVE},
@@ -135,7 +136,7 @@ const char *cfg_get(const char *name) {
 void cfg_set(const char *name, const char *value) {
     char k[64];
     norm_key(name, k);
-    const char *copy = value ? strdup(value) : NULL;
+    const char *copy = value ? _strdup(value) : NULL;   // MSVC CRT name
     plat_mutex_lock(&set_lock);
     int i = 0;
     while (i < n_set && strcmp(set_values[i].key, k)) i++;

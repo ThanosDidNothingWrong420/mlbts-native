@@ -2,6 +2,8 @@
 // points, as the vendored back end calls them, each switched off. Declarations in vk.h, vk_dlaa.h, gfx.h, flight.h,
 // input.h, ui/menu.h and host.h (all from TotK Recomp @ ae30a61). A feature that comes back replaces its stubs here.
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <string.h>
@@ -75,9 +77,68 @@ void vk_pass_mark_end(VkCommandBuffer cb, const VkPassMark *m) { (void)cb, (void
 void vk_pass_mark_cmd(VkCommandBuffer cb, uint32_t id, int end) { (void)cb, (void)id, (void)end; }
 void vk_pass_marks_report(void) {}
 int vk_pass_marks_want_nv(void) { return 0; }
+// mlbts-native, our own: an RGBA8 PNG with stored (uncompressed) deflate blocks. Big files, no zlib needed; for
+// test shots only.
+static uint32_t png_crc(uint32_t c, const uint8_t *p, size_t n) {
+    static uint32_t t[256];
+    if (!t[1])
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t v = i;
+            for (int k = 0; k < 8; k++) v = v & 1 ? 0xEDB88320u ^ (v >> 1) : v >> 1;
+            t[i] = v;
+        }
+    c = ~c;
+    while (n--) c = t[(c ^ *p++) & 0xFF] ^ (c >> 8);
+    return ~c;
+}
+
+static void png_chunk(FILE *f, const char *type, const uint8_t *d, uint32_t n) {
+    uint8_t be[4] = {(uint8_t)(n >> 24), (uint8_t)(n >> 16), (uint8_t)(n >> 8), (uint8_t)n};
+    fwrite(be, 1, 4, f);
+    fwrite(type, 1, 4, f);
+    if (n) fwrite(d, 1, n, f);
+    uint32_t c = png_crc(png_crc(0, (const uint8_t *)type, 4), d, n);
+    uint8_t cb[4] = {(uint8_t)(c >> 24), (uint8_t)(c >> 16), (uint8_t)(c >> 8), (uint8_t)c};
+    fwrite(cb, 1, 4, f);
+}
+
 void rt_write_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h) {
-    (void)rgba, (void)w, (void)h;
-    rt_log("gfx: screenshot %s not written (PNG writer not ported)", path);
+    size_t row = (size_t)w * 4 + 1, raw_n = row * h, blocks = (raw_n + 65534) / 65535;
+    size_t z_n = 2 + raw_n + blocks * 5 + 4;
+    uint8_t *raw = malloc(raw_n), *z = malloc(z_n);
+    FILE *f = fopen(path, "wb");
+    if (!raw || !z || !f || z_n > 0xFFFFFFFFu) {
+        rt_log("gfx: screenshot %s not written", path);
+        free(raw), free(z);
+        if (f) fclose(f);
+        return;
+    }
+    for (uint32_t y = 0; y < h; y++) {
+        raw[y * row] = 0;   // filter: none
+        memcpy(raw + y * row + 1, rgba + (size_t)y * w * 4, (size_t)w * 4);
+    }
+    size_t o = 0;
+    z[o++] = 0x78, z[o++] = 0x01;
+    uint32_t a = 1, b = 0;
+    for (size_t i = 0; i < raw_n; i += 65535) {
+        size_t n = raw_n - i < 65535 ? raw_n - i : 65535;
+        z[o++] = i + n == raw_n;
+        z[o++] = (uint8_t)n, z[o++] = (uint8_t)(n >> 8), z[o++] = (uint8_t)~n, z[o++] = (uint8_t)(~n >> 8);
+        memcpy(z + o, raw + i, n);
+        o += n;
+        for (size_t k = 0; k < n; k++) a = (a + raw[i + k]) % 65521, b = (b + a) % 65521;
+    }
+    uint32_t ad = b << 16 | a;
+    z[o++] = (uint8_t)(ad >> 24), z[o++] = (uint8_t)(ad >> 16), z[o++] = (uint8_t)(ad >> 8), z[o++] = (uint8_t)ad;
+    static const uint8_t sig[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    uint8_t ihdr[13] = {(uint8_t)(w >> 24), (uint8_t)(w >> 16), (uint8_t)(w >> 8), (uint8_t)w,
+                        (uint8_t)(h >> 24), (uint8_t)(h >> 16), (uint8_t)(h >> 8), (uint8_t)h, 8, 6, 0, 0, 0};
+    fwrite(sig, 1, 8, f);
+    png_chunk(f, "IHDR", ihdr, 13);
+    png_chunk(f, "IDAT", z, (uint32_t)o);
+    png_chunk(f, "IEND", NULL, 0);
+    fclose(f);
+    free(raw), free(z);
 }
 int probe_census_dir(char *dir, size_t n) { (void)dir, (void)n; return 0; }
 
@@ -148,7 +209,25 @@ void vk_hdr_to_srgb8(const uint8_t *in, uint8_t *out, size_t px, int a2r) { (voi
 // ---- the in-game settings menu (ui/menu.cpp, ImGui) and keyboard/mouse input (input_win.c): not ported yet; the
 // window procedure then handles every message itself.
 void menu_overlay_draw(VkCommandBuffer cb) { (void)cb; }
-int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot) { (void)frame, (void)t, (void)shot; return 0; }
+// No overlay. mlbts-native: MLB_SHOT=<frame>[,<frame>...] saves the presented picture of those frames as
+// <profile>/shot-<frame>.png through gfx_present.c's capture path (the one TotK's menu test shots use).
+int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot) {
+    (void)t;
+    static char path[1100];
+    const char *list = cfg_get("MLB_SHOT");
+    for (const char *q = list; q && *q;) {
+        char *end;
+        unsigned long long f = strtoull(q, &end, 10);
+        if (end == q) break;
+        if (f == frame) {
+            snprintf(path, sizeof path, "%s/shot-%llu.png", rt_config()->profile, f);
+            *shot = path;
+            break;
+        }
+        q = *end == ',' ? end + 1 : end;
+    }
+    return 0;
+}
 void menu_vk_release(void) {}
 int menu_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res) { (void)h, (void)m, (void)w, (void)l, (void)res; return 0; }
 int input_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res) { (void)h, (void)m, (void)w, (void)l, (void)res; return 0; }

@@ -2,6 +2,8 @@
 // contributors): the mixing stage (voice decode and resampling, splitters, mixes, effects, sinks) and the IAudioDevice
 // service. The CoreAudio output is replaced by SDL3 audio. Effect algorithms follow
 // Ryujinx.Audio (MIT, Copyright (c) Ryujinx Team and Contributors).
+// Vendored from TotK Recomp runtime/audio_mixer.c @ ae30a61 (MIT, LICENSE.totk-recomp). mlbts-native: the SDL3 audio
+// stream is replaced by WASAPI (platform/audio_out.h), so "the SDL audio thread" below is the output's own thread.
 //
 // Per 5 ms frame the render thread (audren.c, renderer lock held) decodes every started voice (PCM8/16/24/32, float,
 // DSP-ADPCM) along the sample path the voice clock consumes, resamples it linearly, runs the voice biquads, scales it
@@ -23,7 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <SDL3/SDL.h>
+#include "platform/audio_out.h"
 
 #include "cfg.h"
 #include "audio_effects.h"
@@ -52,7 +54,7 @@ typedef struct Mixer {
     float *buf; int nbuf, frame;
     int *offset;                                   // first mix buffer of each mix id
     SplitInfo *split; int nsplit; SplitDest *dest; int ndest;
-    SDL_AudioStream *stream; int device_ok, rate;
+    AudioOut *stream; int device_ok, rate;   // mlbts-native: WASAPI output
     int channels;                                  // output channels, 2 or 6 (output_channels)
     float ring[RING_FRAMES * OUT_MAX];
     _Atomic uint64_t wr, rd, underruns, overruns, missing_frames, callback_frames, callback_nonzero, skipped_frames;
@@ -70,6 +72,7 @@ typedef struct Mixer {
 } Mixer;
 
 static _Atomic float device_volume = 1.0f;
+float audio_device_volume(void) { return atomic_load(&device_volume); }   // mlbts-native: for audout.c (Astral's)
 
 // TOTK_VOLUME: the player's volume in percent (0..100) on top of the game's own; a live setting (the
 // menu), parsed again when cfg_version changes. Render thread only.
@@ -121,10 +124,9 @@ static int output_channels(void) {
     else if (!strcmp(want, "5.1")) n = 6;
     else if (!strcmp(want, "stereo")) n = 2;
     else {
-        SDL_AudioSpec dev = {0};
-        n = SDL_InitSubSystem(SDL_INIT_AUDIO) && SDL_GetAudioDeviceFormat(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &dev, NULL) &&
-            dev.channels >= 6 ? 6 : 2;
-        rt_log("audio: TOTK_AUDIO_CHANNELS=auto: the default device has %d channels, output %s", dev.channels,
+        int dev_channels = audio_out_default_channels();   // mlbts-native: WASAPI's mix format
+        n = dev_channels >= 6 ? 6 : 2;
+        rt_log("audio: TOTK_AUDIO_CHANNELS=auto: the default device has %d channels, output %s", dev_channels,
                n == 6 ? "5.1" : "stereo");
     }
     int expected = 0;
@@ -191,20 +193,11 @@ static void ring_pull(Mixer *m, float *out, uint32_t frames) {
     atomic_store_explicit(&m->rd, rd + n, memory_order_release);
 }
 
-static void SDLCALL sdl_pull(void *user, SDL_AudioStream *stream, int additional, int total) {
-    (void)total;
+// mlbts-native: the WASAPI thread's pull callback, writing straight into the endpoint buffer
+static void out_pull(void *user, float *out, uint32_t frames) {
     Mixer *m = user;
-    float tmp[OUT_MAX * 1024];
-    const uint32_t frame_bytes = (uint32_t)m->channels * sizeof(float);
     atomic_store_explicit(&m->pulled_ns, kern_now_ns(), memory_order_release);
-    while (additional > 0) {
-        uint32_t frames = (uint32_t)additional / frame_bytes;
-        if (!frames) break;
-        if (frames > 1024) frames = 1024;
-        ring_pull(m, tmp, frames);
-        if (!SDL_PutAudioStreamData(stream, tmp, (int)(frames * frame_bytes))) break;
-        additional -= (int)(frames * frame_bytes);
-    }
+    ring_pull(m, out, frames);
 }
 
 static void output_open(Mixer *m, int rate) {
@@ -213,35 +206,24 @@ static void output_open(Mixer *m, int rate) {
         rt_log("audio: TOTK_AUDIO=none: mixing without a device");
         return;
     }
-    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
-        rt_log("audio: SDL audio init failed (%s): mixing without sound", SDL_GetError());
-        return;
-    }
-    SDL_AudioSpec spec = {SDL_AUDIO_F32, m->channels, rate};
-    m->stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, sdl_pull, m);
+    // mlbts-native: WASAPI in place of SDL_OpenAudioDeviceStream; the device period comes from GetDevicePeriod
+    int period = 0;
+    char name[128], err[160];
+    m->stream = audio_out_open(rate, m->channels, out_pull, m, &period, name, sizeof name, err, sizeof err);
     if (!m->stream) {
-        rt_log("audio: no output device (%s): mixing without sound", SDL_GetError());
-        return;
-    }
-    if (!SDL_ResumeAudioStreamDevice(m->stream)) {
-        rt_log("audio: starting the output failed (%s): mixing without sound", SDL_GetError());
-        SDL_DestroyAudioStream(m->stream);
-        m->stream = NULL;
+        rt_log("audio: no output device (%s): mixing without sound", err);
         return;
     }
     m->device_ok = 1;
-    SDL_AudioSpec dev = {0};
-    int period = 0;
-    if (!SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(m->stream), &dev, &period) || period <= 0) period = m->frame;
+    if (period <= 0) period = m->frame;
     m->period = period;
     m->target = m->frame * m->prefill > 2 * period ? m->frame * m->prefill : 2 * period;
     if (m->target > RING_FRAMES / 2) m->target = RING_FRAMES / 2;
     uint64_t period_ns = (uint64_t)period * 1000000000ull / (uint64_t)rate;
     m->stall_ns = 4 * period_ns > STALL_MS * 1000000ull ? 4 * period_ns : STALL_MS * 1000000ull;
-    const char *name = SDL_GetAudioDeviceName(SDL_GetAudioStreamDevice(m->stream));
-    rt_log("audio: SDL device '%s' opened, %d Hz %s float (device %d channels), prefill %d ms, device period %d frames; "
-           "the device paces rendering at %.1f ms queued", name ? name : "?", rate, m->channels == 6 ? "5.1" : "stereo",
-           dev.channels, m->prefill * 5, period, m->target * 1000.0 / rate);
+    rt_log("audio: WASAPI device '%s' opened, %d Hz %s float, prefill %d ms, device period %d frames; "
+           "the device paces rendering at %.1f ms queued", name, rate, m->channels == 6 ? "5.1" : "stereo",
+           m->prefill * 5, period, m->target * 1000.0 / rate);
 }
 
 int64_t audio_mixer_pace_ns(AudioRenderer *r, uint64_t now) {
@@ -379,10 +361,7 @@ void audio_mixer_set_running(AudioRenderer *r, int running) {
 void audio_mixer_close(AudioRenderer *r) {
     Mixer *m = r->mixer;
     if (!m) return;
-    if (m->stream) {   // destroying the stream closes the device and waits for the callback to finish
-        SDL_DestroyAudioStream(m->stream);
-        SDL_QuitSubSystem(SDL_INIT_AUDIO);
-    }
+    audio_out_close(m->stream);   // mlbts-native: stops the output thread, so the callback has finished
     for (int i = 0; i < m->nsplit; i++) free(m->split[i].ids);
     for (int i = 0; i < r->param.effect_count; i++) {
         audio_reverb_free(m->effect[i].reverb);

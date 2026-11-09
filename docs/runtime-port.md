@@ -131,17 +131,35 @@ linker. `tools/shader_smoke.py` translates a sample of MLB's FXB shaders offline
 12. **fs**: the game mounts the RomFS as `FS_Rom` and temporary storage as `FS_Temp`, reads
     `FS_Rom:/BOOT/CONFIG_MAIN.TXT`, and logs its own start-up lines (`[lm 0] Compiler: ...`). ✔
 13. **Graphics bring-up** (docs/graphics-plan.md). The `nv::` and `nn::vi::` overrides take the place of `nvdrv`, and
-    `nvnBootstrapLoader` hands out TotK's NVN procs. The game creates its device, records command buffers and **presents
-    its first frame** through Vulkan on the RTX 3060 Ti. ✔ Two procs TotK never needed were added:
-    `nvnSamplerPoolRegisterSamplerBuilder` and `nvnQueueWaitSync`.
+    `nvnBootstrapLoader` hands out TotK's NVN procs. The game creates its device, records command buffers and presents
+    through Vulkan on the RTX 3060 Ti. ✔ Two procs TotK never needed were added:
+    `nvnSamplerPoolRegisterSamplerBuilder` and `nvnQueueWaitSync`. **Correction (2026-11-09):** until then `main.c`
+    hard-coded the null back end, so the first runs recorded and "presented" without Vulkan; `MLB_GPU` (default
+    `vulkan`) now chooses, and the Vulkan path is what runs. MLB binds one program per shader stage, which TotK's back
+    end did not support (every draw was skipped as having no vertex stage); see docs/graphics-plan.md.
 14. Network setup, offline: **`nifm:u`** (`CreateGeneralService`) and **`bsd:u`** (`RegisterClient`,
     `StartMonitoring`) are served with nothing behind them (`runtime/mlb/services.c`). ✔
 15. **`nn::account`** by symbol override (`runtime/mlb/account.c`, TotK's six overrides). The preselected user opens
     with the local Uid, and its nickname comes from `MLB_NICKNAME` (default `Player`). The network service account
     reads as unavailable; its other online calls stop with a named fatal, so no SDK code ever sees a host-made user
     handle. ✔
-16. Input: `nn::hid::InitializeNpad` (from `main+0x1342ec8`) opens **`hid`**. ✘ **Current stop:**
-    `sm: service "hid" is not implemented`.
+16. **Input** by symbol override (`runtime/mlb/hid.c`): one full-key controller as player 1, fed by XInput and the
+    keyboard (map in the file header; `MLB_PAD_MAP`, `MLB_RUMBLE`). ✔
+17. More offline services: `ssl`, `csrng` (host random bytes), `ngc:u` (no word list, nothing flagged), `friend:u`
+    (an empty notification queue whose event never fires), `nim:eca`, `nsd:u` (environment `lp1`, `ResolveEx`), and
+    `pctl`'s free-communication commands (permitted). The SDK's own `nn::account` user lists are overridden too
+    (`ListOpenUsers` is called from the SDK's friends code). ✔
+18. **Audio**: `audren:u` is TotK's renderer and mixer (`runtime/core/audren.c`, `audio_mixer.c`); `audout:u` is
+    Astral Chain Recomp's (`runtime/core/audout.c`). MLB uses both: a 6-channel `AudioOut` that is folded to stereo, and
+    a renderer with one device sink. Output is WASAPI (`runtime/core/platform/audio_win32.c`) instead of SDL3.
+    `audin:u` lists no microphone. ✔ The AudioOut needed two changes from Astral's behaviour: the buffer event is
+    signalled again while a played buffer waits, and `GetAudioOutBufferCount` counts only unplayed buffers (MLB waits
+    for that count to fall before it takes buffers back).
+19. The game opens its intro movies (`UI/MOVIES/INTRO/*.BIK`, Bink, decoded by the game itself) and logs
+    `ATT_SCREEN: FMV player init.` It then runs at 60 fps with two draws a frame for at least 75 s. ✘ **Current
+    stop:** every presented frame is black (`MLB_SHOT` captures). Under investigation: MLB samples through separate
+    texture and sampler handles (`nvnCommandBufferBindSeparateTextures`), and uploads movie frames with
+    `nvnTextureWriteTexels`.
 
 Commands each service has not been seen to use stop with a named fatal (`ipc_unimplemented`), so every new one is
 found where it is first needed; commands that only pass a setting are accepted and logged under `MLB_TRACE=ipc`.
@@ -149,7 +167,9 @@ found where it is first needed; commands that only pass a setting are accepted a
 `tools/disasm.py` disassembles a module range or symbol (with PLT call targets named) for reading SDK code paths
 such as the ones above.
 
-Still ahead: hid (input), then more of the game's frames and their correctness, audio, and the save path as the game first uses it.
+`MLB_SHOT=<frame>[,<frame>...]` saves those presented frames as `<profile>/shot-<frame>.png`.
+
+Still ahead: the frames' correctness (step 19), then the menus, and the save path as the game first uses it.
 
 ## Approach for services
 

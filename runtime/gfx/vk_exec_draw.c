@@ -2206,6 +2206,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     vk_exec_pass_begin(ex);
     VkRect2D sc = vk_exec_scissor(ex);
     if (!sc.extent.width || !sc.extent.height) return 0;
+    ex->prog = ex->prog_gfx;   // mlbts-native: the graphics stages' program (vk_exec.h stage_prog)
     if (!ex->prog) return warn_once(W_PROGRAM, "a draw without a bound program is skipped"), 0;
     int has_vs, has_fs, vs_wait = 0, fs_wait = 0, memo = shader_memo_on();
     const GfxShader *vs, *fs;
@@ -3214,6 +3215,7 @@ static void op_draw_idx_ind(VkExec *ex, const p_draw_idx_ind *d) {
 
 static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     if (d->x <= 0 || d->y <= 0 || d->z <= 0) return;
+    ex->prog = ex->prog_cs;   // mlbts-native: the compute stage's program (vk_exec.h stage_prog)
     if (!ex->prog) return warn_once(W_PROGRAM, "a dispatch without a bound program is skipped");
     vk_contact_flush(ex);
     cb_res(ex);
@@ -3240,6 +3242,7 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
 // DispatchComputeIndirect: vkCmdDispatchIndirect from the pool buffer. The shader reads the group counts from c0 0x200,
 // so they are copied there on the GPU, into a c0 range no other dispatch uses, before the dispatch.
 static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
+    ex->prog = ex->prog_cs;   // mlbts-native: as op_dispatch
     if (!ex->prog) return warn_once(W_PROGRAM, "a dispatch without a bound program is skipped");
     VkMemSpan ip;
     if (!vk_mem_resolve(d->ind, sizeof(VkDispatchIndirectCommand), &ip) || ip.offset % 4)
@@ -3538,11 +3541,79 @@ static void bind_handles(uint64_t *dst, int cap, const p_bind_handles *b) {
     memcpy(&dst[b->first], b->h, sizeof(uint64_t) * (size_t)b->n);
 }
 
+// mlbts-native: the graphics program a draw sees when its stages come from different programs. One combined prog_t
+// per distinct set of {stage program, its serial}: it takes from each program the shader of the stage that program is
+// bound for and gets a serial of its own, so pipeline keys, shader memos and find_stage work on it unchanged. Kept for
+// the life of the process (a program set again gets a new serial and so a new combination). [H] Back-end state keyed
+// by a combined serial is not released with its component programs.
+typedef struct Combo { struct Combo *next; const prog_t *src[5]; uint64_t serial[5]; prog_t p; } Combo;
+#define COMBO_BUCKETS 4096
+static Combo *combos[COMBO_BUCKETS];
+static PlatMutex combo_lock = PLAT_MUTEX_INIT;
+static uint64_t combo_count;
+
+static const prog_t *graphics_program(const VkExec *ex) {
+    const prog_t *one = NULL;
+    int mixed = 0;
+    for (int s = 0; s < 5; s++) {
+        const prog_t *p = ex->stage_prog[s];
+        if (!p) continue;
+        if (one && p != one) mixed = 1;
+        if (!one) one = p;
+    }
+    if (!mixed) return one;   // one program for every bound graphics stage: TotK's case, used as it is
+    uint64_t h = 0;
+    for (int s = 0; s < 5; s++) {
+        const prog_t *p = ex->stage_prog[s];
+        h = (h ^ (uint64_t)(uintptr_t)p ^ (p ? p->serial << 17 : 0)) * 0x9E3779B97F4A7C15ull;
+    }
+    Combo **head = &combos[h >> 52 & (COMBO_BUCKETS - 1)];
+    plat_mutex_lock(&combo_lock);
+    Combo *c = *head;
+    for (; c; c = c->next) {
+        int same = 1;
+        for (int s = 0; s < 5 && same; s++) {
+            const prog_t *p = ex->stage_prog[s];
+            same = c->src[s] == p && c->serial[s] == (p ? p->serial : 0);
+        }
+        if (same) break;
+    }
+    if (!c) {
+        c = calloc(1, sizeof *c);
+        if (!c) rt_fatal("vk_exec: combined program allocation");
+        c->p.magic = NVN_PROG_MAGIC;
+        for (int s = 0; s < 5; s++) {
+            const prog_t *p = ex->stage_prog[s];
+            c->src[s] = p;
+            c->serial[s] = p ? p->serial : 0;
+            const uint8_t *ctl, *code;
+            uint32_t len;
+            if (p && find_stage_scan(p, s, &ctl, &code, &len) && c->p.nstage < 6)
+                c->p.sd[c->p.nstage++] = (NVNshaderData){(NVNbufferAddress)(uintptr_t)code, ctl};
+        }
+        c->p.serial = nvn_new_serial();
+        c->next = *head;
+        *head = c;
+        if (++combo_count == 1 || (rt_trace & RT_TRACE_GFX))
+            rt_log("vk_exec: combined program %llu from per-stage programs (%u stages; %llu combinations so far)",
+                   (unsigned long long)c->p.serial, c->p.nstage, (unsigned long long)combo_count);
+    }
+    plat_mutex_unlock(&combo_lock);
+    return &c->p;
+}
+
 void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
     switch (op) {
     case OP_BIND_PROGRAM: {
         const p_bind_program *b = payload;
-        ex->prog = b->prog, ex->prog_stages = b->stages;
+        // mlbts-native: per stage (vk_exec.h stage_prog); prog follows the bind as before, for code that reads it
+        // between binds and draws
+        for (int s = 0; s < 6; s++)
+            if (b->stages >> s & 1) ex->stage_prog[s] = b->prog;
+        ex->prog_gfx = graphics_program(ex);
+        ex->prog_cs = ex->stage_prog[NVN_STAGE_CS];
+        ex->prog = (b->stages & 0x1f) ? ex->prog_gfx : ex->prog_cs;
+        ex->prog_stages = b->stages;
         bind_gen++;
         break;
     }

@@ -86,6 +86,11 @@ typedef struct VkExec {
     // ---- vk_exec_draw.c slots (draws, binds, dispatch): left empty by vk_exec.c
     const prog_t *prog;                  // OP_BIND_PROGRAM
     int32_t prog_stages;
+    // mlbts-native: nvnCommandBufferBindProgram binds a program for the stages in its mask, and MLB binds one program
+    // per stage. stage_prog is each stage's program; prog_gfx (the graphics stages', combined when they differ:
+    // vk_exec_draw.c graphics_program) and prog_cs are what prog is set to before a draw and before a dispatch.
+    const prog_t *stage_prog[6];
+    const prog_t *prog_gfx, *prog_cs;
     NVNbufferRange vbuf[16];             // OP_BIND_VBUF
     p_bind_buf ubo[6][18], ssbo[6][16];  // OP_BIND_UBO / OP_BIND_SSBO per stage and index
     uint64_t tex[6][128], samp[6][128], img[6][32];   // OP_BIND_TEX / OP_BIND_SAMP / OP_BIND_IMG handles per stage

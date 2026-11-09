@@ -96,7 +96,14 @@ Each step ends with a run, a log, and a commit; the boot progress in docs/runtim
   after every field the remaining patches use.
 - **G3 ✔ (offline)** `tools/shader_smoke.py`: 66 of 66 vertex/fragment programs from 12 FXB banks translate to
   SPIR-V **[C]**.
-- **G1, G2, G4 ✔** The whole stack builds with clang (MSVC target) and lld. The boot passes `nv::InitializeGraphics`
-  and `nvnBootstrapLoader`, records command buffers and presents its first frame. The run then leaves graphics for
-  `nifm:u`.
-- **G5** open: the frames after the first, and what they show.
+- **G1, G2 ✔** The whole stack builds with clang (MSVC target) and lld. The boot passes `nv::InitializeGraphics`
+  and `nvnBootstrapLoader` and records command buffers.
+- **G4 (2026-11-09)** The status above first claimed a presented frame, but `main.c` had the null back end
+  hard-coded, so Vulkan never ran. With `MLB_GPU=vulkan` (now the default) the window, swapchain and translator
+  (`work/xlate/`, which gfx_shader.c now looks for instead of TotK's `build/xlate/`) run, and the game presents at
+  60 fps. Every draw was skipped at first: MLB's programs hold **one stage each** **[C]** and are bound per stage
+  (`nvnCommandBufferBindProgram`'s stage mask), while TotK's back end took the last bound program as the whole
+  pipeline. `vk_exec_draw.c` now keeps a program per stage and hands draws a combined program (one per distinct set,
+  with its own serial), and dispatches the compute stage's program.
+- **G5** open: the presented frames are black while the intro movie should play. MLB binds textures and samplers
+  through separate handles and writes movie frames with `nvnTextureWriteTexels`; both are next to check.

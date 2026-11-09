@@ -28,6 +28,7 @@ RT_FLAGS = ['-O2', '-g', '-Wall', '-Wno-unused-function', '-fno-strict-aliasing'
 LIBS = ['bcrypt', 'user32', 'kernel32', 'advapi32', 'ntdll', 'synchronization', 'winmm', 'psapi', 'shell32', 'ole32',
         'dbghelp', 'gdi32', 'dwmapi', 'imm32', 'uuid']
 RUNTIME_SOURCES = ['runtime/core/*.c', 'runtime/core/platform/common.c', 'runtime/core/platform/win32.c',
+                   'runtime/core/platform/audio_win32.c',
                    'runtime/mlb/*.c', 'runtime/gfx/*.c', 'runtime/gfx/*.cpp']
 DEPS = ROOT / 'work' / 'deps'   # tools/fetch_deps.py: Vulkan headers, VMA, vulkan-1.lib
 CXX_FLAGS = ['-O2', '-g', '-std=c++17', '-march=x86-64-v3', '-D_CRT_SECURE_NO_WARNINGS', '-Wno-nullability-completeness']

@@ -140,6 +140,61 @@ static void ov_nsa_available(Cpu *c) {
     ret_x(c, out ? 0 : ACCOUNT_R_INVALID);
 }
 
+// The user lists. One local account: it always exists, is qualified for this application, and is open while any
+// handle from TryOpenPreselectedUser is (the SDK's own friends code asks ListOpenUsers, so these are reached from
+// sdk as well as main; the SDK versions would read an account service object that is never set up here).
+static int open_count(void) {   // holding account_lock
+    int n = 0;
+    for (int i = 0; i < 64; i++) n += tokens[i] != 0;
+    return n;
+}
+
+static void list_users(Cpu *c, int only_open) {   // Result (int *count, Uid *out, int max)
+    int32_t *count = arg_p(c, 0);
+    Uid *out = arg_p(c, 1);
+    int max = (int)arg_x(c, 2);
+    plat_mutex_lock(&account_lock);
+    load_uid();
+    int n = (!only_open || open_count()) && max > 0 ? 1 : 0;
+    if (n && out) out[0] = (Uid){uid_lo, uid_hi};
+    plat_mutex_unlock(&account_lock);
+    if (count) *count = n;
+    ret_x(c, 0);
+}
+
+// Result ListOpenUsers(int *, Uid *, int) and the overload with an arp::ApplicationInstanceId
+static void ov_list_open(Cpu *c) { list_users(c, 1); }
+// Result ListAllUsers(int *, Uid *, int); ListQualifiedUsers(int *, Uid *, int[, const ApplicationId &])
+static void ov_list_all(Cpu *c) { list_users(c, 0); }
+
+// Result GetUserCount(int *)
+static void ov_user_count(Cpu *c) {
+    int32_t *n = arg_p(c, 0);
+    if (n) *n = 1;
+    ret_x(c, 0);
+}
+
+// Result GetUserExistence(bool *, const Uid &)
+static void ov_user_exists(Cpu *c) {
+    uint8_t *out = arg_p(c, 0);
+    plat_mutex_lock(&account_lock);
+    load_uid();
+    int yes = same_uid(arg_p(c, 1));
+    plat_mutex_unlock(&account_lock);
+    if (out) *out = (uint8_t)yes;
+    ret_x(c, 0);
+}
+
+// Result GetLastOpenedUser(Uid *)
+static void ov_last_opened(Cpu *c) {
+    Uid *out = arg_p(c, 0);
+    plat_mutex_lock(&account_lock);
+    load_uid();
+    if (out) *out = (Uid){uid_lo, uid_hi};
+    plat_mutex_unlock(&account_lock);
+    ret_x(c, 0);
+}
+
 // The online ones: with IsNetworkServiceAccountAvailable false the game should not get here; if it does, the answer
 // Horizon gives (and whether an applet would show) is not known yet.
 #define ACCOUNT_ONLINE(fn, name)                                                                                           static void fn(Cpu *c) {                                                                                                 (void)c;                                                                                                             rt_fatal("nn::account::%s: the network service account is not served (offline)", name);                         }
@@ -156,6 +211,14 @@ HOST_OVERRIDE("_ZN2nn7account9CloseUserERKNS0_10UserHandleE", ov_close_user);
 HOST_OVERRIDE("_ZN2nn7account9GetUserIdEPNS0_3UidERKNS0_10UserHandleE", ov_user_id);
 HOST_OVERRIDE("_ZN2nn7account11GetNicknameEPNS0_8NicknameERKNS0_3UidE", ov_nickname);
 HOST_OVERRIDE("_ZN2nn7account32IsNetworkServiceAccountAvailableEPbRKNS0_10UserHandleE", ov_nsa_available);
+HOST_OVERRIDE("_ZN2nn7account13ListOpenUsersEPiPNS0_3UidEi", ov_list_open);
+HOST_OVERRIDE("_ZN2nn7account13ListOpenUsersEPiPNS0_3UidEiRKNS_3arp21ApplicationInstanceIdE", ov_list_open);
+HOST_OVERRIDE("_ZN2nn7account12ListAllUsersEPiPNS0_3UidEi", ov_list_all);
+HOST_OVERRIDE("_ZN2nn7account18ListQualifiedUsersEPiPNS0_3UidEi", ov_list_all);
+HOST_OVERRIDE("_ZN2nn7account18ListQualifiedUsersEPiPNS0_3UidEiRKNS_13ApplicationIdE", ov_list_all);
+HOST_OVERRIDE("_ZN2nn7account12GetUserCountEPi", ov_user_count);
+HOST_OVERRIDE("_ZN2nn7account16GetUserExistenceEPbRKNS0_3UidE", ov_user_exists);
+HOST_OVERRIDE("_ZN2nn7account17GetLastOpenedUserEPNS0_3UidE", ov_last_opened);
 HOST_OVERRIDE("_ZN2nn7account26GetNetworkServiceAccountIdEPNS0_23NetworkServiceAccountIdERKNS0_10UserHandleE", ov_nsa_id);
 HOST_OVERRIDE("_ZN2nn7account36EnsureNetworkServiceAccountAvailableERKNS0_10UserHandleE", ov_nsa_ensure);
 HOST_OVERRIDE("_ZN2nn7account37LoadNetworkServiceAccountIdTokenCacheEPmPcmRKNS0_10UserHandleE", ov_nsa_token);

@@ -3,19 +3,12 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#include "audren.h"
 #include "host.h"
 #include "ipc.h"
 #include "nfp.h"
 
 
 // ---- services ipc.c lists in its sm: table
-void audren_manager_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
-    (void)rs;
-    ipc_unimplemented(s, rq);
-}
-long audren_renderers_live(void) { return 0; }
-
 void nfp_user_manager_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
     (void)rs;
     ipc_unimplemented(s, rq);

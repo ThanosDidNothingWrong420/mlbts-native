@@ -143,6 +143,8 @@ static void pctl_service_handler(IpcSession *s, const IpcRequest *rq, IpcRespons
     case 1: return;      // Initialize
     case 1001: return;   // CheckFreeCommunicationPermission: permitted
     case 1013: return;   // ConfirmStereoVisionPermission: permitted
+    case 1017: return;   // EndFreeCommunication
+    case 1018: return;   // IsFreeCommunicationAvailable: available (a restriction would be a failing result)
     case 1031:           // IsRestrictionEnabled -> bool
     case 1403:           // IsPairingActive -> bool
     case 1453:           // IsPlayTimerEnabled -> bool
@@ -278,13 +280,30 @@ static void friend_service_handler(IpcSession *s, const IpcRequest *rq, IpcRespo
     ipc_unimplemented(s, rq);
 }
 
+// INotificationService: the friend notifications of one user (requests, presence). Offline none arrive: the event is
+// never signalled and the queue is always empty.
+#define FRIEND_R_QUEUE_EMPTY 0x1E79u   // friends (module 121) description 15 [H: from Ryujinx's ResultCode]
+static void friend_notification_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    static uint32_t ev;
+    switch (rq->cmd) {
+    case 0:   // GetEvent -> copy handle
+        rs->copy[rs->ncopy++] = nifm_event(&ev);
+        return;
+    case 1: return;   // Clear
+    case 2:           // Pop -> SizedNotificationInfo
+        rs->result = FRIEND_R_QUEUE_EMPTY;
+        return;
+    default: ipc_unimplemented(s, rq);
+    }
+}
+
 static void friend_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
     switch (rq->cmd) {
     case 0:   // CreateFriendService -> IFriendService
         rs->move[rs->nmove++] = ipc_session_new("friend:IFriendService", friend_service_handler, NULL, NULL);
         return;
     case 1:   // CreateNotificationService(Uid) -> INotificationService
-        rs->move[rs->nmove++] = ipc_session_new("friend:INotificationService", friend_service_handler, NULL, NULL);
+        rs->move[rs->nmove++] = ipc_session_new("friend:INotificationService", friend_notification_handler, NULL, NULL);
         return;
     default: ipc_unimplemented(s, rq);
     }
@@ -313,6 +332,64 @@ static void eca_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
     }
 }
 
+// ---- nsd:u: network service discovery settings. A retail console's are the production environment "lp1"
+// (nn::oe::ServerEnvironmentType 1, Lp). Offline nothing connects to the names it resolves.
+#define NSD_ENVIRONMENT "lp1"
+static const IpcBuffer *nsd_in(const IpcRequest *rq) {    // AutoSelect in (0x15): A or X
+    return rq->na && rq->a[0].size ? &rq->a[0] : rq->nx && rq->x[0].size ? &rq->x[0] : NULL;
+}
+static const IpcBuffer *nsd_out(const IpcRequest *rq) {   // AutoSelect out (0x16): B or C
+    return rq->nb && rq->b[0].size ? &rq->b[0] : rq->nc && rq->c[0].size ? &rq->c[0] : NULL;
+}
+
+static void nsd_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    switch (rq->cmd) {
+    case 11: {   // GetEnvironmentIdentifier -> buffer 0x16 (8 bytes)
+        const IpcBuffer *o = nsd_out(rq);
+        if (!o) rt_fatal("nsd: GetEnvironmentIdentifier without an output buffer");
+        char *d = ipc_guest(o->addr, o->size);
+        memset(d, 0, o->size);
+        memcpy(d, NSD_ENVIRONMENT, o->size < sizeof NSD_ENVIRONMENT ? o->size : sizeof NSD_ENVIRONMENT);
+        return;
+    }
+    case 21: {   // ResolveEx(buffer 0x15 Fqdn) -> (Result, buffer 0x16 Fqdn): '%' stands for the environment
+        const IpcBuffer *i = nsd_in(rq), *o = nsd_out(rq);
+        if (!i || !o) rt_fatal("nsd: ResolveEx without its buffers");
+        const char *src = ipc_guest(i->addr, i->size);
+        char out[0x100] = {0};
+        size_t n = 0;
+        for (size_t k = 0; k < i->size && src[k] && n + 4 < sizeof out; k++) {
+            if (src[k] == '%') memcpy(out + n, NSD_ENVIRONMENT, 3), n += 3;
+            else out[n++] = src[k];
+        }
+        memcpy(ipc_guest(o->addr, o->size), out, o->size < sizeof out ? o->size : sizeof out);
+        if (rt_trace & RT_TRACE_IPC) rt_log("nsd: ResolveEx %s", out);
+        uint32_t inner = 0;
+        IPC_OUT(rs, inner);
+        return;
+    }
+    case 100: {   // GetApplicationServerEnvironmentType -> u8
+        uint8_t v = 1;   // Lp
+        IPC_OUT(rs, v);
+        return;
+    }
+    default: ipc_unimplemented(s, rq);
+    }
+}
+
+// ---- audin:u: audio input (the microphone, for voice chat). No input device is offered: every list is empty, so the
+// SDK never opens one.
+static void audin_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    switch (rq->cmd) {
+    case 0: case 2: case 4: {   // ListAudioIns, ListAudioInsAuto, ListAudioInsAutoFiltered -> u32 count
+        uint32_t n = 0;
+        IPC_OUT(rs, n);
+        return;
+    }
+    default: ipc_unimplemented(s, rq);
+    }
+}
+
 // ---- table
 void am_applet_oe_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs);   // am.c
 void aoc_u_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs);          // aoc.c
@@ -333,6 +410,8 @@ static const struct { const char *name; IpcHandler handler; } services[] = {
     {"ngc:u", ngc_handler},
     {"friend:u", friend_handler},
     {"nim:eca", eca_handler},
+    {"nsd:u", nsd_handler},
+    {"audin:u", audin_handler},
 };
 
 IpcHandler rt_service_handler(const char *name, const char **stable_name) {

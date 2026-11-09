@@ -26,6 +26,7 @@ enum { T_CLOSE = 2, T_REQUEST = 4, T_CONTROL = 5, T_REQUEST_CTX = 6, T_CONTROL_C
 // Services sm: hands out. Anything else is a named fatal.
 static const struct { const char *name; IpcHandler handler; } services[] = {
     {"audren:u", audren_manager_handler},
+    {"audout:u", audout_manager_handler},   // mlbts-native (audout.c)
     {"nfp:user", nfp_user_manager_handler},
 };
 
@@ -374,6 +375,20 @@ static void dispatch(IpcSession *s, uint32_t *m) {
 }
 
 // ---- sm: service manager (CMIF, and TIPC as the SDK's sm client speaks it since 12.0.0)
+
+// mlbts-native: the first open of each service is logged, later ones only with TOTK_TRACE=ipc (MLB opens audin:u
+// about once a second while it looks for a microphone). Names are the table's own strings, so pointers compare.
+static void log_open(const char *name) {
+    static const char *seen[96];
+    static PlatMutex seen_lock = PLAT_MUTEX_INIT;
+    int first = 1;
+    plat_mutex_lock(&seen_lock);
+    for (int i = 0; i < 96 && seen[i] && first; i++) first = seen[i] != name;
+    for (int i = 0; i < 96 && first; i++)
+        if (!seen[i]) { seen[i] = name; break; }
+    plat_mutex_unlock(&seen_lock);
+    if (first || (rt_trace & RT_TRACE_IPC)) rt_log("ipc: opened service %s", name);
+}
 static void sm_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
     switch (rq->cmd) {
     case 0: return;   // RegisterClient / Initialize (pid)
@@ -391,14 +406,14 @@ static void sm_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
         for (unsigned i = 0; i < sizeof services / sizeof *services; i++)
             if (!strcmp(services[i].name, name)) {
                 rs->move[rs->nmove++] = ipc_session_new(services[i].name, services[i].handler, NULL, NULL);
-                rt_log("ipc: opened service %s", services[i].name);
+                log_open(services[i].name);
                 return;
             }
         const char *stable = NULL;
         IpcHandler extra = rt_service_handler(name, &stable);   // mlbts-native: services the game layer adds
         if (extra) {
             rs->move[rs->nmove++] = ipc_session_new(stable, extra, NULL, NULL);
-            rt_log("ipc: opened service %s", stable);
+            log_open(stable);
             return;
         }
         fflush(stdout);
