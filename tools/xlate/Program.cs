@@ -102,8 +102,12 @@ static class SwshXlate
             // "early_fragment_tests": the fragment shader's NVN control byte +0x718 (the driver's early-Z-force, Ryujinx's
             // EarlyZForce); the SPIR-V then declares EarlyFragmentTests (MacNativeGames ae8f4f4).
             bool earlyZ = _job["early_fragment_tests"] is JsonValue ez && ez.TryGetValue<bool>(out bool eb) && eb;
+            // mlbts-native: "alpha_test" (NVNalphaFunc 1-7, the same numbering as AlphaTestOp) and "alpha_ref" (the float's
+            // bits): NVN's alpha test, which Vulkan lacks, compiled into the fragment shader as Ryujinx does.
+            AlphaTestOp alphaOp = _job["alpha_test"] is JsonNode at && (int)at >= 1 && (int)at <= 7 ? (AlphaTestOp)(int)at : AlphaTestOp.Always;
+            float alphaRef = _job["alpha_ref"] is JsonNode ar ? BitConverter.UInt32BitsToSingle((uint)ar) : 0f;
             return new GpuGraphicsState(earlyZ, InputTopology.Triangles, false, TessPatchType.Triangles, TessSpacing.EqualSpacing,
-                false, false, false, depthMinusW, false, 1f, AlphaTestOp.Always, 0f, attr, false, fout, false,
+                false, false, false, depthMinusW, false, 1f, alphaOp, alphaRef, attr, false, fout, false,
                 false /* 不做 Y 取反 | no Y flip */, true /* 原点左上 | origin upper-left */, false);
         }
         public bool QueryHostSupportsDepthClipControl() => true;

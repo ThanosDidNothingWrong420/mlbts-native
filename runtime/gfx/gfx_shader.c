@@ -1097,7 +1097,8 @@ static size_t pack_answers(uint8_t *o, const GfxShaderAnswers *a) {
     memcpy(p, a->frag_out_type, 8), p += 8;
     for (int i = 0; i < 3; i++) *p++ = (uint8_t)a->local[i], *p++ = (uint8_t)(a->local[i] >> 8);
     put_u32(&p, a->shared_bytes);
-    *p++ = (uint8_t)(a->depth_minus_w | (a->mvprev ? 0x80 : 0));
+    *p++ = (uint8_t)(a->alpha_func | (a->mvprev ? 0x80 : 0));
+    if (a->alpha_func) put_u32(&p, (uint32_t)a->alpha_ref_hi << 16 | a->alpha_ref_lo);   // only then: other keys unchanged
     return (size_t)(p - o);
 }
 
@@ -1117,7 +1118,7 @@ static int build_code_hash(int stage, const uint8_t *control, const uint8_t *cod
     return 1;
 }
 
-// The answers with everything outside the mask zeroed; the translator ignores depth_minus_w (Program.cs).
+// The answers with everything outside the mask zeroed; the alpha test (fragment stage) is always kept.
 static void mask_answers(const GfxShaderAnswers *a, const UseMask *m, GfxShaderAnswers *o) {
     memset(o, 0, sizeof *o);
     if (!a) return;
@@ -1130,6 +1131,7 @@ static void mask_answers(const GfxShaderAnswers *a, const UseMask *m, GfxShaderA
     memcpy(o->local, a->local, sizeof o->local);
     o->shared_bytes = a->shared_bytes;
     o->mvprev = a->mvprev;   // another translation, not an answer the use mask covers
+    o->alpha_func = a->alpha_func, o->alpha_ref_lo = a->alpha_ref_lo, o->alpha_ref_hi = a->alpha_ref_hi;
 }
 
 // The cache key of an input id under the current translator.
@@ -1196,6 +1198,9 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const 
         for (int i = 0; i < 8; i++)
             if (a->frag_out_type[i]) o += sprintf(o, "%s\"%d\":\"%s\"", sep, i, attr_name(a->frag_out_type[i])), sep = ",";
         o += sprintf(o, "},\"shared\":%u", a->shared_bytes);
+        if (a->alpha_func)   // mlbts-native: the fragment stage's alpha test, compiled into the shader (Program.cs)
+            o += sprintf(o, ",\"alpha_test\":%u,\"alpha_ref\":%u", a->alpha_func,
+                         (unsigned)((uint32_t)a->alpha_ref_hi << 16 | a->alpha_ref_lo));
     }
     if (!strcmp(stage, "cs")) {
         uint32_t l[3] = {1, 1, 1};
@@ -1870,7 +1875,12 @@ static void unpack_answers(const uint8_t *p, GfxShaderAnswers *a) {
     memcpy(a->frag_out_type, p, 8), p += 8;
     for (int i = 0; i < 3; i++) a->local[i] = (uint16_t)(p[0] | p[1] << 8), p += 2;
     memcpy(&a->shared_bytes, p, 4), p += 4;
-    a->depth_minus_w = *p & 0x7f, a->mvprev = *p >> 7;
+    a->alpha_func = *p & 0x7f, a->mvprev = *p >> 7;
+    if (a->alpha_func) {
+        uint32_t r;
+        memcpy(&r, p + 1, 4);
+        a->alpha_ref_lo = (uint16_t)r, a->alpha_ref_hi = (uint16_t)(r >> 16);
+    }
 }
 
 // Reads a record file's body (after its header) into *body; 0 when absent, and a file with another header is removed.
@@ -1951,16 +1961,19 @@ static void ans_note(const Req *r, int stage, const uint8_t *control, const uint
     uint32_t st = (uint32_t)stage;
     plat_mutex_lock(&RC.lock);
     if (set_add(&RC.pairs, hash8(s->iid))) {
-        uint8_t rec[ANS_REC] = {0};
+        uint8_t rec[ANS_REC + 8] = {0};
         memcpy(rec, &st, 4), memcpy(rec + 4, r->code_hash, 32), memcpy(rec + 36, s->iid, 32);
-        pack_answers(rec + 68, a);
+        if (pack_answers(rec + 68, a) > ANS_PACKED) {   // mlbts-native: alpha-test answers do not fit the record;
+            plat_mutex_unlock(&RC.lock);                // the stored inputs (in/) still prewarm them
+            return;
+        }
         if (set_add(&RC.progs, hash8(r->code_hash))) {
             uint32_t head[3] = {st, r->length, r->c1_len};
             bytes_put(&RC.prg, head, 12), bytes_put(&RC.prg, r->code_hash, 32);
             bytes_put(&RC.prg, control, CONTROL_SIZE), bytes_put(&RC.prg, code, r->length);
             bytes_put(&RC.prg, r->c1, r->c1_len);
         }
-        bytes_put(&RC.ans, rec, sizeof rec);
+        bytes_put(&RC.ans, rec, ANS_REC);
         RC.pairs_new++;
     }
     plat_mutex_unlock(&RC.lock);

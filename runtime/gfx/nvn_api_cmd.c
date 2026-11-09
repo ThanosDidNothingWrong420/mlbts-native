@@ -1096,6 +1096,15 @@ NVN_API(nvnCommandBufferSetStencilMask) {
 NVN_API(nvnCommandBufferSetStencilRef) {
     *REC(cmd_of(c), OP_STENCIL, p_stencil) = (p_stencil){(int)arg_x(c, 1), 0, 0, (int)arg_x(c, 2), 2};
 }
+// void nvnCommandBufferSetAlphaRef(NVNcommandBuffer *cmd, float ref): the alpha test's reference, recorded as an
+// OP_STENCIL with which 3 (the float's bits in ref); the replay compiles the test into the fragment shader
+// (vk_exec_draw.c answers_for). MLB's crowd cards cut their background out with it.
+NVN_API(nvnCommandBufferSetAlphaRef) {
+    float r = arg_s(c, 0);
+    int32_t bits;
+    memcpy(&bits, &r, 4);
+    *REC(cmd_of(c), OP_STENCIL, p_stencil) = (p_stencil){0, 0, 0, bits, 3};
+}
 // void nvnCommandBufferSetPolygonOffsetClamp(NVNcommandBuffer *cmd, float factor, float units, float clamp)
 NVN_API(nvnCommandBufferSetPolygonOffsetClamp) {
     *REC(cmd_of(c), OP_POLY_OFFSET, p_poly_offset) = (p_poly_offset){arg_s(c, 0), arg_s(c, 1), arg_s(c, 2)};

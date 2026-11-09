@@ -904,6 +904,10 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
         }
         case OP_STENCIL: {
             const p_stencil *s = a;
+            if (s->which == 3) {   // mlbts-native: the alpha test reference (nvnCommandBufferSetAlphaRef)
+                ex->alpha_ref = (uint32_t)s->ref;
+                break;
+            }
             for (int f = 0; f < 2; f++) {
                 if (!(s->face & (1 << f))) continue;
                 if (s->which == 0) ex->st_vmask[f] = (uint32_t)s->value_mask;

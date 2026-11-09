@@ -760,7 +760,16 @@ static uint8_t type_of_handle(uint64_t h) {   // texture lock held
 static void answers_for(VkExec *ex, int st, const uint8_t *ctl, uint32_t mask, GfxShaderAnswers *a) {
     memset(a, 0, sizeof *a);
     if (st == NVN_STAGE_VS) vk_pipeline_answers(&ex->pipe, a, NULL);
-    else if (st == NVN_STAGE_FS) vk_pipeline_answers(&ex->pipe, NULL, a);
+    else if (st == NVN_STAGE_FS) {
+        vk_pipeline_answers(&ex->pipe, NULL, a);
+        // mlbts-native: NVN's alpha test (nvnColorStateSetAlphaTest, nvnCommandBufferSetAlphaRef) has no Vulkan state;
+        // the translator compiles it into the fragment shader (Ryujinx GpuGraphicsState.AlphaTestCompare / Reference).
+        unsigned f = ex->pipe.color.alpha_func;
+        if (f && f != NVN_ALPHA_FUNC_ALWAYS) {
+            a->alpha_func = (uint8_t)f;
+            a->alpha_ref_lo = (uint16_t)ex->alpha_ref, a->alpha_ref_hi = (uint16_t)(ex->alpha_ref >> 16);
+        }
+    }
     else
         for (int k = 0; k < 3; k++) {
             uint32_t l;
@@ -3446,13 +3455,14 @@ static void draw_note(VkExec *ex, const char *kind, int prim, int count) {
         const ds_st *d = &ex->pipe.ds;
         rt_log("drawlog   ds: depth test %u write %u func %u; stencil %u funcs %u/%u ops f%u/zf%u/zp%u ref %u/%u vmask %#x/%#x "
                "wmask %#x/%#x; vp0 %.0f,%.0f %.0fx%.0f z %.3f..%.3f, range %.3f..%.3f; scissor %d,%d %dx%d (set %d); "
-               "depth_minus_w %u, poly cull %#llx",
+               "depth_minus_w %u, poly cull %#llx; alpha test %u ref %g",
                (unsigned)d->dt, (unsigned)d->dw, (unsigned)d->df, (unsigned)d->st, (unsigned)d->sf_f, (unsigned)d->sf_b,
                (unsigned)d->fail_f, (unsigned)d->zfail_f, (unsigned)d->zpass_f, ex->st_ref[0], ex->st_ref[1],
                ex->st_vmask[0], ex->st_vmask[1], ex->st_wmask[0], ex->st_wmask[1], ex->vp[0][0], ex->vp[0][1],
                ex->vp[0][2], ex->vp[0][3], ex->vp[0][4], ex->vp[0][5], ex->depth_range[0], ex->depth_range[1],
                (int)ex->scissor.x, (int)ex->scissor.y, (int)ex->scissor.w, (int)ex->scissor.h, ex->has_scissor,
-               (unsigned)ex->pipe.depth_minus_w, (unsigned long long)*(const uint32_t *)&ex->pipe.poly);
+               (unsigned)ex->pipe.depth_minus_w, (unsigned long long)*(const uint32_t *)&ex->pipe.poly,
+               (unsigned)ex->pipe.color.alpha_func, (double)*(const float *)&ex->alpha_ref);
     }
     {   // vertex input and the vertex stage's storage buffers (mlbts-native)
         char line[700];

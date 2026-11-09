@@ -72,6 +72,7 @@ typedef struct VkExec {
     int has_scissor;                     // a scissor was set; else unbounded
     float depth_range[2];                // OP_DEPTH_RANGE: overrides the viewports' near and far
     uint32_t st_vmask[2], st_wmask[2], st_ref[2];   // OP_STENCIL per face (0 front, 1 back): compare mask, write mask, ref
+    uint32_t alpha_ref;                              // mlbts-native: OP_STENCIL which 3, nvnCommandBufferSetAlphaRef (float bits)
     float point_size;                    // OP_BIND_STATE kind 6: NVN point size for the support buffer; 0 = never set = 1
     p_poly_offset poly_offset;           // OP_POLY_OFFSET: depth bias factor, units, clamp
     p_prim_restart prim_restart;         // OP_PRIM_RESTART: applied to indexed strip and fan draws (op_draw_idx)
