@@ -73,6 +73,7 @@ void vk_exec_frame_log(const tex_t *p, uint64_t frame) {
         const tex_t *ts[64];
         for (int i = 0; i < nfw; i++) ts[i] = fw[i].t;
         vk_capture_targets(ts, nfw, frame);
+        vk_drawq_report();
     }
     if (!(rt_trace & RT_TRACE_GFX)) {   // mlbts-native: the summary of the drawlog frame too, counted from the one before
         long want = vk_drawlog_frame();
@@ -671,6 +672,7 @@ void vk_exec_pass_begin(VkExec *ex) {
 
 void vk_exec_pass_end(VkExec *ex) {
     if (!ex->in_pass) return;
+    vk_exec_dq_end(ex);
     vk_exec_oq_pass_end(ex);
     vkCmdEndRendering(ex->cb);
     ex->recorded++;

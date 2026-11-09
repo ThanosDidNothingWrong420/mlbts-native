@@ -2282,6 +2282,7 @@ static int prepare_draw_inner(VkExec *ex, int prim, int32_t count, int restart);
 static long drawlog_now_l(void);
 // mlbts-native: in the drawlog frame, a draw prepare_draw_inner turns away is logged with what it can tell of why
 static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
+    vk_exec_dq_end(ex);   // the previous draw's query ends before this one's preparation can begin a game query
     int ok = prepare_draw_inner(ex, prim, count, restart);
     if (!ok && drawlog_now_l()) {
         VkRect2D sc = vk_exec_scissor(ex);
@@ -3227,8 +3228,66 @@ static int drawlog_now(void) {
     long want = vk_drawlog_frame();
     return want >= 0 && (long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1 == want;
 }
+// mlbts-native diagnosis: in the drawlog frame every draw inside a pass, unless a game samples-passed query is open
+// there, gets an occlusion query of its own ("q <n>" in its drawlog line); it ends at the next draw's preparation or
+// the pass end. vk_drawq_report logs the samples each one passed once the frame is done, so a draw that writes no
+// pixel (culled, every fragment failing depth or stencil, collapsed or off-screen vertices) shows as 0.
+#define DQ_N 8192
+static VkQueryPool dq_pool;
+static int dq_state;          // 0 not set up, 1 ready, -1 unavailable
+static uint32_t dq_n;         // queries begun in the drawlog frame
+static int dq_open = -1;
+
+static int dq_ready(void) {
+    if (dq_state) return dq_state > 0;
+    dq_state = -1;
+    VkCtx *v = vk_ctx();
+    VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_OCCLUSION,
+                                .queryCount = DQ_N};
+    if (vkCreateQueryPool(v->device, &qi, NULL, &dq_pool) != VK_SUCCESS) return 0;
+    vkResetQueryPool(v->device, dq_pool, 0, DQ_N);
+    dq_state = 1;
+    return 1;
+}
+
+void vk_exec_dq_end(VkExec *ex) {
+    if (dq_open < 0) return;
+    vkCmdEndQuery(ex->cb, dq_pool, (uint32_t)dq_open);
+    ex->recorded++;
+    dq_open = -1;
+}
+
+static int dq_begin(VkExec *ex) {
+    if (!ex->in_pass || vk_exec_oq_active() || dq_n >= DQ_N || !dq_ready()) return -1;
+    vkCmdBeginQuery(ex->cb, dq_pool, dq_n, 0);
+    ex->recorded++;
+    dq_open = (int)dq_n;
+    return (int)dq_n++;
+}
+
+void vk_drawq_report(void) {
+    if (!dq_n || dq_state <= 0) return;
+    VkDevice dev = vk_ctx()->device;
+    rt_log("drawq: %u draws queried; samples passed per query, 16 a line", dq_n);
+    for (uint32_t i = 0; i < dq_n; i += 16) {
+        uint64_t v[32];
+        uint32_t n = dq_n - i < 16 ? dq_n - i : 16;
+        char line[512];
+        int o = snprintf(line, sizeof line, "drawq %u:", i);
+        if (vkGetQueryPoolResults(dev, dq_pool, i, n, sizeof v, v, 2 * sizeof v[0],
+                                  VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) < 0)
+            n = 0;
+        for (uint32_t k = 0; k < n; k++)
+            o += snprintf(line + o, sizeof line - o, v[2 * k + 1] ? " %llu" : " ?", (unsigned long long)v[2 * k]);
+        rt_log("%s", line);
+    }
+    vkResetQueryPool(dev, dq_pool, 0, dq_n);
+    dq_n = 0;
+}
+
 static void draw_note(VkExec *ex, const char *kind, int prim, int count) {
     if (!drawlog_now()) return;
+    int q = dq_begin(ex);
     uint32_t h[2] = {0, 0};
     for (int st = 0; st < 2; st++) {
         const uint8_t *ctl, *code; uint32_t len;
@@ -3238,9 +3297,9 @@ static void draw_note(VkExec *ex, const char *kind, int prim, int count) {
             h[st] = x;
         }
     }
-    rt_log("drawlog %s prim %d count %d pass %ux%u fmt %d/%d prog %llu vs %08x fs %08x blend0 en %u src %u dst %u "
+    rt_log("drawlog %s q %d prim %d count %d pass %ux%u fmt %d/%d prog %llu vs %08x fs %08x blend0 en %u src %u dst %u "
            "chmask %#x tex1 %llx %llx %llx %llx samp1 %llx %llx ubo1 %llx+%llx",
-           kind, prim, count, ex->pass_w, ex->pass_h, ex->pipe.color_fmt[0], ex->pipe.depth_fmt,
+           kind, q, prim, count, ex->pass_w, ex->pass_h, ex->pipe.color_fmt[0], ex->pipe.depth_fmt,
            (unsigned long long)(ex->prog ? ex->prog->serial : 0), h[0], h[1], (unsigned)ex->pipe.color.blend_en,
            (unsigned)ex->pipe.blend[0].src_rgb, (unsigned)ex->pipe.blend[0].dst_rgb, ex->pipe.chmask.mask,
            (unsigned long long)ex->tex[1][0], (unsigned long long)ex->tex[1][1], (unsigned long long)ex->tex[1][2],
