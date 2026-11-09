@@ -3137,18 +3137,18 @@ static void bind_index(VkExec *ex, const void *data, uint64_t bytes, VkIndexType
 // mlbts-native diagnosis: MLB_DRAWLOG=<frame> logs every draw of that presented frame: pass, formats, program and a
 // hash of each stage's code, blend and mask state, the fragment stage's first texture and sampler handles, and what
 // the textures resolve to (size, storage address, a byte sum of their storage). Off unless set.
-// F12 in the game window arms it for the frame after the current one (vk_drawlog_arm, from gfx_stubs.c).
+// gfx_stubs.c gfx_capture_arm (F12, MLB_DRAWLOG=game) arms it for a frame to come (vk_drawlog_arm_at).
 static volatile long drawlog_want = -2;
-void vk_drawlog_arm(void) {
-    long f = (long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 2;
-    __atomic_store_n(&drawlog_want, f, __ATOMIC_RELAXED);
-    rt_log("drawlog: frame %ld", f);
+long vk_drawlog_frame(void);
+void vk_drawlog_arm_at(long frame) {
+    vk_drawlog_frame();   // reads MLB_DRAWLOG first, so it cannot overwrite this later
+    __atomic_store_n(&drawlog_want, frame, __ATOMIC_RELAXED);
 }
 long vk_drawlog_frame(void) {
     long want = __atomic_load_n(&drawlog_want, __ATOMIC_RELAXED);
     if (want == -2) {
         const char *e = cfg_get("MLB_DRAWLOG");
-        want = e ? atol(e) : -1;
+        want = e && strcmp(e, "game") ? atol(e) : -1;   // "game": armed by services.c at ===GAME ENTERED===
         __atomic_store_n(&drawlog_want, want, __ATOMIC_RELAXED);
     }
     return want;

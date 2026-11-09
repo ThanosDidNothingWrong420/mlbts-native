@@ -211,22 +211,32 @@ void vk_hdr_to_srgb8(const uint8_t *in, uint8_t *out, size_t px, int a2r) { (voi
 void menu_overlay_draw(VkCommandBuffer cb) { (void)cb; }
 // No overlay. mlbts-native: MLB_SHOT=<frame>[,<frame>...] saves the presented picture of those frames as
 // <profile>/shot-<frame>.png through gfx_present.c's capture path (the one TotK's menu test shots use).
-void vk_drawlog_arm(void);   // vk_exec_draw.c
+void vk_drawlog_arm_at(long frame);   // vk_exec_draw.c
+// One frame's capture, `ahead` presents from now: its draws in the log (MLB_DRAWLOG format) and its picture as
+// <profile>/shot-<frame>.png. F12 in the game window asks for one; so does MLB_DRAWLOG=game, 10 s after the game logs
+// ===GAME ENTERED=== (services.c).
+static volatile long capture_at = -1;
+void gfx_capture_arm(long ahead) {
+    long f = (long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + ahead;
+    vk_drawlog_arm_at(f);
+    __atomic_store_n(&capture_at, f, __ATOMIC_RELAXED);
+    rt_log("capture: frame %ld", f);
+}
 int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot) {
     (void)t;
     static char path[1100];
-    // F12 in the game window: log the next frame's draws (MLB_DRAWLOG) and save it as <profile>/shot-<frame>.png
     static int f12_was;
     HWND fg = GetForegroundWindow();
     DWORD pid = 0;
     if (fg) GetWindowThreadProcessId(fg, &pid);
-    int f12 = pid == GetCurrentProcessId() && (GetAsyncKeyState(VK_F12) & 0x8000);
-    if (f12 && !f12_was) {
-        vk_drawlog_arm();
+    int f12 = pid == GetCurrentProcessId() && (GetAsyncKeyState(VK_F12) & 0x8001);
+    if (f12 && !f12_was) gfx_capture_arm(2);
+    f12_was = f12 != 0;
+    if ((long)frame == __atomic_load_n(&capture_at, __ATOMIC_RELAXED)) {
         snprintf(path, sizeof path, "%s/shot-%llu.png", rt_config()->profile, (unsigned long long)frame);
         *shot = path;
+        MessageBeep(0xFFFFFFFFu);   // the capture is being taken: a beep tells the player (asynchronous)
     }
-    f12_was = f12;
     const char *list = cfg_get("MLB_SHOT");
     for (const char *q = list; q && *q;) {
         char *end;
