@@ -103,6 +103,9 @@ typedef struct {
     // 0x568 + 8 slot) for 1 and 2, the sampler id itself for 3, -1 outside the separate sampler range.
     uint8_t samp_type;
     int16_t samp_slot;
+    // mlbts-native: a texture array read from the c2 handle table (Ryujinx BindlessToArray): element k is c2 entry
+    // slot + k (8 bytes each from c2 byte 0), not texture slot slot + k (vk_exec_draw.c tex_slot_of)
+    uint8_t table;
 } GfxShaderRes;
 typedef struct { uint8_t type, comps, packed; } GfxShaderIo;   // GFX_TYPE_*, components, 1 with a Component decoration
 int gfx_shader_stage(const GfxShader *s);                   // GFX_STAGE_VS, GFX_STAGE_FS or GFX_STAGE_CS

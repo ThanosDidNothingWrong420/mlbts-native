@@ -712,6 +712,7 @@ static int handle_slot(int kind, int cbuf_slot, int handle, int separate, int16_
         if (sbuf != 2) return sep_tex_slot(bytes);
         if (sep_tex_slot(bytes) >= 0 && sep_samp_slot(other) >= 0) return *samp_slot = (int16_t)sep_samp_slot(other), sep_tex_slot(bytes);
         if (sep_tex_slot(other) >= 0 && sep_samp_slot(bytes) >= 0) return *samp_slot = (int16_t)sep_samp_slot(bytes), sep_tex_slot(other);
+        if (sep_samp_slot(other) >= 0) *samp_slot = (int16_t)sep_samp_slot(other);   // a handle-table array's sampler
         return sep_tex_slot(bytes);
     }
     if (type == 3) {   // SeparateConstantSamplerHandle: the sampler id is the immediate (gfx.h samp_slot)
@@ -721,6 +722,14 @@ static int handle_slot(int kind, int cbuf_slot, int handle, int separate, int16_
     if (separate) return sep_tex_slot(bytes);
     if (bytes >= 0x20 && bytes < 0x120) return (bytes - 0x20) / 8;
     return sep_tex_slot(bytes);
+}
+
+// mlbts-native: a texture array whose handles Ryujinx reads from c2 at a dynamic index (BindlessToArray.RunPass):
+// texture word at c2 byte 0 plus the element index in 8-byte entries. Its first c2 entry, or -1 when it is not one.
+static int table_entry(int kind, int cbuf_slot, int handle, int count) {
+    if (kind != GFX_RES_TEX || count < 2 || (cbuf_slot >= 0 && (cbuf_slot & 0xffff) != 2)) return -1;
+    int bytes = (handle & 0x3fff) * 4;
+    return bytes % 8 ? -1 : bytes / 8;
 }
 
 static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
@@ -750,6 +759,8 @@ static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
     r->separate = sep && *sep == 't';
     // cbuf_slot from the JSON in full: r->cbuf_slot keeps only its low byte
     r->slot = (int16_t)handle_slot(kind, (int)json_int(o, e, "cbuf_slot", -1), handle, r->separate, &r->samp_slot);
+    int entry = table_entry(kind, (int)json_int(o, e, "cbuf_slot", -1), handle, r->count);
+    if (entry >= 0 && r->slot < 0) r->table = 1, r->slot = (int16_t)entry;
     r->samp_type = kind == GFX_RES_TEX ? (uint8_t)((unsigned)handle >> 28) : 0;
 }
 

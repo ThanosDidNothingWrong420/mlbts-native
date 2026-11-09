@@ -1292,8 +1292,16 @@ static VkBufferView texel_view(VkExec *ex, uint64_t h, int written) {
 // mlbts-native: the texture handle a TEX resource reads, as the shader would form it: the texture word, ORed with the
 // sampler word bound at its separate sampler slot when it has one (gfx.h samp_type; Ryujinx TextureHandle
 // ReadPackedId). The texture word's own sampler bits are replaced then.
+// The texture slot element k of a TEX resource reads: slot + k, or for a handle-table array (gfx.h table) the slot of
+// c2 entry slot + k: separate textures are entries 45-172 (byte 0x168 on), combined handles entries 4-35 (0x20 on).
+static int tex_slot_of(const GfxShaderRes *r, int k) {
+    if (!r->table) return r->slot + k;
+    int e = r->slot + k;
+    return e >= 45 && e < 173 ? e - 45 : e >= 4 && e < 36 ? e - 4 : -1;
+}
+
 static uint64_t res_tex_handle(const VkExec *ex, int st, const GfxShaderRes *r, int k) {
-    int slot = r->slot + k;
+    int slot = tex_slot_of(r, k);
     uint64_t h = slot >= 0 && slot < 128 ? ex->tex[st][slot] : 0;
     if (!h || !r->samp_type) return h;
     uint64_t s = 0;
@@ -1575,7 +1583,7 @@ static VkDescriptorSet alloc_set(VkExec *ex, VkDescriptorSetLayout layout) {
         }
         static const VkDescriptorPoolSize sizes[] = {
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4096}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2048},
-            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4096}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16384}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024},   // mlbts-native: 173-entry handle-table arrays
             {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 256},
             {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 256}};
         VkDescriptorPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 256,
@@ -1787,7 +1795,7 @@ static const RsList *rs_list(const VkExec *ex, const VkPipeInfo *info) {
                        b->type != VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
                 int img = b->kind == GFX_RES_IMG, cap = img ? 32 : 128;
                 for (uint32_t k = 0; k < cnt; k++) {
-                    int slot = r->slot + (int)k;
+                    int slot = img ? r->slot + (int)k : tex_slot_of(r, (int)k);   // mlbts-native: handle tables
                     if (slot >= 0 && slot < cap) rs_add(tmp, &n, ex, img ? &ex->img[st][slot] : &ex->tex[st][slot], 8);
                 }
                 // mlbts-native: a separate sampler word is read too (res_tex_handle)

@@ -42,7 +42,10 @@ static class SwshXlate
         public SetBindingPair CreateTextureBinding(int count, bool isBuffer) { int b = _binding; _binding += count; return new(0, b); }
         public ReadOnlySpan<ulong> GetCode(ulong address, int minimumSize) => MemoryMarshal.Cast<byte, ulong>(new ReadOnlySpan<byte>(_code)[(int)address..]);
         public int QuerySamplerArrayLengthFromPool() => 32;
-        public int QueryTextureArrayLengthFromBuffer(int slot) => 32;
+        // mlbts-native: a texture array read from a handle table in c2 (Ryujinx BindlessToArray: element i is c2 entry i,
+        // 8 bytes each) reaches up to the end of the separate texture range, 0x568 / 8 = 173 entries; MLB's crowd indexes
+        // entries 47 and up, which a length of 32 clamped to entry 31 (runtime/gfx/gfx_shader.c handle_slot)
+        public int QueryTextureArrayLengthFromBuffer(int slot) => slot == 2 ? 173 : 32;
         public int QueryTextureArrayLengthFromPool() => 32;
 
         string Get(string table, int slot) => _job[table] is JsonObject t && t[slot.ToString()] is JsonNode n ? (n is JsonObject o ? (string)o["type"] : (string)n) : null;
