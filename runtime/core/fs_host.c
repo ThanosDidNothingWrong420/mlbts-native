@@ -1192,8 +1192,15 @@ static uint32_t extend_save(const uint64_t *uid, int64_t size, int64_t journal) 
 }
 
 // Free space of a mount: its size less what its files take (the RomFS has none).
+// mlbts-native: a bare mount name counts as its root. MLB asks GetFreeSpaceSize("savedata") (main+0xd76904) and reads
+// a failure as 0 bytes free; it then grows the save 8 MiB at a time and, once past 0x7E00000, unmounts it without
+// mounting it again (main+0xd76940), so the next check unmounted an unknown mount and stopped [C, disassembly].
 static uint32_t free_space(int64_t *out, const char *path) {
-    char p[PATH_CAP];
+    char p[PATH_CAP], named[PATH_CAP];
+    if (path && !strchr(path, ':') && strlen(path) + 3 <= sizeof named) {
+        snprintf(named, sizeof named, "%s:/", path);
+        path = named;
+    }
     int kind = M_FREE;
     uint32_t r = host_path_kind(path, p, sizeof p, &kind);
     if (r) return r;
@@ -1746,6 +1753,12 @@ static void probe_storage(void) {
     CHECK(fs_save_busy(), "closed but uncommitted save data does not count as a save in progress");
     CHECK(tx_commit() == 0 && !fs_save_busy(), "Commit");
     CHECK(RES(S_COMMIT, U("nomount")) == FS_R_PATH_NOT_FOUND, "Commit of an unknown mount");
+    {   // mlbts-native: GetFreeSpaceSize takes a bare mount name as MLB passes it ("savedata"), same as "name:/"
+        int64_t bare = -1, rooted = -2;
+        CHECK(RES(S_FREE_SPACE, U(&bare), U("save")) == 0 && RES(S_FREE_SPACE, U(&rooted), U("save:/")) == 0 &&
+                  bare == rooted && bare > 0,
+              "GetFreeSpaceSize of a bare mount name");
+    }
 
     // paths
     CHECK(RES(S_CREATE_FILE, U("save:/../x"), 0) == FS_R_INVALID_PATH, "save:/../x");
