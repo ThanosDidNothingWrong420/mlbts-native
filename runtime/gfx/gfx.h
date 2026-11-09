@@ -94,9 +94,15 @@ typedef struct {
     uint8_t format;             // IMG: declared format as a GfxShaderAnswers.img_format code, 0 unknown
     uint8_t flags;              // SSBO: 1 written; TEX/IMG: Ryujinx TextureUsageFlags (4 image store, 8 coherent)
     int8_t cbuf_slot;           // TEX/IMG: constant buffer of the handle (-1: bound texture buffer); SSBO: of its address
-    uint16_t handle;            // TEX/IMG: raw handle (word offset; separate: texture | sampler << 14); SSBO: address offset
+    uint32_t handle;            // TEX/IMG: Ryujinx packed handle (texture word | sampler word << 14 | handle type << 28);
+                                // SSBO: address offset. mlbts-native: 32 bits; 16 dropped the sampler word and the type
     uint16_t count;             // descriptors (array length)
     uint8_t separate;           // TEX: texture and sampler handles are separate
+    // mlbts-native: TEX whose sampler handle is in its own c2 word (Ryujinx TextureHandleType 1 SeparateSamplerHandle,
+    // 2 SeparateSamplerId, 3 SeparateConstantSamplerHandle; 0 combined). samp_slot: separate sampler slot (handle at
+    // 0x568 + 8 slot) for 1 and 2, the sampler id itself for 3, -1 outside the separate sampler range.
+    uint8_t samp_type;
+    int16_t samp_slot;
 } GfxShaderRes;
 typedef struct { uint8_t type, comps, packed; } GfxShaderIo;   // GFX_TYPE_*, components, 1 with a Component decoration
 int gfx_shader_stage(const GfxShader *s);                   // GFX_STAGE_VS, GFX_STAGE_FS or GFX_STAGE_CS

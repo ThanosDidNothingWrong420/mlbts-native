@@ -390,6 +390,12 @@ static void audin_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) 
     }
 }
 
+// nn::nifm::HandleNetworkRequestErrorResult(): on the console it shows the network error applet and reports whether
+// the user got a connection; MLB's caller keeps only bit 0 of w0 (main+0x1515f2c) [C, disassembly]. Offline nothing
+// can resolve it and no applet exists here: false, without the applet (whose IRequest GetAppletInfo the SDK would ask).
+static void ov_nifm_handle_error(Cpu *c) { ret_x(c, 0); }
+HOST_OVERRIDE("_ZN2nn4nifm31HandleNetworkRequestErrorResultEv", ov_nifm_handle_error);
+
 // ---- table
 void am_applet_oe_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs);   // am.c
 void aoc_u_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs);          // aoc.c

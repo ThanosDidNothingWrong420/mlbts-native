@@ -39,6 +39,7 @@ void vk_queue_unlock(void) { plat_rmutex_unlock(&g_ql); }
 
 // ---- window state shared with the back end
 static VkSurfaceKHR g_surface;
+static int g_want_srgb;   // mlbts-native: the last presented texture was sRGB-encoded (create_swapchain)
 static volatile int32_t g_dirty;               // the window was resized; swapchain stale
 static volatile int32_t g_restart;             // gfx_window_request_restart: closing the window starts the game again
 static volatile int32_t g_focused = 1;
@@ -313,8 +314,15 @@ static int build_swapchain(void) {
     vkGetPhysicalDeviceSurfaceFormatsKHR(c->phys, g_surface, &nf, fmts);
     if (!nf) return 0;
     // UNORM: the blit writes the bytes the game wrote (no sRGB encode). TOTK_HDR: HDR10 when the surface offers it.
+    // mlbts-native: an sRGB swapchain while the game presents sRGB textures (MLB's window textures are RGBA8_SRGB):
+    // vkCmdBlitImage decodes an sRGB source to linear and writes it unencoded into a UNORM image, which darkened every
+    // mid-tone (too much contrast); into an sRGB image it is encoded again, so the bytes arrive as the game wrote them.
     VkSurfaceFormatKHR sf = fmts[0];
     int hdr = vk_hdr_surface_format(fmts, nf, &sf), found = hdr;
+    for (uint32_t i = 0; i < nf && !found && g_want_srgb; i++)
+        if (fmts[i].format == VK_FORMAT_B8G8R8A8_SRGB && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) { sf = fmts[i]; found = 1; }
+    for (uint32_t i = 0; i < nf && !found && g_want_srgb; i++)
+        if (fmts[i].format == VK_FORMAT_R8G8B8A8_SRGB && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) { sf = fmts[i]; found = 1; }
     for (uint32_t i = 0; i < nf && !found; i++)
         if (fmts[i].format == VK_FORMAT_B8G8R8A8_UNORM && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) { sf = fmts[i]; found = 1; }
     for (uint32_t i = 0; i < nf && !found; i++)
@@ -577,6 +585,12 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     VkCtx *c = vk_ctx();
     plat_rmutex_lock(&g_pl);
     flip_locked();
+    int srgb = fmt == VK_FORMAT_R8G8B8A8_SRGB || fmt == VK_FORMAT_B8G8R8A8_SRGB || fmt == VK_FORMAT_A8B8G8R8_SRGB_PACK32;
+    if (srgb != g_want_srgb) {   // mlbts-native: the swapchain follows the presented texture's encoding (create_swapchain)
+        g_want_srgb = srgb;
+        plat_xchg32(&g_dirty, 1);
+        rt_log("gfx: the game presents %s textures: %s swapchain", srgb ? "sRGB" : "UNORM", srgb ? "sRGB" : "UNORM");
+    }
     if (!g_sc || plat_cas32(&g_dirty, 0, 0)) {
         if (!wsys_minimized() && !create_swapchain() && !g_sc) goto out;
     }

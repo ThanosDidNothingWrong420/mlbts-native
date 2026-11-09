@@ -22,3 +22,11 @@ NVN_API(nvnQueueWaitSync) {
     const sync_t *s = arg_p(c, 1);
     if (rt_trace & RT_TRACE_GFX) rt_log("nvn: QueueWaitSync on a %s sync", s && s->fenced ? "fenced" : "not yet fenced");
 }
+
+// void nvnTexturePoolRegisterImage(const NVNtexturePool *tp, int id, const NVNtexture *t, const NVNtextureView *v):
+// an image descriptor at pool index id. Image handles are texture pool indices here (nvnDeviceGetImageHandle) and a
+// slot holds one descriptor, texture or image, as on the hardware, so the image takes the texture registration of
+// that slot (nvn_api_cmd.c, comment above nvnCommandBufferBindTexture).
+NVN_API(nvnTexturePoolRegisterImage) {
+    gfx_backend()->texture_register((int)arg_x(c, 1), arg_p(c, 2), arg_p(c, 3));
+}

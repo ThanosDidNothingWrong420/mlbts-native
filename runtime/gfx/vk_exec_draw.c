@@ -1234,6 +1234,19 @@ static void feedback_written(VkExec *ex, const VkPipeState *s) {
         if (ex->color[i].image && !(ex->fb_dirty >> i & 1) && vk_pipeline_target_wmask(s, (int)i)) ex->fb_dirty |= 1u << i;
 }
 
+// mlbts-native: the texture handle a TEX resource reads, as the shader would form it: the texture word, ORed with the
+// sampler word bound at its separate sampler slot when it has one (gfx.h samp_type; Ryujinx TextureHandle
+// ReadPackedId). The texture word's own sampler bits are replaced then.
+static uint64_t res_tex_handle(const VkExec *ex, int st, const GfxShaderRes *r, int k) {
+    int slot = r->slot + k;
+    uint64_t h = slot >= 0 && slot < 128 ? ex->tex[st][slot] : 0;
+    if (!h || !r->samp_type) return h;
+    uint64_t s = 0;
+    if (r->samp_type == 3) s = (uint64_t)(uint16_t)r->samp_slot << 20;
+    else if (r->samp_slot >= 0 && r->samp_slot < 128) s = r->samp_type == 2 ? ex->samp[st][r->samp_slot] << 20 : ex->samp[st][r->samp_slot];
+    return (h & 0xfffff) | (s & ~0xfffffull);
+}
+
 static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage, int separate,
                           VkDescriptorImageInfo *out, VkImage *image);
 
@@ -1722,6 +1735,11 @@ static const RsList *rs_list(const VkExec *ex, const VkPipeInfo *info) {
                     int slot = r->slot + (int)k;
                     if (slot >= 0 && slot < cap) rs_add(tmp, &n, ex, img ? &ex->img[st][slot] : &ex->tex[st][slot], 8);
                 }
+                // mlbts-native: a separate sampler word is read too (res_tex_handle)
+                if (!img && (r->samp_type == 1 || r->samp_type == 2) && r->samp_slot >= 0 && r->samp_slot < 128) {
+                    if (n >= MAX_DESC) { ok = 0; break; }
+                    rs_add(tmp, &n, ex, &ex->samp[st][r->samp_slot], 8);
+                }
             }
         }
         uint64_t bytes = 0;
@@ -1902,7 +1920,7 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
                     int slot = r->slot + (int)k;
                     uint64_t h = 0;
                     if (img) h = slot >= 0 && slot < 32 ? ex->img[st][slot] : 0;
-                    else h = slot >= 0 && slot < 128 ? ex->tex[st][slot] : 0;
+                    else h = res_tex_handle(ex, st, r, (int)k);   // mlbts-native: separate sampler words
                     tex_info(ex, r, h, img, r->separate, &o[k].image);
                     o[k].w[2] = (uint32_t)o[k].image.imageLayout;   // zero the tail padding
                 }
@@ -2514,10 +2532,8 @@ static int mo_desc(VkExec *ex, const VkPipeInfo *info, MoDraw *q) {
             for (uint32_t k = 0; k < cnt; k++) o[k].buffer = ssbo_info(ex, st, r, 0);
         } else if (b->kind == GFX_RES_TEX && b->type != VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER) {
             vk_texture_lock();
-            for (uint32_t k = 0; k < cnt; k++) {
-                int slot = r->slot + (int)k;
-                tex_info(ex, r, slot >= 0 && slot < 128 ? ex->tex[st][slot] : 0, 0, r->separate, &o[k].image);
-            }
+            for (uint32_t k = 0; k < cnt; k++)   // mlbts-native: res_tex_handle, separate sampler words
+                tex_info(ex, r, res_tex_handle(ex, st, r, (int)k), 0, r->separate, &o[k].image);
             vk_texture_unlock();
         } else {
             return 0;
@@ -3101,10 +3117,51 @@ static void bind_index(VkExec *ex, const void *data, uint64_t bytes, VkIndexType
     ex->recorded++;
 }
 
+// mlbts-native diagnosis: MLB_DRAWLOG=<frame> logs every draw of that presented frame: pass, formats, program and a
+// hash of each stage's code, blend and mask state, the fragment stage's first texture and sampler handles, and what
+// the textures resolve to (size, storage address, a byte sum of their storage). Off unless set.
+static void draw_note(VkExec *ex, const char *kind, int prim, int count) {
+    static long want = -2;
+    if (want == -2) { const char *e = cfg_get("MLB_DRAWLOG"); want = e ? atol(e) : -1; }
+    if (want < 0 || (long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1 != want) return;
+    uint32_t h[2] = {0, 0};
+    for (int st = 0; st < 2; st++) {
+        const uint8_t *ctl, *code; uint32_t len;
+        if (ex->prog && find_stage(ex->prog, st, &ctl, &code, &len)) {
+            uint32_t x = 2166136261u;
+            for (uint32_t i = 0; i < len; i++) x = (x ^ code[i]) * 16777619u;
+            h[st] = x;
+        }
+    }
+    rt_log("drawlog %s prim %d count %d pass %ux%u fmt %d/%d prog %llu vs %08x fs %08x blend0 en %u src %u dst %u "
+           "chmask %#x tex1 %llx %llx %llx %llx samp1 %llx %llx ubo1 %llx+%llx",
+           kind, prim, count, ex->pass_w, ex->pass_h, ex->pipe.color_fmt[0], ex->pipe.depth_fmt,
+           (unsigned long long)(ex->prog ? ex->prog->serial : 0), h[0], h[1], (unsigned)ex->pipe.color.blend_en,
+           (unsigned)ex->pipe.blend[0].src_rgb, (unsigned)ex->pipe.blend[0].dst_rgb, ex->pipe.chmask.mask,
+           (unsigned long long)ex->tex[1][0], (unsigned long long)ex->tex[1][1], (unsigned long long)ex->tex[1][2],
+           (unsigned long long)ex->tex[1][3], (unsigned long long)ex->samp[1][0], (unsigned long long)ex->samp[1][1],
+           (unsigned long long)ex->ubo[1][3].addr, (unsigned long long)ex->ubo[1][3].size);
+    for (int k = 0; k < 4; k++) {
+        if (!ex->tex[1][k]) continue;
+        view_t v; int hv;
+        const VkTexImage *im = vk_texture_by_id((int)(ex->tex[1][k] & 0xfffff), &v, &hv);
+        if (!im) { rt_log("drawlog   tex %d: id %#llx unresolved", k, (unsigned long long)(ex->tex[1][k] & 0xfffff)); continue; }
+        uint64_t sum = 0, nz = 0;
+        const uint8_t *b = (const uint8_t *)(uintptr_t)im->addr;
+        uint64_t n = (uint64_t)im->width * im->height;
+        if (n > (1u << 22)) n = 1u << 22;
+        for (uint64_t i = 0; b && im->mirrored && i < n; i++) sum += b[i], nz += b[i] != 0;
+        rt_log("drawlog   tex %d: id %#llx %ux%u addr %#llx mirrored %u gpu_owned %u bytes sum %llu nonzero %llu",
+               k, (unsigned long long)(ex->tex[1][k] & 0xfffff), im->width, im->height, (unsigned long long)im->addr,
+               im->mirrored, im->gpu_owned, (unsigned long long)sum, (unsigned long long)nz);
+    }
+}
+
 static void op_draw(VkExec *ex, const p_draw *d) {
     c0_binst = (uint32_t)d->base_instance;
     if (d->count <= 0 || !prepare_draw(ex, d->prim, d->count, 0)) return;
     vk_exec_frame.draws++;
+    draw_note(ex, "arrays", d->prim, d->count);
     uint32_t inst = d->instances > 0 ? (uint32_t)d->instances : 1, first = (uint32_t)d->first, n = (uint32_t)d->count;
     if (d->prim == NVN_DRAW_PRIMITIVE_QUADS && n >= 4) {   // quads become two triangles each
         uint32_t q = n / 4;
@@ -3157,6 +3214,7 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
     int restart = restart_for(ex, d->prim, d->itype);
     if (d->count <= 0 || !prepare_draw(ex, d->prim, d->count, restart)) return;
     vk_exec_frame.draws++;
+    draw_note(ex, "indexed", d->prim, d->count);
     uint64_t bytes = (uint64_t)d->count * isize[d->itype];
     VkMemSpan sp;
     if (!vk_mem_resolve(d->ibuf, bytes, &sp)) return warn_once(W_INDEX, "index buffer %#llx is not backed: draws with it are skipped", (unsigned long long)d->ibuf);

@@ -691,11 +691,15 @@ static int fmt_code(const char *name) {
 
 // c2 slot of a texture or image handle (Service.cs of MNG's totk_xlate: combined handles at 0x20, 32 slots; images at
 // 0x120; separate textures at 0x168), -1 outside those ranges or for a handle in another constant buffer.
+// mlbts-native: a texture with its own sampler word (handle type 1-3 in bits 28+, gfx.h samp_type) takes its texture
+// from the separate texture range like a separate one; MLB's movie and UI shaders sample that way (Ryujinx
+// TextureHandle.ReadPackedId ORs the two words on the host). cbuf_slot is Ryujinx PackSlots: texture buffer in the low
+// 16 bits, sampler buffer + 1 above (0: the same).
 static int handle_slot(int kind, int cbuf_slot, int handle, int separate) {
-    if (cbuf_slot >= 0 && cbuf_slot != 2) return -1;
+    if (cbuf_slot >= 0 && (cbuf_slot & 0xffff) != 2) return -1;
     int bytes = (handle & 0x3fff) * 4;
     if (kind == GFX_RES_IMG) return bytes >= 0x120 && bytes < 0x168 ? (bytes - 0x120) / 8 : -1;
-    if (separate) return bytes >= 0x168 && bytes < 0x568 ? (bytes - 0x168) / 8 : -1;
+    if (separate || (unsigned)handle >> 28) return bytes >= 0x168 && bytes < 0x568 ? (bytes - 0x168) / 8 : -1;
     return bytes >= 0x20 && bytes < 0x120 ? (bytes - 0x20) / 8 : -1;
 }
 
@@ -708,7 +712,7 @@ static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
         r->count = 1;
         if (kind == GFX_RES_SSBO) {
             r->cbuf_slot = (int8_t)json_int(o, e, "cb_slot", -1);
-            r->handle = (uint16_t)json_int(o, e, "cb_offset", 0);
+            r->handle = (uint32_t)json_int(o, e, "cb_offset", 0);
             r->flags = (uint8_t)json_int(o, e, "flags", 0);
         }
         return;
@@ -721,10 +725,20 @@ static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
     r->flags = (uint8_t)json_int(o, e, "flags", 0);
     r->cbuf_slot = (int8_t)json_int(o, e, "cbuf_slot", -1);
     int handle = (int)json_int(o, e, "handle", 0);
-    r->handle = (uint16_t)handle;
+    r->handle = (uint32_t)handle;
     r->count = (uint16_t)json_int(o, e, "array", 1);
     r->separate = sep && *sep == 't';
     r->slot = (int16_t)handle_slot(kind, r->cbuf_slot, handle, r->separate);
+    r->samp_type = kind == GFX_RES_TEX ? (uint8_t)((unsigned)handle >> 28) : 0;
+    r->samp_slot = -1;
+    if (r->samp_type == 3) {
+        r->samp_slot = (int16_t)(handle >> 14 & 0x3fff);
+    } else if (r->samp_type) {
+        int64_t slots = json_int(o, e, "cbuf_slot", -1);
+        int sbuf = slots < 0 ? 2 : (int)(slots >> 16 & 0xffff) ? (int)(slots >> 16 & 0xffff) - 1 : (int)(slots & 0xffff);
+        int sbytes = (handle >> 14 & 0x3fff) * 4;
+        if (sbuf == 2 && sbytes >= 0x568 && sbytes < 0x568 + 8 * 128) r->samp_slot = (int16_t)((sbytes - 0x568) / 8);
+    }
 }
 
 // SPIR-V opcodes and enumerants used below (SPIR-V 1.6 specification, section 3).
