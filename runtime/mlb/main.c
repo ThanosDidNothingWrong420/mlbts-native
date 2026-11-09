@@ -253,6 +253,7 @@ int main(int argc, char **argv) {
     }
     log_open();
     if (probe) return probe_fs();
+    prof_start();   // perf.c: the frame-time summary, MLB_TRACE=perf, MLB_SAMPLER
     rt_boot();
     return 0;
 }

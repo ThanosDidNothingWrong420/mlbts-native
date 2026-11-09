@@ -31,26 +31,7 @@ void res_present(Cpu *c) { (void)c; }
 // ---- ov_movie.c: TotK's VP9 movie decoder (MLB plays Bink; not ported yet)
 void movie_tick(Cpu *c) { (void)c; }
 
-// ---- perf.c: frame timing counters and the A/B knobs. Knobs read the setting as TotK's perf.c does.
-uint64_t perf_begin(void) { return 0; }
-void perf_end(int kind, uint64_t t0) { (void)kind, (void)t0; }
-void perf_count(int kind) { (void)kind; }
-void perf_present(uint64_t frame) { (void)frame; }
-void perf_replay(uint64_t t0) { (void)t0; }
-void perf_replay_thread(void) {}
-void perf_gpu_busy(uint64_t ns) { (void)ns; }
-void perf_gpu_wait(uint64_t t0) { (void)t0; }
-int perf_gpu_timing(void) { return 0; }
-void (*perf_gpu_stats)(PerfGpu *out);
-int rt_ab(void) { return 0; }
-int rt_knob(const char *name, const char *def) {   // TotK perf.c rt_knob: "ab" -> 2, "0" -> 0, anything else -> 1
-    char key[64];
-    strcpy(key, "TOTK_");
-    strncat(key, name, sizeof key - 6);
-    const char *e = cfg_get(key);
-    if (!e || !*e) e = def;
-    return !strcmp(e, "ab") ? 2 : strcmp(e, "0") != 0;
-}
+// ---- perf.c: runtime/core/perf.c
 
 // ---- flight.c, rdoc.c, vk_crumbs.c, vk_dump.c, pass marks: diagnostics
 int flight_on;
