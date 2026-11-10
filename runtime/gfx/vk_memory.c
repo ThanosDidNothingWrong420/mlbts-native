@@ -1790,7 +1790,8 @@ static int quiet_on(void) {
     if (quiet_cfg < 0) {
         const char *e = cfg_get("MLB_WB_QUIET");
         quiet_cfg = !e || strcmp(e, "0");
-        int n = cfg_int("MLB_WB_QUIET_SUBS");
+        const char *ns = cfg_get("MLB_WB_QUIET_SUBS");   // cfg_get: cfg_int needs a row in the settings table
+        int n = ns ? atoi(ns) : 0;
         if (n > 0 && n < 60) quiet_subs = n;
         rt_log("mem: write-back of shader-written pages the CPU left alone for %d submissions: %s (MLB_WB_QUIET, "
                "MLB_WB_QUIET_SUBS)", quiet_subs, quiet_cfg ? "plain copies" : "merged");
