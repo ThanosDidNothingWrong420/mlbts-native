@@ -1555,7 +1555,8 @@ static void gpu_wrote(Tex *e) {
     if (cube_behind(e)) {
         cube_queue(e);   // the cubes over its storage copy the new content at the next pass or dispatch
         if (cube_log())
-            rt_log("vk: array %#llx fmt %#x %ux%u written by the GPU (write %llu): a cube over its storage is behind",
+            rt_log("vk: image %#llx fmt %#x %ux%u written by the GPU (write %llu): a cube or block view over its storage "
+                   "is behind",
                    (unsigned long long)e->pub.addr, (unsigned)e->t.d.format, e->pub.width, e->pub.height,
                    (unsigned long long)e->wseq);
     }
@@ -1669,24 +1670,44 @@ static int is_cube(const Tex *e) {
 }
 static volatile int32_t n_cube_log;   // diagnosis: cube events logged (cube_log)
 static int cube_log(void) { return plat_inc32(&n_cube_log) <= 600; }
-static int cube_behind(const Tex *src) {   // src (not a cube) wrote content a live cube at its storage lacks
+// mlbts-native: and a block-compressed entry over the storage of an uncompressed image with one texel per block (a
+// block view, alias_compatible) takes that image's newer content the same way. MLB's GPU BC7 encoder (compute
+// acd11752) writes the post-game stats screen's player portrait as a 192x192 R32G32B32A32_UINT image over the storage of
+// the 768x768 BC7 texture the screen samples; the BC7 entry took the content once, when it was created, and the
+// portrait stayed empty (the team logo behind it) on every later visit. The created-player faces are encoded the same
+// way.
+static int bc_of(const Tex *e) {   // a block-compressed nvn format
+    int bw, bh;
+    return nvn_fmt_bpb(e->t.d.format, &bw, &bh) && (bw > 1 || bh > 1);
+}
+static int follows(const Tex *p, const Tex *src) {   // p takes the content src writes
+    if (p == src) return 0;
+    if (is_cube(p)) return !is_cube(src);
+    return !is_cube(src) && bc_of(p) && !bc_of(src) &&
+           (p->pub.width != src->pub.width || p->pub.height != src->pub.height) && alias_compatible(p, src);
+}
+static int cube_behind(const Tex *src) {   // src wrote content a cube or block view at its storage lacks
     if (is_cube(src)) return 0;
     for (Tex *p = nvn_hm_get(&by_addr, &src->key.addr); p; p = p->next_at)
-        if (p != src && is_cube(p) && p->cseq < src->wseq) return 1;
+        if (p->cseq < src->wseq && follows(p, src)) return 1;
     return 0;
 }
 static void cube_refresh(Tex *e) {
     Tex *src = NULL;
     uint32_t lv = 0, l;
+    int cube = is_cube(e);
+    // a cube copies from a live array; a block view also from a released source, which keeps its image (MLB finalizes
+    // the encoder's storage-image descriptor right after the dispatch)
     for (Tex *p = nvn_hm_get(&by_addr, &e->key.addr); p; p = p->next_at)
-        if (p != e && !p->released && !is_cube(p) && p->pub.gpu_owned && p->wseq > e->cseq &&
+        if (p != e && (cube ? !p->released && !is_cube(p) : follows(e, p)) && p->pub.gpu_owned && p->wseq > e->cseq &&
             (!src || p->wseq > src->wseq) && (l = alias_compatible(e, p)))
             src = p, lv = l;
     if (!src) return;
     if (!alias_copy(e, src, lv)) {
         if (cube_log())
-            rt_log("vk: cube %#llx: newer array content (write %llu > %llu) but no replay is recording: not copied yet",
-                   (unsigned long long)e->pub.addr, (unsigned long long)src->wseq, (unsigned long long)e->cseq);
+            rt_log("vk: %s %#llx: newer content (write %llu > %llu) but no replay is recording: not copied yet",
+                   cube ? "cube" : "block view", (unsigned long long)e->pub.addr, (unsigned long long)src->wseq,
+                   (unsigned long long)e->cseq);
         return;
     }
     void vk_watch_note_tex(const tex_t *t);   // vk_capture.c: saved at the next F12
@@ -1695,9 +1716,9 @@ static void cube_refresh(Tex *e) {
     e->pub.gpu_owned = 1;
     if (e->pub.mirrored) vk_mem_changed(e->pub.addr, e->t.L.size, 0, &e->wgen), e->uploaded = 1;
     if (cube_log())
-        rt_log("vk: cube %#llx fmt %#x %ux%u took newer content from the %ux%u array over its storage (%u levels)",
-               (unsigned long long)e->pub.addr, (unsigned)e->t.d.format, e->pub.width, e->pub.height, src->pub.width,
-               src->pub.height, lv);
+        rt_log("vk: %s %#llx fmt %#x %ux%u took newer content from the %ux%u %s over its storage (%u levels)",
+               cube ? "cube" : "block-compressed texture", (unsigned long long)e->pub.addr, (unsigned)e->t.d.format,
+               e->pub.width, e->pub.height, src->pub.width, src->pub.height, cube ? "array" : "block image", lv);
 }
 
 // Cubes behind an array write, live or released (MLB finalizes and recreates its texture objects, and a slot falls back
@@ -1713,7 +1734,7 @@ static uint64_t n_cube_copies, n_cube_dropped;
 static void cube_queue(const Tex *src) {
     if (is_cube(src)) return;
     for (Tex *p = nvn_hm_get(&by_addr, &src->key.addr); p; p = p->next_at) {
-        if (p == src || !is_cube(p) || p->cseq >= src->wseq) continue;
+        if (p->cseq >= src->wseq || !follows(p, src)) continue;
         int have = 0;
         for (int i = 0; i < n_cube_pend; i++) have |= cube_pend[i] == p;
         if (have) continue;
@@ -1740,7 +1761,7 @@ void vk_texture_cube_flush(void) {
     static uint64_t last_frame;
     uint64_t fr = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     if ((rt_trace & RT_TRACE_PERF) && fr >= last_frame + 600) {
-        rt_log("perf: frame %llu: lighting cubes refreshed from their arrays %llu times in 600 frames%s",
+        rt_log("perf: frame %llu: cubes and block views refreshed from their sources %llu times in 600 frames%s",
                (unsigned long long)fr, (unsigned long long)n_cube_copies, n_cube_dropped ? " (queue overflowed)" : "");
         n_cube_copies = n_cube_dropped = 0, last_frame = fr;
     }
