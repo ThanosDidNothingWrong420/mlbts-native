@@ -1222,7 +1222,7 @@ typedef struct {
     uint64_t snap_bytes, merge_bytes, merge_dispatches, snap_allocs;   // write-back merge
     uint64_t quiet_bytes, quiet_ranges, quiet_broken;                  // mlbts-native: quiet pages copied (gpu_wrote)
     uint64_t age_bytes[4];                                             // merged page bytes by CPU write age (q_age)
-    uint64_t merge_union, merge_ranges;                                // distinct bytes and ranges of the merges
+    uint64_t merge_union, merge_ranges, snap_joined;                   // distinct bytes and ranges of the merges; joins
     uint64_t page_bytes, flush_n, flush_bytes, flush_calls, flush_sum;   // what mirror_sync queues, by source
 } MirrorAcc;
 static MirrorAcc mrep;                 // replay: this submission
@@ -1662,9 +1662,27 @@ static int chunk_new(uint64_t size, int host) {
 }
 
 // Record time: room in a snapshot chunk for [off, off+size) of r's mirror, once per submission. 0: plain copy instead.
+// mlbts-native: a range overlapping or touching ranges of the same pool that have no snapshot yet (the part being
+// recorded) joins them into one: their union, snapshotted at the same moment, merges each word once and exactly as the
+// separate ranges did. MLB's draft cutscene bound overlapping pieces of the same buffers to its skinning dispatches,
+// and the merge processed 22 MiB a frame for 6.3 MiB of distinct memory (12 ms of GPU time). Ranges of earlier parts
+// keep their own snapshots (taken before their part); a union stays at most MERGE_MAX. The joined entries' chunk
+// space is left unused until the submission's chunks return to the pool.
 static int snap_add(PoolRec *r, uint64_t off, uint64_t size) {
     for (int i = nsnl; i-- > 0;)
         if (snl[i].r == r && snl[i].off == off && snl[i].size == size) return 1;
+    uint64_t lo = off, hi = off + size;
+    for (int i = snl_copied; i < nsnl;) {
+        uint64_t a = snl[i].off, e = a + snl[i].size;
+        uint64_t ulo = a < lo ? a : lo, uhi = e > hi ? e : hi;
+        if (snl[i].r != r || a > hi || e < lo || uhi - ulo > MERGE_MAX) { i++; continue; }
+        if (a <= lo && hi <= e) return 1;   // inside a range that will be snapshotted with this part
+        lo = ulo, hi = uhi;
+        snl[i] = snl[--nsnl];                // joined: the union replaces it
+        mrep.snap_joined++;
+        i = snl_copied;                      // the union may now reach ranges passed over
+    }
+    off = lo, size = hi - lo;
     int k = -1;
     for (int i = nchunks; i-- > 0;)   // the newest snapshot chunk, if the range fits
         if (chunks[i].used != UINT64_MAX && chunks[i].size - chunks[i].used >= size) { k = i; break; }
@@ -2237,7 +2255,7 @@ static void mirror_log(uint64_t frame) {
     rt_log("mem: mirror frame %llu: pools %lld, %.1f MiB device-local; stay imported: budget %lld (%.1f MiB), untracked "
            "%lld, overlapping %lld, failed %lld; per frame: submits %.2f, syncs %.1f, upload %.3f MiB in %.1f ranges, "
            "first use %.2f pools %.3f MiB, write-back %.3f MiB in %.1f ranges, merge %.3f MiB in %.1f dispatches "
-           "(distinct %.3f MiB in %.1f ranges; snapshots %.3f MiB, new buffers %.2f; quiet pages copied instead %.3f MiB in %.1f runs, written by the CPU right "
+           "(distinct %.3f MiB in %.1f ranges, %.1f overlapping ranges joined; snapshots %.3f MiB, new buffers %.2f; quiet pages copied instead %.3f MiB in %.1f runs, written by the CPU right "
            "after %llu; merged pages by the CPU's last write: 0-1 submissions ago %.3f MiB, 2-4 %.3f, older %.3f, "
            "write-watch set %.3f), flush calls %.1f (%.3f MiB), queries "
            "%.1f pre-snap (%.1f MiB) + %.1f sync, prologues %.2f, tracking cpu %.3f ms (pre-snap %.3f, syncs %.3f)%s",
@@ -2245,7 +2263,7 @@ static void mirror_log(uint64_t frame) {
            m_refused_bytes[MR_BUDGET] / M, (long long)m_refused_n[MR_UNTRACKED], (long long)m_refused_n[MR_OVERLAP],
            (long long)m_refused_n[MR_ALLOC], a.subs / f, a.syncs / f, a.upload_bytes / f / M, a.upload_copies / f,
            a.first_n / f, a.first_bytes / f / M, a.wb_bytes / f / M, a.wb_copies / f, a.merge_bytes / f / M,
-           a.merge_dispatches / f, a.merge_union / f / M, a.merge_ranges / f, a.snap_bytes / f / M, a.snap_allocs / f,
+           a.merge_dispatches / f, a.merge_union / f / M, a.merge_ranges / f, a.snap_joined / f, a.snap_bytes / f / M, a.snap_allocs / f,
            a.quiet_bytes / f / M, a.quiet_ranges / f,
            (unsigned long long)a.quiet_broken, a.age_bytes[0] / f / M, a.age_bytes[1] / f / M, a.age_bytes[2] / f / M,
            a.age_bytes[3] / f / M, fc / f, fb / f / M,
