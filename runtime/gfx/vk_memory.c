@@ -1533,8 +1533,10 @@ static int nchunks, cchunks;
 // the pool holds the frames in flight: a VMA allocation that needs a new memory block costs 8-11 ms on the replay
 // thread. Chunk sizes are powers of two so that one fits the next request; what the pool cannot hold is destroyed.
 #define SNAP_LIST_MIN (64u << 10)
-#define SNAP_POOL_N 32
-#define SNAP_POOL_BYTES (16ull << 20)
+// mlbts-native: 128 chunks, 256 MiB. MLB's draft cutscene merges 27 MiB a frame with up to three frames in flight; a
+// 16 MiB pool made it create about 8 snapshot buffers every frame (mem: mirror "new buffers").
+#define SNAP_POOL_N 128
+#define SNAP_POOL_BYTES (256ull << 20)
 static PlatMutex snap_pool_lock = PLAT_MUTEX_INIT;
 static SnapChunk snap_pool[SNAP_POOL_N];
 static int nsnap_pool;
@@ -1613,12 +1615,25 @@ static int chunk_new(uint64_t size, int host) {
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = want,
                                  .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                  .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
-        VmaAllocationCreateInfo ai = {.usage = host ? VMA_MEMORY_USAGE_AUTO_PREFER_HOST : VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        // mlbts-native: a range list (host) goes in device-local memory the CPU can map where there is some (the BAR):
+        // every merge invocation binary-searches it, and from system memory those were reads over PCIe, 7 million
+        // invocations a frame in MLB's draft cutscene. VMA falls back to system memory without such a type.
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
                                       .flags = host ? VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
                                                           VMA_ALLOCATION_CREATE_MAPPED_BIT : 0};
         if (vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &ch->buf, &ch->alloc, NULL) != VK_SUCCESS) return -1;
         ch->size = want, ch->host = host;
         mrep.snap_allocs++;
+        static int logged;
+        if (host && !logged) {
+            logged = 1;
+            VmaAllocationInfo inf;
+            vmaGetAllocationInfo(vk_ctx()->vma, ch->alloc, &inf);
+            VkMemoryPropertyFlags f = 0;
+            vmaGetMemoryTypeProperties(vk_ctx()->vma, inf.memoryType, &f);
+            rt_log("mem: write-back merge range lists in memory type %u (%s)", inf.memoryType,
+                   f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT ? "device-local, CPU-mapped" : "system memory");
+        }
     }
     ch->used = 0;
     return nchunks++;
@@ -1893,8 +1908,9 @@ void vk_mem_mirror_begin(void) {
 
 int vk_mem_mirror_pending(void) { return npend || snl_copied < nsnl; }
 
-void vk_mem_mirror_prologue(VkCommandBuffer cb) {
+void vk_mem_mirror_prologue(VkCommandBuffer cb, uint64_t fence) {
     if (!npend && snl_copied == nsnl) return;
+    VkPassMark *tm = vk_pass_mark_other(cb, fence, "mirror prologue: CPU writes up, snapshots");
     mbarrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
              VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
     copy_ranges(cb, pend, npend, 1, &mrep.upload_bytes, &mrep.upload_copies);
@@ -1907,6 +1923,7 @@ void vk_mem_mirror_prologue(VkCommandBuffer cb) {
              VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
     npend = 0;
     mrep.prologues++;
+    vk_pass_mark_end(cb, tm);
 }
 
 // ---- verify mode
@@ -2001,6 +2018,7 @@ static int verify_record(VkCommandBuffer cb, uint64_t fence) {
 int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
     if (!vk_mirror_on) return 0;
     int rec = 0;
+    VkPassMark *tm = nsnl ? vk_pass_mark_other(cb, fence, "mirror write-back: merge") : NULL;
     if (nsnl) {
         // the merge reads the mirror the submission's shaders wrote and writes the imported buffers
         mbarrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
@@ -2013,6 +2031,7 @@ int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
         mbarrier(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                  VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                  VK_ACCESS_2_HOST_READ_BIT | VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+        vk_pass_mark_end(cb, tm);
     }
     if (nchunks) {   // the last part's prologue still records snapshot copies into them; back to the pool at the fence
         SnapFree *f = malloc(sizeof *f + sizeof(SnapChunk) * (size_t)nchunks);
@@ -2022,6 +2041,7 @@ int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
         vk_completion_add(fence, snap_free, f);
     }
     if (nwbl) {
+        tm = vk_pass_mark_other(cb, fence, "mirror write-back: copies");
         mbarrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
                  VK_ACCESS_2_TRANSFER_READ_BIT);
         for (int i = 0; i < nwbl; i++) wbl[i].r->wb_sub = msub;
@@ -2031,6 +2051,7 @@ int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
                  VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                  VK_ACCESS_2_HOST_READ_BIT | VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
         nwbl = 0;
+        vk_pass_mark_end(cb, tm);
     }
     if (mirror_verify) rec += verify_record(cb, fence);
     plat_mutex_lock(&mirror_stat_lock);

@@ -98,7 +98,7 @@ void vk_crumbs_report(void);         // logs the two codes and what they name
 // vkGetQueueCheckpointData(2)NV after the loss. TOTK_PASS_CRUMBS: unset, AMD buffer marks only; 1, also NVIDIA
 // checkpoints (the extension is enabled at device creation); 0, none.
 #define VK_PASS_MARKS 4096   // power of two
-enum { VK_MARK_PASS = 1, VK_MARK_DISPATCH };
+enum { VK_MARK_PASS = 1, VK_MARK_DISPATCH, VK_MARK_OTHER };   // OTHER: the port's own work, named by label
 typedef struct {
     uint32_t id;                        // the mark this record belongs to (0: never written)
     uint8_t kind;                       // VK_MARK_*
@@ -109,7 +109,10 @@ typedef struct {
     uint64_t fence;                     // the submission: the timeline value it signals
     VkFormat color[8], depth;           // attachment formats (VK_FORMAT_UNDEFINED: none)
     const GfxShader *first[2], *last[2];// vertex and fragment shader of the first and last draw; a dispatch: first[0]
+    const char *label;                  // VK_MARK_OTHER: what it times (a string literal)
 } VkPassMark;
+// mlbts-native: times the port's own work between the two calls under a name (MLB_TRACE=perf; vk_passtime.c)
+VkPassMark *vk_pass_mark_other(VkCommandBuffer cb, uint64_t fence, const char *label);
 // Pass marks wanted and possible (TOTK_PASS_CRUMBS and the extensions): set by vk_crumbs_init.
 extern int vk_pass_marks_on;
 // vk_device.c create_device, before vkCreateDevice: 1 when TOTK_PASS_CRUMBS asks for NVIDIA checkpoints.
@@ -276,7 +279,7 @@ void vk_mvprev_frame(void);   // each present, beside vk_dlaa_frame
 void vk_mem_mirror_begin(void);
 int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence);
 int vk_mem_mirror_pending(void);
-void vk_mem_mirror_prologue(VkCommandBuffer cb);
+void vk_mem_mirror_prologue(VkCommandBuffer cb, uint64_t fence);
 // Shadow storage (vk_memory.c): vk_sync.c calls vk_mem_shadow_sync right before each submit; the replay notes every GPU
 // write into CPU-visible memory at record time (vk_mem_gpu_pending) and reports it at the fence with vk_gpu_written,
 // which copies the bytes back into guest memory before telling the texture cache (vk_guest_written).

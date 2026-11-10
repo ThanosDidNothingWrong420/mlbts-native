@@ -356,7 +356,7 @@ static VkCommandBuffer prologue(VkCtx *c, uint64_t fence) {
     VkCommandBuffer cb = slots[i].cb;
     rec_begin(cb, fence, 0, 0);   // a command buffer of the part pool: the recorder's like the parts
     int pair = ts_open(cb);
-    vk_mem_mirror_prologue(cb);
+    vk_mem_mirror_prologue(cb, fence);
     ts_close(cb, pair, fence);
     if (!rec_end_cb(cb, 0, 0)) vkEndCommandBuffer(cb);
     return cb;

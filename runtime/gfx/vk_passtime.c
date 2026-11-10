@@ -30,6 +30,7 @@ static uint32_t next_id = 1, collected = 1;
 static struct { char key[96]; double ns; uint64_t n, disp, groups, maxg; } agg[AGG_N];
 static int nagg;
 static uint64_t frame0, n_marks, n_skipped, prev_end, prev_fence;
+static int prev_kind;
 static double total_ns, gap_ns, gap_max_ns;
 
 static int init(void) {
@@ -55,7 +56,9 @@ static void id_hex(const GfxShader *s, char *out) {
 
 static void key_of(const VkPassMark *m, char *key, size_t n) {
     char a[9], b[9];
-    if (m->kind == VK_MARK_DISPATCH) {
+    if (m->kind == VK_MARK_OTHER) {
+        snprintf(key, n, "port: %s", m->label ? m->label : "?");
+    } else if (m->kind == VK_MARK_DISPATCH) {
         id_hex(m->first[0], a), id_hex(m->last[0], b);
         if (m->last[0] && m->last[0] != m->first[0]) snprintf(key, n, "dispatch run cs %s..%s", a, b);
         else snprintf(key, n, "dispatch run cs %s", a);
@@ -105,12 +108,14 @@ static void collect(void) {
                                   VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) < 0 || !r[1] || !r[3])
             continue;
         double ns = r[2] > r[0] ? (double)(r[2] - r[0]) * tick_ns : 0;
-        if (m->fence == prev_fence && r[0] > prev_end) {   // GPU time between this mark and the one before, same submission
+        // GPU time between this mark and the one before in the same command stream: not across a port mark, which may
+        // sit in a prologue command buffer submitted on its own
+        if (m->fence == prev_fence && r[0] > prev_end && m->kind != VK_MARK_OTHER && prev_kind != VK_MARK_OTHER) {
             double g = (double)(r[0] - prev_end) * tick_ns;
             gap_ns += g;
             if (g > gap_max_ns) gap_max_ns = g;
         }
-        prev_end = r[2], prev_fence = m->fence;
+        prev_end = r[2], prev_fence = m->fence, prev_kind = m->kind;
         char key[96];
         key_of(m, key, sizeof key);
         add(key, ns, m);
@@ -157,6 +162,12 @@ VkPassMark *vk_pass_mark_begin(VkCommandBuffer cb, int kind, uint64_t fence) {
     ended[s] = 0;
     vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, qp, 2 * s);
     next_id = id + 1 ? id + 1 : 1;
+    return m;
+}
+
+VkPassMark *vk_pass_mark_other(VkCommandBuffer cb, uint64_t fence, const char *label) {
+    VkPassMark *m = vk_pass_mark_begin(cb, VK_MARK_OTHER, fence);
+    if (m) m->label = label, m->draws = 0;
     return m;
 }
 
