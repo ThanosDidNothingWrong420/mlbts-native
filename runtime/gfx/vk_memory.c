@@ -909,6 +909,9 @@ static int shadow_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
                                   .preferredFlags = VK_MEMORY_PROPERTY_HOST_CACHED_BIT};
     VmaAllocationInfo info;
     VkResult res = vmaCreateBuffer(c->vma, &bi, &ai, &r->buf, &r->salloc, &info);
+    if (res == VK_SUCCESS)
+        vk_debug_name(VK_OBJECT_TYPE_BUFFER, (uint64_t)r->buf, "pool %#llx+%#llx shadow", (unsigned long long)r->import_lo,
+                      (unsigned long long)n);
     if (res != VK_SUCCESS) {
         rt_log("vk: pool %#llx+%#llx: shadow allocation failed (%d)", (unsigned long long)addr, (unsigned long long)size,
                (int)res);
@@ -1382,6 +1385,9 @@ static void mirror_create(PoolRec *r) {
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
                                   .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT};
     VkResult res = vmaCreateBuffer(c->vma, &bi, &ai, &r->mbuf, &r->malloc_, NULL);
+    if (res == VK_SUCCESS)
+        vk_debug_name(VK_OBJECT_TYPE_BUFFER, (uint64_t)r->mbuf, "pool %#llx+%#llx mirror", (unsigned long long)r->lo,
+                      (unsigned long long)n);
     if (res != VK_SUCCESS) {
         r->mbuf = VK_NULL_HANDLE, r->malloc_ = NULL;
         char why[96];

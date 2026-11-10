@@ -35,9 +35,6 @@ void movie_tick(Cpu *c) { (void)c; }
 
 // ---- flight.c, rdoc.c, vk_crumbs.c, vk_dump.c, pass marks: diagnostics
 int flight_on;
-int rdoc_active(void) { return 0; }
-void rdoc_init(void) {}
-void rdoc_after_present(uint64_t frame) { (void)frame; }
 void vk_crumb(VkCommandBuffer cb, int kind, uint64_t n) { (void)cb, (void)kind, (void)n; }
 void vk_crumbs_init(VkCtx *c) { (void)c; }
 void vk_crumbs_release(void) {}

@@ -196,6 +196,8 @@ uint64_t gfx_replayed_submits(void) {
 }
 
 static uint64_t submit_sync(const uint64_t *handles, int n) {
+    extern uint64_t vk_rdoc_game_submits;   // rdoc.c: a capture ends after a frame with game work
+    if (n > 0) __atomic_add_fetch(&vk_rdoc_game_submits, 1, __ATOMIC_RELAXED);
     vk_sync_start();
     vk_present_drain();
     vk_texture_new_submit();

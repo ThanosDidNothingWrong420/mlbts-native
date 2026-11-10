@@ -508,6 +508,10 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     }
     VkTexImage *p = &e->pub;
     p->image = img;
+    vk_debug_name(VK_OBJECT_TYPE_IMAGE, (uint64_t)img, "tex %#llx fmt %#x %ux%u%s%s", (unsigned long long)k->addr,
+                  (unsigned)d->format, w, h, levels > 1 ? " mips" : "",
+                  usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) &&
+                  !block_views ? " rt" : "");
     p->format = f.vk;
     p->type = type;
     p->usage = usage;

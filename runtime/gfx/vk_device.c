@@ -2,10 +2,12 @@
 // Ported from LAS Recomp, runtime/nvn/vulkan/device.c:33-330
 // (https://github.com/peiikai/LASRecomp @ da35b83a9611d046a9a681aae668d7085954d37f, MIT, Copyright (c) 2026 Peiikai),
 // without SDL. The VMA implementation is runtime/vk_vma.cpp (VMA is C++ only).
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
+#include <windows.h>   // GetModuleHandleA (vk_debug_names_on)
 #define strncasecmp _strnicmp   // mlbts-native: the MSVC C library names it so
 #endif
 
@@ -505,6 +507,35 @@ void vk_shutdown(void) {
 }
 
 VkCtx *vk_ctx(void) { return g_ready ? &g_vk : NULL; }
+
+// RenderDoc lists images and buffers by number only; a name with the guest address, format and size ties a capture's
+// resources to the game's textures and pools (and to the log). Only under RenderDoc: names cost a driver call each.
+static PFN_vkSetDebugUtilsObjectNameEXT p_set_name;
+int vk_debug_names_on(void) {
+    static int on = -1;
+    if (on < 0) {
+#ifdef _WIN32
+        on = GetModuleHandleA("renderdoc.dll") != NULL && g_ready;
+#else
+        on = 0;
+#endif
+        if (on) p_set_name = (PFN_vkSetDebugUtilsObjectNameEXT)vkGetDeviceProcAddr(g_vk.device, "vkSetDebugUtilsObjectNameEXT");
+        if (on && !p_set_name) on = 0;
+        if (on) rt_log("vk: RenderDoc: images and pools are named with their guest address");
+    }
+    return on;
+}
+void vk_debug_name(VkObjectType type, uint64_t handle, const char *fmt, ...) {
+    if (!handle || !vk_debug_names_on()) return;
+    char name[160];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(name, sizeof name, fmt, ap);
+    va_end(ap);
+    VkDebugUtilsObjectNameInfoEXT ni = {.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT, .objectType = type,
+                                        .objectHandle = handle, .pObjectName = name};
+    p_set_name(g_vk.device, &ni);
+}
 
 static const char *fault_address_type(VkDeviceFaultAddressTypeEXT t) {
     switch (t) {

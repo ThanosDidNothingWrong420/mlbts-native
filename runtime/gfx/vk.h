@@ -71,6 +71,9 @@ int vk_caps_gpl(const VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT *f,
 void vk_caps_init(VkCtx *c);                          // after it: pretend limits, fallbacks, the boot report
 
 VkCtx *vk_ctx(void);                        // NULL until vk_init() succeeded
+// Names a Vulkan object for a capture tool (VK_EXT_debug_utils) while RenderDoc is loaded; nothing otherwise.
+int  vk_debug_names_on(void);
+void vk_debug_name(VkObjectType type, uint64_t handle, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
 int vk_init(void);                          // idempotent; 1 on success, 0 on failure (reason logged with rt_log)
 void vk_shutdown(void);
 int vk_selftest(void);                      // 0 on success
