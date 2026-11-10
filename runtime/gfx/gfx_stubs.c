@@ -225,6 +225,18 @@ int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot) {
         }
     }
     int f12 = pid == GetCurrentProcessId() && (GetAsyncKeyState(key) & 0x8001);
+    if (key == VK_F9) {   // RenderDoc's F12: the free commit at the press (a capture short of it crashes in renderdoc.dll)
+        static int rd_was;
+        int rd = pid == GetCurrentProcessId() && (GetAsyncKeyState(VK_F12) & 0x8001);
+        if (rd && !rd_was) {
+            MEMORYSTATUSEX ms = {.dwLength = sizeof ms};
+            GlobalMemoryStatusEx(&ms);
+            rt_log("capture: RenderDoc capture at frame %llu: commit free %.1f of %.1f GiB, RAM free %.1f GiB",
+                   (unsigned long long)frame, (double)ms.ullAvailPageFile / 1073741824.0,
+                   (double)ms.ullTotalPageFile / 1073741824.0, (double)ms.ullAvailPhys / 1073741824.0);
+        }
+        rd_was = rd != 0;
+    }
     if (f12 && !f12_was) gfx_capture_arm(2);
     f12_was = f12 != 0;
     if ((long)frame == __atomic_load_n(&capture_at, __ATOMIC_RELAXED)) {

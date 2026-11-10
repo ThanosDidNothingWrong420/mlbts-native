@@ -14,4 +14,6 @@ if not defined RD (
 )
 if not exist "%ROOT%\work\scratch\rd" mkdir "%ROOT%\work\scratch\rd"
 cd /d "%ROOT%\work\build"
-"%RD%" capture -w -c "%ROOT%\work\scratch\rd\mlb" "%ROOT%\work\build\mlb.exe" %*
+rem --opt-soft-memory-limit (MiB): RenderDoc prepares a capture's resource copies in batches under it. Without it a
+rem capture in a match copied everything at once and ran out of memory (renderdoc.dll crashed at the F12 press).
+"%RD%" capture -w --opt-soft-memory-limit 2048 -c "%ROOT%\work\scratch\rd\mlb" "%ROOT%\work\build\mlb.exe" %*
