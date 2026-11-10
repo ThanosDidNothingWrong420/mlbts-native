@@ -4059,9 +4059,12 @@ static void draw_note(VkExec *ex, const char *kind, int prim, int count) {
         uint64_t n = (uint64_t)im->width * im->height;
         if (n > (1u << 22)) n = 1u << 22;
         for (uint64_t i = 0; b && im->mirrored && i < n; i++) sum += b[i], nz += b[i] != 0;
-        rt_log("drawlog   tex %d: id %#llx %ux%u addr %#llx mirrored %u gpu_owned %u bytes sum %llu nonzero %llu",
-               k, (unsigned long long)(ex->tex[1][k] & 0xfffff), im->width, im->height, (unsigned long long)im->addr,
-               im->mirrored, im->gpu_owned, (unsigned long long)sum, (unsigned long long)nz);
+        rt_log("drawlog   tex %d: id %#llx %ux%u addr %#llx mirrored %u gpu_owned %u bytes sum %llu nonzero %llu image %p "
+               "vkfmt %d", k, (unsigned long long)(ex->tex[1][k] & 0xfffff), im->width, im->height,
+               (unsigned long long)im->addr, im->mirrored, im->gpu_owned, (unsigned long long)sum,
+               (unsigned long long)nz, (void *)im->image, (int)im->format);
+        void vk_texture_log_at(uint64_t addr, const char *who);   // vk_texture.c (mlbts-native diagnosis)
+        if (im->width >= 256 && im->height >= 256) vk_texture_log_at(im->addr, "drawlog");
     }
 }
 
@@ -4261,7 +4264,8 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     static int dd_n = -1;
     if (dd_n < 0) {
         const char *e = cfg_get("MLB_DISPATCH_DUMP");
-        if (!e) e = "6dfb3fe0,1760ce02,96b26045,029166ea,0e0c2eb9,257c230d,2ef7a42a";
+        if (!e) e = "6dfb3fe0,1760ce02,96b26045,029166ea,0e0c2eb9,257c230d,2ef7a42a,acd11752";   // acd11752: the stats
+                                                                                              // screen's player image
         dd_n = 0;
         while (e && *e && dd_n < 16) {
             char *end;
@@ -4314,12 +4318,15 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
                 n = t.L.size < (4u << 20) ? t.L.size : (4u << 20);
                 for (uint64_t b = 0; b < n; b++) nz += t.mem[b] != 0;
             }
-            rt_log("watch:   tex b%d slot %d type %#x: h %#llx%s nvn fmt %#x %ux%u vkfmt %d lv %u addr %#llx mir %u gpu %u; "
-                   "storage %llu of %llu bytes non-zero",
-                   (int)tr[i].binding, (int)tr[i].slot, (unsigned)tr[i].type, (unsigned long long)h,
-                   im ? "" : " unresolved", im ? (unsigned)t.d.format : 0, im ? im->width : 0, im ? im->height : 0,
-                   im ? (int)im->format : 0, im ? im->levels : 0, im ? (unsigned long long)im->addr : 0ull,
-                   im ? im->mirrored : 0, im ? im->gpu_owned : 0, (unsigned long long)nz, (unsigned long long)n);
+            rt_log("watch:   tex b%d slot %d type %#x%s: h %#llx%s nvn fmt %#x %ux%u vkfmt %d lv %u addr %#llx mir %u gpu %u "
+                   "image %p; storage %llu of %llu bytes non-zero",
+                   (int)tr[i].binding, (int)tr[i].slot, (unsigned)tr[i].type, tr[i].img_handle ? " (storage image)" : "",
+                   (unsigned long long)h, im ? "" : " unresolved", im ? (unsigned)t.d.format : 0, im ? im->width : 0,
+                   im ? im->height : 0, im ? (int)im->format : 0, im ? im->levels : 0,
+                   im ? (unsigned long long)im->addr : 0ull, im ? im->mirrored : 0, im ? im->gpu_owned : 0,
+                   im ? (void *)im->image : NULL, (unsigned long long)nz, (unsigned long long)n);
+            void vk_texture_log_at(uint64_t addr, const char *who);   // vk_texture.c (mlbts-native diagnosis)
+            if (im) vk_texture_log_at(im->addr, "watch:");
         }
         const GfxShaderRes *ur;
         int nu = gfx_shader_resources(cs, GFX_RES_UBO, &ur);

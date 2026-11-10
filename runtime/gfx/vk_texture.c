@@ -1807,6 +1807,22 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
     return e;
 }
 
+// mlbts-native diagnosis: every entry at a storage address, one line each (which image, its format, usage, whether it
+// is released, GPU-owned, and the order of its newest GPU write and of the write its content comes from), so a draw
+// that samples one image while a dispatch or pass wrote another at the same address shows it.
+void vk_texture_log_at(uint64_t addr, const char *who) {
+    lock();
+    int i = 0;
+    for (Tex *p = nvn_hm_get(&by_addr, &addr); p && i < 8; p = p->next_at, i++)
+        rt_log("%s   entry %d at %#llx: image %p nvn fmt %#x target %d %ux%u levels %u layers %u vkfmt %d usage %#x "
+               "released %d gpu_owned %u gpu_dirty %u uploads %u wseq %llu cseq %llu", who, i, (unsigned long long)addr,
+               (void *)p->pub.image, (unsigned)p->t.d.format, p->t.d.target, p->pub.width, p->pub.height, p->pub.levels,
+               p->pub.layers, (int)p->pub.format, (unsigned)p->pub.usage, p->released, p->pub.gpu_owned, p->gpu_dirty,
+               p->n_up, (unsigned long long)p->wseq, (unsigned long long)p->cseq);
+    if (!i) rt_log("%s   no entry at %#llx", who, (unsigned long long)addr);
+    unlock();
+}
+
 void vk_texture_lock(void) { lock(); }
 void vk_texture_unlock(void) { unlock(); }
 uint32_t vk_texture_slots_gen(void) { return slots_gen; }
