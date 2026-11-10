@@ -454,7 +454,9 @@ static const char *kind_name(uint32_t k) {
                                          "vertex+index", "uniform+vertex+index"};
     return names[k & 7];
 }
-// The submit-call bytes over the replay's copy of the regions (U.reg, at dst).
+// The submit-call bytes over the replay's copy of the regions (U.reg, at dst). dst is only written: it is often device
+// memory through the BAR, read back at about a microsecond a cache line (comparing a frame's 4 MiB there took 70-150
+// ms); the comparison reads the live guest bytes the copy came from.
 static void fz_overlay(const Frozen *f, uint8_t *dst) {
     int j = 0;
     for (int i = 0; i < U.nreg; i++) {
@@ -468,10 +470,11 @@ static void fz_overlay(const Frozen *f, uint8_t *dst) {
                 continue;
             }
             uint8_t *d = dst + g->off + (a - g->lo);
+            const uint8_t *live = (const uint8_t *)(uintptr_t)a;
             const uint8_t *s = f->bytes + f->off[k] + (a - f->r[k].lo);
-            if (memcmp(d, s, b - a)) {
+            if (memcmp(live, s, b - a)) {
                 uint64_t nd = 0;
-                for (uint64_t x = 0; x < b - a; x++) nd += d[x] != s[x];
+                for (uint64_t x = 0; x < b - a; x++) nd += live[x] != s[x];
                 F.changed_ranges++, F.changed_bytes += nd, F.changed_kind[f->r[k].kind & 7]++;
                 static volatile int32_t n_logged;
                 if (plat_inc32(&n_logged) <= 40)
@@ -494,6 +497,9 @@ static void summary(void) {
            (unsigned long long)U.subs, (unsigned long long)U.off_subs, U.regions / s, U.bytes / s / 1024.0,
            U.copy_ns / s / 1e6, U.hits / s, U.drops / s, U.inflight / s, U.refused / s);
     U.subs = U.off_subs = U.regions = U.bytes = U.copy_ns = U.hits = U.drops = U.inflight = U.refused = 0;
+}
+static void fz_summary(void) {   // mlbts-native: replay, every 600 submissions with a submit-call copy
+    if (__atomic_load_n(&F.subs, __ATOMIC_RELAXED) < 600) return;
     uint64_t fs = __atomic_exchange_n(&F.subs, 0, __ATOMIC_RELAXED), fr = __atomic_exchange_n(&F.ranges, 0, __ATOMIC_RELAXED),
              fb = __atomic_exchange_n(&F.bytes, 0, __ATOMIC_RELAXED), fns = __atomic_exchange_n(&F.ns, 0, __ATOMIC_RELAXED),
              ffull = __atomic_exchange_n(&F.full, 0, __ATOMIC_RELAXED),
@@ -517,6 +523,7 @@ static void summary(void) {
 static void begin_(const uint64_t *handles, int n, uint64_t fence, const Frozen *fz);
 void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
     Frozen *fz = fz_take(handles, n);   // mlbts-native
+    fz_summary();
     begin_(handles, n, fence, fz);
     fz_release(fz);
 }
