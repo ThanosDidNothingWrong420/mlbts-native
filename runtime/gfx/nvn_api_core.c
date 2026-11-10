@@ -703,7 +703,6 @@ static uint64_t lod_entered, lod_issued, lod_fence[LOD_RING];
 // core given up (section 2.2), or queued for the replay thread (TOTK_REPLAY_ASYNC, vk_backend.c); the newest fence
 // value is what QueueFenceSync records. With the queue the fence covers replay and GPU, so the LOD guard below waits
 // for both.
-__attribute__((weak)) void gfx_tex_snap_submit(void) {}   // mlbts-native: vk_texture.c
 __attribute__((weak)) void vk_usnap_submit(const uint64_t *handles, int n) { (void)handles, (void)n; }   // vk_usnap.c
 NVN_API(nvnQueueSubmitCommands) {
     queue_t *q = arg_p(c, 0);
@@ -720,7 +719,6 @@ NVN_API(nvnQueueSubmitCommands) {
         uint64_t local[32], *hs = n <= 32 ? local : malloc(sizeof *hs * (size_t)n);
         if (!hs) rt_fatal("nvn: out of memory (submit of %d handles)", n);
         plat_mutex_lock(&submit_lock);
-        gfx_tex_snap_submit();   // mlbts-native: CPU textures rewritten every frame, as the game hands them over
         nvn_submit_prepare_async(h, hs, n);
         vk_usnap_submit(hs, n);   // mlbts-native: uniform, vertex and index bytes as the game hands them over
         f = gfx_backend()->submit(hs, n);
