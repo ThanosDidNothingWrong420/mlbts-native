@@ -67,8 +67,10 @@ void vk_exec_frame_written(const tex_t *t) {
 
 void vk_capture_targets(const tex_t *const *ts, int n, uint64_t frame);   // vk_capture.c
 void vk_watch_frame(uint64_t frame);   // vk_capture.c
+void vk_watch_queries_report(void);   // vk_exec_draw.c
 void vk_exec_frame_log(const tex_t *p, uint64_t frame) {
     vk_watch_frame(frame);
+    vk_watch_queries_report();
     VkExecFrame *f = &vk_exec_frame;
     long cap = vk_drawlog_frame();
     if (cap >= 0 && (uint64_t)cap == frame) {   // mlbts-native: the capture frame's render targets as PNGs
@@ -539,6 +541,17 @@ int vk_exec_targets_recent(VkExec *ex, int any) {
     return any ? color || (depth && !color_first) : n > 0;
 }
 
+// mlbts-native diagnosis: whether a target of the current pass is in an address-watch range (vk_watch_hit)
+int vk_watch_hit(uint64_t a, uint64_t n);
+int vk_exec_targets_watched(VkExec *ex) {
+    resolve_rt(ex);
+    for (int i = 0; i < 9; i++) {
+        const VkExecTarget *t = i < 8 ? &ex->color[i] : &ex->depth;
+        if (t->image && t->tex && t->tex->mem && vk_watch_hit((uint64_t)(uintptr_t)t->tex->mem, t->tex->L.size)) return 1;
+    }
+    return 0;
+}
+
 // One line naming each target of the current pass: format, extent, layer and the two frames it was last rendered in
 // (prepare_draw's pipeline wait log).
 void vk_exec_targets_describe(VkExec *ex, char *buf, size_t cap) {
@@ -783,6 +796,9 @@ static void clear_color(VkExec *ex, const p_clear_color *c) {
     const VkExecTarget *t = &ex->color[i];
     VkClearColorValue cv;
     memcpy(cv.float32, c->rgba, sizeof cv.float32);   // integer targets: the payload's bits as the front end stored them
+    if (t->tex && t->tex->mem && vk_watch_hit((uint64_t)(uintptr_t)t->tex->mem, t->tex->L.size))   // mlbts-native diagnosis
+        rt_log("watch: colour clear of %#llx layer %u level %u to %g %g %g %g (%s)", (unsigned long long)(uintptr_t)t->tex->mem,
+               t->base_layer, t->level, c->rgba[0], c->rgba[1], c->rgba[2], c->rgba[3], whole_target(ex, t) ? "whole" : "scissored");
     if (whole_target(ex, t)) {
         vk_exec_barrier(ex);
         VkImageSubresourceRange r = {VK_IMAGE_ASPECT_COLOR_BIT, t->level, 1, t->base_layer, t->layers};

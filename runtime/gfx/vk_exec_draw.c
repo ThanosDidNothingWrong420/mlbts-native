@@ -2362,9 +2362,29 @@ static int pipe_memo_on(void) {
 static int prepare_draw_inner(VkExec *ex, int prim, int32_t count, int restart);
 static long drawlog_now_l(void);
 // mlbts-native: in the drawlog frame, a draw prepare_draw_inner turns away is logged with what it can tell of why
+static const char *pd_why;   // mlbts-native diagnosis: why prepare_draw_inner returned 0
+int vk_exec_targets_watched(VkExec *ex);   // vk_exec.c
 static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     vk_exec_dq_end(ex);   // the previous draw's query ends before this one's preparation can begin a game query
+    pd_why = NULL;
     int ok = prepare_draw_inner(ex, prim, count, restart);
+    if (!ok && !drawlog_now_l() && vk_exec_targets_watched(ex)) {   // a dropped draw into a watched target, any frame
+        uint32_t h[2] = {0, 0};
+        for (int st = 0; st < 2; st++) {
+            const uint8_t *ctl, *code; uint32_t len;
+            if (ex->prog && find_stage(ex->prog, st, &ctl, &code, &len)) {
+                uint32_t x = 2166136261u;
+                for (uint32_t i = 0; i < len; i++) x = (x ^ code[i]) * 16777619u;
+                h[st] = x;
+            }
+        }
+        char tg[512];
+        vk_exec_targets_describe(ex, tg, sizeof tg);
+        rt_log("watch: draw DROPPED in frame %llu: %s; prim %d count %d pass %ux%u prog %llu vs %08x fs %08x; %s",
+               (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1,
+               pd_why ? pd_why : "(no reason recorded)", prim, count, ex->pass_w, ex->pass_h,
+               (unsigned long long)(ex->prog ? ex->prog->serial : 0), h[0], h[1], tg);
+    }
     if (!ok && drawlog_now_l()) {
         VkRect2D sc = vk_exec_scissor(ex);
         const char *why = ex->render_disabled ? "rendering disabled (render enable / conditional render)"
@@ -2378,7 +2398,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     return ok;
 }
 static int prepare_draw_inner(VkExec *ex, int prim, int32_t count, int restart) {
-    if (ex->render_disabled) return 0;
+    if (ex->render_disabled) return pd_why = "rendering disabled (render enable / conditional render)", 0;
     cb_res(ex);
     dummies_init();
     if (ex->pass_noatt) {   // no attachment: the pass covers this draw's viewport or scissor, reopened when it needs more
@@ -2390,9 +2410,9 @@ static int prepare_draw_inner(VkExec *ex, int prim, int32_t count, int restart) 
     if (!ex->in_pass) ex->dirty |= VK_EXEC_DIRTY_VIEWPORT | VK_EXEC_DIRTY_SCISSOR;
     vk_exec_pass_begin(ex);
     VkRect2D sc = vk_exec_scissor(ex);
-    if (!sc.extent.width || !sc.extent.height) return 0;
+    if (!sc.extent.width || !sc.extent.height) return pd_why = "empty scissor", 0;
     ex->prog = ex->prog_gfx;   // mlbts-native: the graphics stages' program (vk_exec.h stage_prog)
-    if (!ex->prog) return warn_once(W_PROGRAM, "a draw without a bound program is skipped"), 0;
+    if (!ex->prog) return pd_why = "no program", warn_once(W_PROGRAM, "a draw without a bound program is skipped"), 0;
     int has_vs, has_fs, vs_wait = 0, fs_wait = 0, memo = shader_memo_on();
     const GfxShader *vs, *fs;
     uint32_t gen = memo ? vk_texture_slots_gen() : 0;   // before shader_for, whose lookups may bump it
@@ -2411,19 +2431,20 @@ static int prepare_draw_inner(VkExec *ex, int prim, int32_t count, int restart) 
         if (memo && vs && !vs_wait && !fs_wait && (!has_fs || fs))
             memo_key(ex, gen, &SM.k), SM.vs = vs, SM.fs = fs, SM.has_fs = has_fs, SM.valid = 1;
     }
-    if (!has_vs) return warn_once(W_NO_VS, "a draw with a program that has no vertex stage is skipped"), 0;
+    if (!has_vs) return pd_why = "no vertex stage", warn_once(W_NO_VS, "a draw with a program that has no vertex stage is skipped"), 0;
     // A draw into a target the previous frame did not render (or into none) waits for a pending shader or pipeline:
     // one-shot draws (volumes and LUTs generated once, later only sampled) would leave their target empty for the
     // session. A draw into per-frame targets is skipped until they are ready and comes back next frame.
     int oneshot = -1, skip = pipe_skip_mode();   // -1: not looked up
     if (vs_wait || fs_wait) {
-        if (!(oneshot = !vk_exec_targets_recent(ex, skip >= 1))) return perf_count(PERF_CNT_SHADER_SKIP), 0;   // skipped until ready
+        if (!(oneshot = !vk_exec_targets_recent(ex, skip >= 1)))
+            return pd_why = "shader still translating, per-frame pass: skipped", perf_count(PERF_CNT_SHADER_SKIP), 0;
         perf_count(PERF_CNT_ONESHOT_WAIT);
         if (vs_wait) vs = shader_for(ex, NVN_STAGE_VS, &has_vs, NULL, 1);
         if (fs_wait) fs = shader_for(ex, NVN_STAGE_FS, &has_fs, NULL, 1);
     }
-    if (!vs || (has_fs && !fs)) return 0;
-    if (vk_dlaa_skip_draw(ex, fs)) return 0;   // the game's FXAA off, or its scaling replaced by DLSS (vk_dlaa.c)
+    if (!vs || (has_fs && !fs)) return pd_why = !vs ? "vertex shader missing (translation failed?)" : "fragment shader missing (translation failed?)", 0;
+    if (vk_dlaa_skip_draw(ex, fs)) return pd_why = "DLAA/FXAA replacement", 0;   // the game's FXAA off, or its scaling replaced by DLSS (vk_dlaa.c)
     uint32_t fbl = feedback_prepare(ex, fs);
     VkPipeState s = ex->pipe;
     s.vs = vs, s.fs = fs;
@@ -2486,8 +2507,8 @@ static int prepare_draw_inner(VkExec *ex, int prim, int32_t count, int restart) 
                (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1, waited / 1e6, why,
                pending ? ", skipped after all" : "", count, ex->pass_w, ex->pass_h, tg);
     }
-    if (pending) return 0;   // a background worker is building it: the draw is skipped until it is ready
-    if (!p || !info) return warn_once(W_PIPELINE, "a graphics pipeline could not be created: draws with it are skipped"), 0;
+    if (pending) return pd_why = oneshot > 0 || why ? "pipeline still building after waiting" : "pipeline building (per-frame pass): skipped", 0;
+    if (!p || !info) return pd_why = "pipeline could not be created", warn_once(W_PIPELINE, "a graphics pipeline could not be created: draws with it are skipped"), 0;
     bind_pipeline(ex, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
     if (!B.st_valid || memcmp(&B.st, &s, sizeof s)) {
         // TOTK_DYN_DELTA: only the dynamic states whose values changed since the last call in this command buffer. A
@@ -3351,7 +3372,54 @@ static int dq_ready(void) {
     return 1;
 }
 
+// mlbts-native diagnosis: an occlusion query around every draw into a watched target (vk_watch_hit), any frame; the
+// results go to the log as they become available (vk_watch_queries_report, at each present).
+#define WQ_N 4096
+static VkQueryPool wq_pool;
+static int wq_state, wq_open = -1;
+static volatile uint32_t wq_n;
+static uint32_t wq_rep;
+static struct { uint32_t fs, vs, layer, count; uint64_t target; } wq_meta[WQ_N];
+static void wq_begin(VkExec *ex, uint32_t vs, uint32_t fs, uint64_t target, uint32_t layer, int count) {
+    if (!ex->in_pass || vk_exec_oq_active() || dq_open >= 0 || wq_open >= 0 || wq_n >= WQ_N) return;
+    if (!wq_state) {
+        wq_state = -1;
+        VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_OCCLUSION,
+                                    .queryCount = WQ_N};
+        if (vkCreateQueryPool(vk_ctx()->device, &qi, NULL, &wq_pool) != VK_SUCCESS) return;
+        vkResetQueryPool(vk_ctx()->device, wq_pool, 0, WQ_N);
+        wq_state = 1;
+    }
+    if (wq_state < 0) return;
+    uint32_t i = wq_n;
+    wq_meta[i].fs = fs, wq_meta[i].vs = vs, wq_meta[i].target = target, wq_meta[i].layer = layer,
+    wq_meta[i].count = (uint32_t)count;
+    vkCmdBeginQuery(ex->cb, wq_pool, i, 0);
+    ex->recorded++;
+    wq_open = (int)i;
+    __atomic_store_n(&wq_n, i + 1, __ATOMIC_RELEASE);
+}
+void vk_watch_queries_report(void) {
+    if (wq_state <= 0) return;
+    uint32_t n = __atomic_load_n(&wq_n, __ATOMIC_ACQUIRE);
+    while (wq_rep < n) {
+        uint64_t v[2] = {0, 0};
+        if (vkGetQueryPoolResults(vk_ctx()->device, wq_pool, wq_rep, 1, sizeof v, v, sizeof v,
+                                  VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) < 0 || !v[1])
+            return;
+        rt_log("watch: draw #%u into %#llx layer %u (vs %08x fs %08x, %u vertices): %llu samples passed", wq_rep,
+               (unsigned long long)wq_meta[wq_rep].target, wq_meta[wq_rep].layer, wq_meta[wq_rep].vs, wq_meta[wq_rep].fs,
+               wq_meta[wq_rep].count, (unsigned long long)v[0]);
+        wq_rep++;
+    }
+}
+
 void vk_exec_dq_end(VkExec *ex) {
+    if (wq_open >= 0) {
+        vkCmdEndQuery(ex->cb, wq_pool, (uint32_t)wq_open);
+        ex->recorded++;
+        wq_open = -1;
+    }
     if (dq_open < 0) return;
     vkCmdEndQuery(ex->cb, dq_pool, (uint32_t)dq_open);
     ex->recorded++;
@@ -3572,6 +3640,8 @@ void vk_drawq_report(void) {
         void vk_capture_targets(const tex_t *const *ts, int n, uint64_t frame);
         if (n) vk_capture_targets(tp, n, 1000000 + (uint64_t)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED));
         for (uint32_t q = 0; q < dq_n; q++) dq_ft[q].save = 0, dq_ft[q].n = 0;
+        void vk_watch_capture(uint64_t frame);   // vk_capture.c: the watched images, every layer
+        vk_watch_capture((uint64_t)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED));
     }
     // Draws with a stride-16 RGBA32F position (MLB's face meshes, positions from a compute pass) that wrote nothing,
     // and every draw sharing their storage buffer 1: vertex constants, bones, first vertices.
@@ -3592,6 +3662,52 @@ void vk_drawq_report(void) {
             }
     vkResetQueryPool(dev, dq_pool, 0, dq_n);
     dq_n = 0;
+}
+
+// mlbts-native diagnosis: every uniform buffer (up to 0x1000 bytes) and the first bytes of every storage buffer bound to
+// the vertex and fragment stages, as floats and hex, into <profile>/drawdump-<frame>-<fs hash>-<why>.txt
+static void dump_draw_buffers(VkExec *ex, uint32_t vsh, uint32_t fsh, const char *why) {
+    char path[1200];
+    snprintf(path, sizeof path, "%s/drawdump-%llu-%08x-%s.txt", rt_config()->profile,
+             (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), fsh, why);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "vs %08x fs %08x prog %llu\n", vsh, fsh, (unsigned long long)(ex->prog ? ex->prog->serial : 0));
+    static const int st[2] = {NVN_STAGE_VS, NVN_STAGE_FS};
+    for (int k = 0; k < 2; k++) {
+        for (int u = 0; u < 14; u++) {
+            const p_bind_buf *b = &ex->ubo[st[k]][u];
+            if (!b->addr) continue;
+            uint64_t n = b->size < 0x1000 ? b->size : 0x1000;
+            fprintf(f, "%s c%d %#llx+%#llx\n", k ? "fs" : "vs", u + 3, (unsigned long long)b->addr, (unsigned long long)b->size);
+            VkMemSpan sp;
+            if (!n || !vk_mem_resolve(b->addr, n, &sp)) continue;
+            const uint32_t *w = (const uint32_t *)(uintptr_t)b->addr;
+            for (uint64_t i = 0; i + 4 <= n / 4 * 1; i += 4) {
+                float x[4];
+                memcpy(x, w + i, 16);
+                fprintf(f, "  %4llx [%3llu]: %12g %12g %12g %12g | %08x %08x %08x %08x\n", (unsigned long long)(i * 4),
+                        (unsigned long long)(i / 4), x[0], x[1], x[2], x[3], w[i], w[i + 1], w[i + 2], w[i + 3]);
+            }
+        }
+        for (int u = 0; u < 16; u++) {
+            const p_bind_buf *b = &ex->ssbo[st[k]][u];
+            if (!b->addr) continue;
+            uint64_t n = b->size < 0x100 ? b->size : 0x100;
+            fprintf(f, "%s ssbo%d %#llx+%#llx\n", k ? "fs" : "vs", u, (unsigned long long)b->addr, (unsigned long long)b->size);
+            VkMemSpan sp;
+            if (!n || !vk_mem_resolve(b->addr, n, &sp)) continue;
+            const uint32_t *w = (const uint32_t *)(uintptr_t)b->addr;
+            for (uint64_t i = 0; i + 4 <= n / 4; i += 4) {
+                float x[4];
+                memcpy(x, w + i, 16);
+                fprintf(f, "  %4llx: %12g %12g %12g %12g | %08x %08x %08x %08x\n", (unsigned long long)(i * 4), x[0], x[1],
+                        x[2], x[3], w[i], w[i + 1], w[i + 2], w[i + 3]);
+            }
+        }
+    }
+    fclose(f);
+    rt_log("drawdump: %s", path);
 }
 
 // mlbts-native diagnosis (black heads): a draw into a watched render target (vk_watch_hit), with what its fragment
@@ -3616,9 +3732,19 @@ static void watch_draw(VkExec *ex, const char *kind, int count) {
         }
     }
     const tex_t *ct = ex->color[hit].tex;
-    rt_log("watch: draw %s count %d into target %d at %#llx (nvn fmt %#x %ux%u level %u, view fmt %d) prog %llu vs %08x "
+    if (!drawlog_now()) wq_begin(ex, h[0], h[1], (uint64_t)(uintptr_t)ct->mem, ex->color[hit].base_layer, count);
+    {   // the first 6 draws of each fragment shader into watched targets: all their uniform buffers
+        static uint32_t seen[64], cnt[64];
+        static int nseen;
+        int j = 0;
+        while (j < nseen && seen[j] != h[1]) j++;
+        if (j == nseen && nseen < 64) seen[nseen] = h[1], cnt[nseen++] = 0;
+        if (j < 64 && cnt[j]++ < 6) dump_draw_buffers(ex, h[0], h[1], "watch");
+    }
+    rt_log("watch: draw %s count %d into target %d at %#llx layers %u+%u (nvn fmt %#x %ux%u level %u, view fmt %d) prog %llu vs %08x "
            "fs %08x; blend en %u src %u/%u dst %u/%u op %u/%u chmask %#x; targets %u",
-           kind, count, hit, (unsigned long long)(uintptr_t)ct->mem, (unsigned)ct->d.format, (unsigned)ct->d.width,
+           kind, count, hit, (unsigned long long)(uintptr_t)ct->mem, ex->color[hit].base_layer, ex->color[hit].layers,
+           (unsigned)ct->d.format, (unsigned)ct->d.width,
            (unsigned)ct->d.height, ex->color[hit].level, ex->pipe.color_fmt[hit],
            (unsigned long long)(ex->prog ? ex->prog->serial : 0), h[0], h[1], (unsigned)ex->pipe.color.blend_en,
            (unsigned)ex->pipe.blend[hit].src_rgb, (unsigned)ex->pipe.blend[hit].src_a, (unsigned)ex->pipe.blend[hit].dst_rgb,
@@ -3726,6 +3852,16 @@ static void draw_note(VkExec *ex, const char *kind, int prim, int count) {
         int nt = gfx_shader_resources(B.st.fs, GFX_RES_TEX, &tr);
         dq_ft[q].n = 0;
         dq_ft[q].save = drawtex_match(h[1]);
+        if (dq_ft[q].save) {
+            static uint32_t dumped[16];
+            static int nd;
+            static uint64_t nd_frame;
+            uint64_t fr = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+            if (fr != nd_frame) nd = 0, nd_frame = fr;
+            int j = 0;
+            while (j < nd && dumped[j] != h[1]) j++;
+            if (j == nd && nd < 16) dumped[nd++] = h[1], dump_draw_buffers(ex, h[0], h[1], "capture");
+        }
         if (dq_ft[q].save) {   // the fragment stage's uniform buffers c3..c10: address, size, and the vec4 at 0x320 (c8[50])
             char line[900];
             int o = snprintf(line, sizeof line, "drawlog   q %d fs ubo:", q);

@@ -340,20 +340,35 @@ static int shadow_scale_of(const nvn_texdesc *d, const TexVkFormat *f, uint32_t 
 // mlbts-native diagnosis (black faces): an address range whose texture creations and GPU writes are logged, the first
 // 300. MLB_WATCH=<hex address>[,<hex size>]; default: player #76's face texture of the exhibition match (0x163906800,
 // a 256x128 BC7 image), which stays zero in guest memory.
+// MLB_WATCH=<hex address>,<hex size>[;<hex address>,<hex size>...] (up to 8 ranges; "off" for none).
+#define WATCH_N 8
+static uint64_t w_lo[WATCH_N], w_hi[WATCH_N];
+static volatile int w_n = -1;
 int vk_watch_hit(uint64_t a, uint64_t n) {
-    static uint64_t lo = 1, hi, lo2, hi2;
-    if (lo == 1) {
+    if (w_n < 0) {
         const char *e = cfg_get("MLB_WATCH");
-        lo = hi = lo2 = hi2 = 0;   // off unless MLB_WATCH=<hex address>[,<hex size>] names a range
-        if (!e || !*e) return 0;
-        char *end;
-        lo = strtoull(e, &end, 16), hi = lo + (*end == ',' ? strtoull(end + 1, NULL, 16) : 0x8000);
-        rt_log("watch: logging texture creations and GPU writes over %#llx-%#llx and %#llx-%#llx",
-               (unsigned long long)lo, (unsigned long long)hi, (unsigned long long)lo2, (unsigned long long)hi2);
+        // for now: the RTTS room's lighting chain (dark room, banding): the 512x512x3 RGBA16F lighting array, its
+        // 512x512 source, the 1024x1024 R8 map, the 16x16 irradiance probe and the 128x128 capture cube
+        int k = 0;
+        while (e && *e && k < WATCH_N && strcmp(e, "off")) {
+            char *end;
+            w_lo[k] = strtoull(e, &end, 16);
+            w_hi[k] = w_lo[k] + (*end == ',' ? strtoull(end + 1, &end, 16) : 0x8000);
+            rt_log("watch: logging texture creations, draws, dispatches and copies over %#llx-%#llx",
+                   (unsigned long long)w_lo[k], (unsigned long long)w_hi[k]);
+            k++;
+            e = strchr(end, ';');
+            if (e) e++;
+        }
+        w_n = k;
     }
-    static volatile int32_t n_logged;
     uint64_t b = a + (n ? n : 1);
-    return ((a < hi && b > lo) || (a < hi2 && b > lo2)) && plat_inc32(&n_logged) <= 3000;
+    for (int i = 0; i < w_n; i++)
+        if (a < w_hi[i] && b > w_lo[i]) {
+            static volatile int32_t n_logged;
+            return plat_inc32(&n_logged) <= 8000;
+        }
+    return 0;
 }
 
 static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
@@ -505,6 +520,8 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
         init_image(e, vk_upload_begin());
         vk_upload_end();
     }
+    void vk_watch_note_tex(const tex_t *t);   // vk_capture.c: saved with the capture
+    if (vk_watch_hit(p->addr, t->L.size)) vk_watch_note_tex(t);
     if (vk_watch_hit(p->addr, t->L.size))
         rt_log("watch: image created at %#llx (storage %#llx bytes) nvn fmt %#x %ux%ux%u target %d levels %u vkfmt %d "
                "mirrored %u usage %#x", (unsigned long long)p->addr, (unsigned long long)t->L.size, (unsigned)d->format,

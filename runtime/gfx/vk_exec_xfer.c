@@ -59,6 +59,7 @@ static void warn_once(int key, const char *fmt, ...) {
 }
 
 static uint32_t max1(uint32_t v) { return v ? v : 1; }
+int vk_watch_hit(uint64_t a, uint64_t n);   // vk_texture.c (mlbts-native diagnosis)
 
 // ---- completion callbacks (completion thread)
 
@@ -433,10 +434,20 @@ static void copy_buffer_image(VkExec *ex, const p_copy_b2t *p, int to_image) {
     if (to_image) vkCmdCopyBufferToImage(ex->cb, m.buffer, s.img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     else vkCmdCopyImageToBuffer(ex->cb, s.img->image, VK_IMAGE_LAYOUT_GENERAL, m.buffer, 1, &c);
     ex->recorded++;
+    if (to_image && vk_watch_hit((uint64_t)(uintptr_t)p->tex->mem, p->tex->L.size)) {   // mlbts-native diagnosis
+        uint64_t nz = 0;
+        VkMemSpan cm;
+        if (vk_mem_resolve(p->src, size, &cm))
+            for (uint64_t b = 0; b < size; b++) nz += ((const uint8_t *)(uintptr_t)p->src)[b] != 0;
+        rt_log("watch: buffer %#llx (+%#llx, %llu bytes non-zero in guest memory) copied to %#llx fmt %#x level %u layer %u "
+               "%d,%d %ux%u", (unsigned long long)p->src, (unsigned long long)size, (unsigned long long)nz,
+               (unsigned long long)(uintptr_t)p->tex->mem, (unsigned)p->tex->d.format, s.level, s.layer0, s.x, s.y, s.w, s.h);
+    }
     if (to_image) vk_texture_gpu_written(p->tex);
     else vk_mem_gpu_wrote(&m, size), note_gpu_write(ex, p->src, size);
 }
 
+int vk_watch_hit(uint64_t a, uint64_t n);   // vk_texture.c (mlbts-native diagnosis)
 static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
     Sub s, d;
     if (!sub_resolve(p->src, &p->sv, p->has_sv, &p->sr, 1, &s)) return;
@@ -453,6 +464,14 @@ static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
         return;
     }
     VkImageSubresourceLayers sl = sub_layers(&s), dl = sub_layers(&d);
+    if (vk_watch_hit((uint64_t)(uintptr_t)p->src->mem, p->src->L.size) ||
+        vk_watch_hit((uint64_t)(uintptr_t)p->dst->mem, p->dst->L.size))   // mlbts-native diagnosis
+        rt_log("watch: copy %#llx fmt %#x level %u layers %u+%u %d,%d %ux%u -> %#llx fmt %#x level %u layers %u+%u %d,%d "
+               "%ux%u (%s%s)", (unsigned long long)(uintptr_t)p->src->mem, (unsigned)p->src->d.format, sl.mipLevel,
+               sl.baseArrayLayer, sl.layerCount, s.x, s.y, s.w, s.h, (unsigned long long)(uintptr_t)p->dst->mem,
+               (unsigned)p->dst->d.format, dl.mipLevel, dl.baseArrayLayer, dl.layerCount, d.x, d.y, d.w, d.h,
+               s.img->samples > 1 && d.img->samples == 1 ? "resolve" : same_size && same_format ? "copy" : "blit",
+               (p->flags & NVN_COPY_FLAGS_LINEAR_FILTER_BIT) ? ", linear" : "");
     vk_exec_pass_end(ex);
     vk_exec_barrier(ex);
     if (s.img->samples > 1 && d.img->samples == 1) {
@@ -607,6 +626,9 @@ static void clear_tex(VkExec *ex, const p_clear_tex *p) {
         vkCmdClearDepthStencilImage(ex->cb, img->image, VK_IMAGE_LAYOUT_GENERAL, &dv, 1, &rng);
     }
     ex->recorded++;
+    if (vk_watch_hit((uint64_t)(uintptr_t)t->mem, t->L.size))   // mlbts-native diagnosis
+        rt_log("watch: texture clear of %#llx fmt %#x to %g %g %g %g", (unsigned long long)(uintptr_t)t->mem,
+               (unsigned)t->d.format, p->c.f[0], p->c.f[1], p->c.f[2], p->c.f[3]);
     vk_texture_gpu_written(t);
 }
 

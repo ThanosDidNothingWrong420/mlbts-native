@@ -21,7 +21,7 @@ static int blit_src_ok(VkPhysicalDevice phys, VkFormat f) {
     return (p.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) != 0;
 }
 
-static void save_one(VkCtx *c, VkCommandPool pool, const VkTexImage *im, const char *path) {
+static void save_one(VkCtx *c, VkCommandPool pool, const VkTexImage *im, const char *path, uint32_t layer) {
     uint32_t w = im->width, h = im->height;
     VkImage tmp = VK_NULL_HANDLE;
     VmaAllocation tmp_a = NULL, buf_a = NULL;
@@ -53,7 +53,7 @@ static void save_one(VkCtx *c, VkCommandPool pool, const VkTexImage *im, const c
                                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                                .image = tmp, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b0);
-    VkImageBlit region = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+    VkImageBlit region = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1},
                           .srcOffsets = {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}},
                           .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                           .dstOffsets = {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}}};
@@ -186,6 +186,30 @@ int vk_capture_read(uint64_t addr, void *out, uint32_t n) {
     return ok;
 }
 
+// mlbts-native diagnosis: the newest texture object of each image the address watch saw created (vk_texture.c
+// create_tex), saved with the capture frame's targets as shot-<2000000+frame>-*.png (vk_drawq_report).
+static tex_t wt[24];
+static int nwt;
+void vk_watch_note_tex(const tex_t *t) {
+    for (int i = 0; i < nwt; i++)
+        if (wt[i].mem == t->mem && wt[i].d.format == t->d.format && wt[i].d.target == t->d.target) {
+            wt[i] = *t;
+            return;
+        }
+    if (nwt < 24) wt[nwt++] = *t;
+}
+void vk_capture_targets(const tex_t *const *ts, int n, uint64_t frame);
+void vk_watch_capture(uint64_t frame) {
+    const tex_t *p[24];
+    for (int i = 0; i < nwt; i++) {
+        p[i] = &wt[i];
+        rt_log("watch: capture saves watched image %d: %#llx nvn fmt %#x %ux%ux%u target %d", i,
+               (unsigned long long)(uintptr_t)wt[i].mem, (unsigned)wt[i].d.format, (unsigned)wt[i].d.width,
+               (unsigned)wt[i].d.height, (unsigned)wt[i].d.depth, (int)wt[i].d.target);
+    }
+    if (nwt) vk_capture_targets(p, nwt, 2000000 + frame);
+}
+
 // mlbts-native diagnosis (black heads): images the address watch keeps (vk_watch_keep) are saved as PNGs at the
 // present of the frame WK_DELAY frames after the one that armed it, once per run.
 enum { WK_DELAY = 30 };
@@ -292,7 +316,16 @@ static int cmpf_cap(const void *a, const void *b) {
 
 // mlbts-native: level 0 of an R11G11B10F or RGBA16F image decoded from its raw bits: value statistics of the brightest
 // channel per texel to the log, and a PNG scaled so the 99th percentile is white (sRGB-encoded), no 8-bit blit first.
+static void save_hdr_layer(VkCtx *c, VkCommandPool pool, const VkTexImage *im, const char *path, uint32_t layer);
 static void save_hdr(VkCtx *c, VkCommandPool pool, const VkTexImage *im, const char *path) {
+    uint32_t nl = im->layers < 8 ? im->layers : 8;
+    for (uint32_t l = 0; l < nl; l++) {
+        char p[1300];
+        if (l) snprintf(p, sizeof p, "%.*s-layer%u.png", (int)(strlen(path) - 4), path, l);
+        save_hdr_layer(c, pool, im, l ? p : path, l);
+    }
+}
+static void save_hdr_layer(VkCtx *c, VkCommandPool pool, const VkTexImage *im, const char *path, uint32_t layer) {
     uint32_t w = im->width, h = im->height, bpt = im->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ? 4 : 8;
     VkBuffer buf;
     VmaAllocation ba;
@@ -309,7 +342,7 @@ static void save_hdr(VkCtx *c, VkCommandPool pool, const VkTexImage *im, const c
         VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                           .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
         vkBeginCommandBuffer(cb, &begin);
-        VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
+        VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1}, .imageExtent = {w, h, 1}};
         vkCmdCopyImageToBuffer(cb, im->image, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &copy);
         vkEndCommandBuffer(cb);
         VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
@@ -358,6 +391,56 @@ static void save_hdr(VkCtx *c, VkCommandPool pool, const VkTexImage *im, const c
     vmaDestroyBuffer(c->vma, buf, ba);
 }
 
+// mlbts-native: a BC6H image's real values: each layer (up to 8) of level 0 blitted into an RGBA16F image (no clamp)
+// and decoded by save_hdr_layer.
+static void save_bc6h(VkCtx *c, VkCommandPool pool, const VkTexImage *im, const char *path) {
+    uint32_t w = im->width, h = im->height, nl = im->layers < 8 ? im->layers : 8;
+    VkImage tmp;
+    VmaAllocation ta;
+    VkImageCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+                            .format = VK_FORMAT_R16G16B16A16_SFLOAT, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
+                            .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                            .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
+    VmaAllocationCreateInfo ia = {.usage = VMA_MEMORY_USAGE_AUTO};
+    if (vmaCreateImage(c->vma, &ii, &ia, &tmp, &ta, NULL) != VK_SUCCESS) return;
+    for (uint32_t l = 0; l < nl; l++) {
+        VkCommandBufferAllocateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pool,
+                                          .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+        VkCommandBuffer cb;
+        if (vkAllocateCommandBuffers(c->device, &ci, &cb) != VK_SUCCESS) break;
+        VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                          .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+        vkBeginCommandBuffer(cb, &begin);
+        VkImageMemoryBarrier b0 = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                                   .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                   .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                   .image = tmp, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b0);
+        VkImageBlit region = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, l, 1},
+                              .srcOffsets = {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}},
+                              .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                              .dstOffsets = {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}}};
+        vkCmdBlitImage(cb, im->image, VK_IMAGE_LAYOUT_GENERAL, tmp, VK_IMAGE_LAYOUT_GENERAL, 1, &region, VK_FILTER_NEAREST);
+        VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                              .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT};
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        vkEndCommandBuffer(cb);
+        VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
+        vk_queue_lock();
+        VkResult r = vkQueueSubmit(c->gfx_queue, 1, &si, VK_NULL_HANDLE);
+        if (r == VK_SUCCESS) r = vkQueueWaitIdle(c->gfx_queue);
+        vk_queue_unlock();
+        vkFreeCommandBuffers(c->device, pool, 1, &cb);
+        if (r != VK_SUCCESS) break;
+        VkTexImage f = *im;
+        f.image = tmp, f.format = VK_FORMAT_R16G16B16A16_SFLOAT, f.layers = 1, f.levels = 1;
+        char lp[1300];
+        snprintf(lp, sizeof lp, "%.*s-bc6h-layer%u.png", (int)(strlen(path) - 4), path, l);
+        save_hdr_layer(c, pool, &f, lp, 0);
+    }
+    vmaDestroyImage(c->vma, tmp, ta);
+}
+
 void vk_capture_targets(const tex_t *const *ts, int n, uint64_t frame) {
     VkCtx *c = vk_ctx();
     if (!c || !n) return;
@@ -379,6 +462,13 @@ void vk_capture_targets(const tex_t *const *ts, int n, uint64_t frame) {
             continue;
         }
         if (im && im->image != VK_NULL_HANDLE && im->samples == 1 && im->type == VK_IMAGE_TYPE_2D &&
+            (im->format == VK_FORMAT_BC6H_UFLOAT_BLOCK || im->format == VK_FORMAT_BC6H_SFLOAT_BLOCK)) {
+            char hp[1200];
+            snprintf(hp, sizeof hp, "%s/shot-%llu-%d-%ux%u-fmt%#x.png", rt_config()->profile, (unsigned long long)frame, i,
+                     im->width, im->height, (unsigned)ts[i]->d.format);
+            save_bc6h(c, pool, im, hp);
+        }
+        if (im && im->image != VK_NULL_HANDLE && im->samples == 1 && im->type == VK_IMAGE_TYPE_2D &&
             (im->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || im->format == VK_FORMAT_R16G16B16A16_SFLOAT)) {
             char hp[1200];
             snprintf(hp, sizeof hp, "%s/shot-%llu-%d-%ux%u-fmt%#x-hdr.png", rt_config()->profile, (unsigned long long)frame,
@@ -388,10 +478,17 @@ void vk_capture_targets(const tex_t *const *ts, int n, uint64_t frame) {
         if (!im || im->image == VK_NULL_HANDLE || !(im->aspect & VK_IMAGE_ASPECT_COLOR_BIT) || im->samples > 1 ||
             im->type != VK_IMAGE_TYPE_2D || !blit_src_ok(c->phys, im->format))
             continue;
-        char path[1200];
-        snprintf(path, sizeof path, "%s/shot-%llu-%d-%ux%u-fmt%#x.png", rt_config()->profile, (unsigned long long)frame, i,
-                 im->width, im->height, (unsigned)ts[i]->d.format);
-        save_one(c, pool, im, path);
+        uint32_t nl = im->layers < 8 ? im->layers : 8;
+        for (uint32_t l = 0; l < nl; l++) {   // mlbts-native: every layer (up to 8) of an array or cube
+            char path[1200];
+            if (l)
+                snprintf(path, sizeof path, "%s/shot-%llu-%d-%ux%u-fmt%#x-layer%u.png", rt_config()->profile,
+                         (unsigned long long)frame, i, im->width, im->height, (unsigned)ts[i]->d.format, l);
+            else
+                snprintf(path, sizeof path, "%s/shot-%llu-%d-%ux%u-fmt%#x.png", rt_config()->profile,
+                         (unsigned long long)frame, i, im->width, im->height, (unsigned)ts[i]->d.format);
+            save_one(c, pool, im, path, l);
+        }
     }
     vkDestroyCommandPool(c->device, pool, NULL);
 }
