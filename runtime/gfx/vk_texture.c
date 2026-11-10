@@ -344,7 +344,7 @@ static int shadow_scale_of(const nvn_texdesc *d, const TexVkFormat *f, uint32_t 
 // 300. MLB_WATCH=<hex address>[,<hex size>]; default: player #76's face texture of the exhibition match (0x163906800,
 // a 256x128 BC7 image), which stays zero in guest memory.
 // MLB_WATCH=<hex address>,<hex size>[;<hex address>,<hex size>...] (up to 8 ranges; "off" for none).
-#define WATCH_N 8
+#define WATCH_N 64   // mlbts-native: ranges vk_watch_add adds too
 static uint64_t w_lo[WATCH_N], w_hi[WATCH_N];
 static volatile int w_n = -1;
 int vk_watch_hit(uint64_t a, uint64_t n) {
@@ -370,9 +370,21 @@ int vk_watch_hit(uint64_t a, uint64_t n) {
     for (int i = 0; i < w_n; i++)
         if (a < w_hi[i] && b > w_lo[i]) {
             static volatile int32_t n_logged;
-            return plat_inc32(&n_logged) <= 8000;
+            return plat_inc32(&n_logged) <= 30000;
         }
     return 0;
+}
+// mlbts-native diagnosis: adds a range to the address watch (the stale hairstyle chain: the encoder's source and output,
+// the textures the draws into a watched target sample). Replay thread.
+void vk_watch_add(uint64_t lo, uint64_t size) {
+    if (w_n < 0) vk_watch_hit(0, 0);
+    if (!lo || !size) return;
+    for (int i = 0; i < w_n; i++)
+        if (lo >= w_lo[i] && lo + size <= w_hi[i]) return;
+    if (w_n >= WATCH_N) return;
+    w_lo[w_n] = lo, w_hi[w_n] = lo + size;
+    rt_log("watch: now also watching %#llx-%#llx", (unsigned long long)lo, (unsigned long long)(lo + size));
+    __atomic_store_n(&w_n, w_n + 1, __ATOMIC_RELEASE);
 }
 
 static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
@@ -1264,14 +1276,32 @@ static void make_fresh_snap(Tex *e) {
         // content: MLB's created-player hair and head textures (their BC7 entries were filled by the GPU encoder)
         // kept the previous hairstyle when the next one loaded there. Only pages wholly inside the storage count (a
         // neighbour's write is not a rewrite), and not while GPU content waits for its write-back (gpu_dirty).
-        if (e->gpu_dirty || !e->uploaded) return;
+        int wh = vk_watch_hit(e->pub.addr, e->t.L.size);
+        if (e->gpu_dirty || !e->uploaded) {
+            if (wh) rt_log("watch: binding of GPU-owned %#llx fmt %#x %ux%u: not checked (%s)", (unsigned long long)e->pub.addr,
+                           (unsigned)e->t.d.format, e->pub.width, e->pub.height,
+                           e->gpu_dirty ? "its GPU content awaits a write-back" : "never uploaded");
+            return;
+        }
         for (Tex *p = nvn_hm_get(&by_addr, &e->key.addr); p; p = p->next_at)
-            if (p->gpu_dirty) return;   // another image's GPU content is not in the storage yet
+            if (p->gpu_dirty) {   // another image's GPU content is not in the storage yet
+                if (wh) rt_log("watch: binding of GPU-owned %#llx fmt %#x %ux%u: not checked (the %ux%u fmt %#x image "
+                               "there awaits a write-back)", (unsigned long long)e->pub.addr, (unsigned)e->t.d.format,
+                               e->pub.width, e->pub.height, p->pub.width, p->pub.height, (unsigned)p->t.d.format);
+                return;
+            }
         uint64_t lo = (e->pub.addr + 0xfff) & ~0xfffull, hi = (e->pub.addr + e->t.L.size) & ~0xfffull;
-        if (hi <= lo) return;
+        if (hi <= lo) {
+            if (wh) rt_log("watch: binding of GPU-owned %#llx: fills no page of its own, not checked",
+                           (unsigned long long)e->pub.addr);
+            return;
+        }
         uint32_t base = e->gpu_gen > e->wgen ? e->gpu_gen : e->wgen, now;
         n_checks++;
-        if (vk_mem_changed_snap(lo, hi - lo, base, submit_epoch, &now) != 1) return;
+        int ch = vk_mem_changed_snap(lo, hi - lo, base, submit_epoch, &now);
+        if (wh) rt_log("watch: binding of GPU-owned %#llx fmt %#x %ux%u: CPU rewrite since generation %u: %d (now %u)",
+                       (unsigned long long)e->pub.addr, (unsigned)e->t.d.format, e->pub.width, e->pub.height, base, ch, now);
+        if (ch != 1) return;
         log_limited(&n_rewrite_log, "vk: texture %#llx fmt %#x %ux%u: the CPU rewrote the storage of GPU content; "
                     "uploaded again", (unsigned long long)e->pub.addr, (unsigned)e->t.d.format, e->pub.width,
                     e->pub.height);

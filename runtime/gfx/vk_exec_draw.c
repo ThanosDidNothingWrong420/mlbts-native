@@ -3811,6 +3811,14 @@ static void dump_draw_buffers(VkExec *ex, uint32_t vsh, uint32_t fsh, const char
 
 // mlbts-native diagnosis (black heads): a draw into a watched render target (vk_watch_hit), with what its fragment
 // shader reads; the textures of the first such draw are kept for the watch's PNGs (vk_capture.c vk_watch_keep).
+// mlbts-native diagnosis: the bound compute program is MLB's GPU BC encoder (acd11752)
+static int cs_hash_is_encoder(const VkExec *ex) {
+    const uint8_t *ctl, *code;
+    uint32_t len, h = 2166136261u;
+    if (!ex->prog || !find_stage(ex->prog, NVN_STAGE_CS, &ctl, &code, &len)) return 0;
+    for (uint32_t i = 0; i < len; i++) h = (h ^ code[i]) * 16777619u;
+    return h == 0xacd11752u;
+}
 static void watch_draw(VkExec *ex, const char *kind, int count) {
     int hit = -1;
     for (uint32_t i = 0; i < ex->pass_ncolor && i < 8; i++)
@@ -3872,6 +3880,12 @@ static void watch_draw(VkExec *ex, const char *kind, int count) {
             }
         }
         const uint8_t *sw = hv && v.set_swizzle ? v.swz : im ? im->swz : (const uint8_t *)"\0\0\0\0";
+        if (im) {   // mlbts-native diagnosis: every image at the texture's storage, and the texture joins the watch
+            void vk_texture_log_at(uint64_t addr, const char *who);
+            void vk_watch_add(uint64_t lo, uint64_t size);
+            vk_texture_log_at(im->addr, "watch:");
+            if (got) vk_watch_add(im->addr, t.L.size);
+        }
         rt_log("watch:   fs tex b%d slot %d type %#x: h %#llx%s nvn fmt %#x view fmt %#x %ux%u vkfmt %d lv %u swz %u%u%u%u "
                "addr %#llx mir %u gpu %u; storage %llu of %llu bytes non-zero, byte sums by offset mod 4 %llu %llu %llu %llu",
                (int)tr[i].binding, (int)tr[i].slot, (unsigned)tr[i].type, (unsigned long long)th, im ? "" : " unresolved",
@@ -4289,6 +4303,10 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     }
     int dd_hit = 0;
     for (int i = 0; i < dd_n; i++) dd_hit |= dd_want[i] == dd_h;
+    if (dd_h == 0xacd11752u) {   // mlbts-native diagnosis: MLB's GPU BC encoder (stale hairstyles): every run
+        static int n_enc;
+        if (n_enc++ < 2000) watch_dispatch = 1;
+    }
     if (dd_hit) {
         static struct { uint32_t h; int n; } ddc[16];
         int i = 0;
@@ -4326,7 +4344,9 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
                    im ? (unsigned long long)im->addr : 0ull, im ? im->mirrored : 0, im ? im->gpu_owned : 0,
                    im ? (void *)im->image : NULL, (unsigned long long)nz, (unsigned long long)n);
             void vk_texture_log_at(uint64_t addr, const char *who);   // vk_texture.c (mlbts-native diagnosis)
+            void vk_watch_add(uint64_t lo, uint64_t size);              // vk_texture.c (mlbts-native diagnosis)
             if (im) vk_texture_log_at(im->addr, "watch:");
+            if (im && t.mem && cs_hash_is_encoder(ex)) vk_watch_add(im->addr, t.L.size);   // its source and output
         }
         const GfxShaderRes *ur;
         int nu = gfx_shader_resources(cs, GFX_RES_UBO, &ur);
