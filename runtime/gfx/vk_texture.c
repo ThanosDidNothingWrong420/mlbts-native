@@ -1253,8 +1253,35 @@ static void make_fresh(Tex *e) {
 // make_fresh for draw bindings: the page check answers from this submission's write-watch snapshot (vk_memory.c
 // vk_mem_changed_snap) instead of a system call per texture. A write the snapshot of the texture's region missed (made
 // after it, during this replay) keeps its write-watch bit and is caught by the next submission's snapshot.
+static volatile int32_t n_rewrite_log;
+static uint64_t n_rewrite_up;      // GPU-owned textures uploaded again after a CPU rewrite (perf line in the cube flush)
 static void make_fresh_snap(Tex *e) {
-    if (!e->pub.mirrored || e->pub.gpu_owned) return;
+    if (!e->pub.mirrored) return;
+    if (e->pub.gpu_owned) {
+        // mlbts-native: the CPU rewrote the storage of an image whose GPU content the storage already holds (written
+        // back, or copied in from a block image that was): the image takes the storage again. A GPU-owned image was
+        // never uploaded again, so new CPU data at the same storage under the same descriptor kept the old GPU
+        // content: MLB's created-player hair and head textures (their BC7 entries were filled by the GPU encoder)
+        // kept the previous hairstyle when the next one loaded there. Only pages wholly inside the storage count (a
+        // neighbour's write is not a rewrite), and not while GPU content waits for its write-back (gpu_dirty).
+        if (e->gpu_dirty || !e->uploaded) return;
+        for (Tex *p = nvn_hm_get(&by_addr, &e->key.addr); p; p = p->next_at)
+            if (p->gpu_dirty) return;   // another image's GPU content is not in the storage yet
+        uint64_t lo = (e->pub.addr + 0xfff) & ~0xfffull, hi = (e->pub.addr + e->t.L.size) & ~0xfffull;
+        if (hi <= lo) return;
+        uint32_t base = e->gpu_gen > e->wgen ? e->gpu_gen : e->wgen, now;
+        n_checks++;
+        if (vk_mem_changed_snap(lo, hi - lo, base, submit_epoch, &now) != 1) return;
+        log_limited(&n_rewrite_log, "vk: texture %#llx fmt %#x %ux%u: the CPU rewrote the storage of GPU content; "
+                    "uploaded again", (unsigned long long)e->pub.addr, (unsigned)e->t.d.format, e->pub.width,
+                    e->pub.height);
+        e->pub.gpu_owned = 0;
+        vk_mem_changed(e->pub.addr, e->t.L.size, 0, &e->wgen);   // resets the write bits before the storage is read
+        upload(e);
+        e->cseq = ++content_writes;   // newer than any block image or array content over the storage
+        n_rewrite_up++;
+        return;
+    }
     uint32_t now;
     n_checks++;
     int ch = vk_mem_changed_snap(e->pub.addr, e->t.L.size, e->uploaded ? e->wgen : 0, submit_epoch, &now);
@@ -1761,9 +1788,11 @@ void vk_texture_cube_flush(void) {
     static uint64_t last_frame;
     uint64_t fr = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     if ((rt_trace & RT_TRACE_PERF) && fr >= last_frame + 600) {
-        rt_log("perf: frame %llu: cubes and block views refreshed from their sources %llu times in 600 frames%s",
-               (unsigned long long)fr, (unsigned long long)n_cube_copies, n_cube_dropped ? " (queue overflowed)" : "");
-        n_cube_copies = n_cube_dropped = 0, last_frame = fr;
+        rt_log("perf: frame %llu: cubes and block views refreshed from their sources %llu times in 600 frames%s; "
+               "GPU-owned textures uploaded again after a CPU rewrite %llu", (unsigned long long)fr,
+               (unsigned long long)n_cube_copies, n_cube_dropped ? " (queue overflowed)" : "",
+               (unsigned long long)n_rewrite_up);
+        n_cube_copies = n_cube_dropped = n_rewrite_up = 0, last_frame = fr;
     }
     unlock();
 }
@@ -2248,7 +2277,9 @@ static void write_back_n(Tex **v, int n) {
         free(buf);
     }
     free(p);
-    for (int i = 0; i < n; i++) v[i]->gpu_dirty = 0;
+    // mlbts-native: the write-back's own stores are not CPU rewrites of the GPU content (make_fresh_snap): a new
+    // generation for them
+    for (int i = 0; i < n; i++) v[i]->gpu_dirty = 0, vk_mem_changed(v[i]->pub.addr, v[i]->t.L.size, 0, &v[i]->gpu_gen);
 }
 
 // Mirrored textures overlapping [addr, addr+size) that the GPU wrote since their last write-back.
