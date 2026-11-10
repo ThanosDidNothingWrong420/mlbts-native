@@ -504,11 +504,24 @@ static void vk_be_guest_read(uint64_t addr, uint64_t size) {
 }
 // After a fence wait: the value is done, so its replay is too; a later submission the replay records meanwhile marks
 // its targets with a later fence, which write_back_small leaves alone. No drain.
+// mlbts-native: once per fence value. A target the replay marks dirty later carries a later fence than any the CPU
+// has seen complete, so a fence at or below the last one handled has nothing left to write back. With the replay on its
+// own thread the pending flag stays up (the replay is always recording newer frames), and MLB's loading code checks its
+// syncs in a loop: each check rescanned every GPU-written texture under the texture lock, the replay thread starved on
+// that lock and scene changes froze for 20-60 s.
+static uint64_t small_done;
+static volatile int64_t cs_calls, cs_runs;   // diagnosis: syncs the CPU saw complete, and write-back scans they ran
 static void vk_be_cpu_synced(uint64_t fence) {
-    if (!vk_texture_small_dirty()) return;
+    if ((plat_add64(&cs_calls, 1) + 1) % 20000 == 0)
+        rt_log("vk: CPU-synced fences: %lld, of them %lld scanned the dirty targets", (long long)cs_calls, (long long)cs_runs);
+    if (!vk_texture_small_dirty() || fence <= __atomic_load_n(&small_done, __ATOMIC_ACQUIRE)) return;
+    plat_add64(&cs_runs, 1);
     vk_sync_start();
     vk_present_drain();
     vk_texture_write_back_small(fence);
+    // recorded once the write-back is done: a caller that skips finds the storage already written
+    uint64_t prev = __atomic_load_n(&small_done, __ATOMIC_ACQUIRE);
+    while (prev < fence && !__atomic_compare_exchange_n(&small_done, &prev, fence, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {}
 }
 
 const GfxBackend gfx_vulkan_backend = {
