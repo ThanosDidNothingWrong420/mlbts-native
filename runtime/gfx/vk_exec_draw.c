@@ -4070,7 +4070,7 @@ static void draw_note(VkExec *ex, const char *kind, int prim, int count) {
                (unsigned long long)im->addr, im->mirrored, im->gpu_owned, (unsigned long long)sum,
                (unsigned long long)nz, (void *)im->image, (int)im->format);
         void vk_texture_log_at(uint64_t addr, const char *who);   // vk_texture.c (mlbts-native diagnosis)
-        if (im->width >= 256 && im->height >= 256) vk_texture_log_at(im->addr, "drawlog");
+        if (im->width >= 128 && im->height >= 128) vk_texture_log_at(im->addr, "drawlog");
     }
 }
 

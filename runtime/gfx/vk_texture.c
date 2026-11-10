@@ -1331,6 +1331,8 @@ static int cpu_rewrite_refresh(Tex *e) {
     up_lvmask = ~0u;
     e->cseq = ++content_writes;   // newer than any block image or array content over the storage
     n_rewrite_up++;
+    void vk_watch_note_tex(const tex_t *t);   // vk_capture.c: saved at the next F12 (diagnosis: stale hairstyles)
+    vk_watch_note_tex(&e->t);
     return 1;
 }
 
