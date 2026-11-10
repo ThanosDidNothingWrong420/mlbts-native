@@ -3,6 +3,7 @@
 // exposure targets, UI layers) can be looked at, not just the presented one. Each colour target is blitted into an
 // RGBA8 image (the blit converts float and packed formats; values above 1 clamp), copied to a host buffer and written.
 // It waits for the queue to go idle first: a diagnosis path, taken once per capture.
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -209,6 +210,154 @@ void vk_watch_frame(uint64_t frame) {
     vk_capture_targets(ts, n, frame);
 }
 
+// mlbts-native: layer 0, level 0 of a D16 / D32 / X8_D24 depth image as a grayscale PNG, stretched from the smallest
+// depth to the largest below 1 (a cleared 1.0 is white); the range goes to the log.
+static void save_depth(VkCtx *c, VkCommandPool pool, const VkTexImage *im, const char *path) {
+    uint32_t w = im->width, h = im->height, bpt;
+    switch (im->format) {
+    case VK_FORMAT_D16_UNORM: bpt = 2; break;
+    case VK_FORMAT_D32_SFLOAT: case VK_FORMAT_X8_D24_UNORM_PACK32: case VK_FORMAT_D32_SFLOAT_S8_UINT:
+    case VK_FORMAT_D24_UNORM_S8_UINT: bpt = 4; break;
+    default: return;
+    }
+    VkBuffer buf;
+    VmaAllocation ba;
+    VmaAllocationInfo info;
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = (VkDeviceSize)w * h * bpt,
+                             .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                  .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+    if (vmaCreateBuffer(c->vma, &bi, &ai, &buf, &ba, &info) != VK_SUCCESS) return;
+    VkCommandBufferAllocateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pool,
+                                      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+    VkCommandBuffer cb;
+    if (vkAllocateCommandBuffers(c->device, &ci, &cb) == VK_SUCCESS) {
+        VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                          .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+        vkBeginCommandBuffer(cb, &begin);
+        VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
+        vkCmdCopyImageToBuffer(cb, im->image, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &copy);
+        vkEndCommandBuffer(cb);
+        VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
+        vk_queue_lock();
+        VkResult r = vkQueueSubmit(c->gfx_queue, 1, &si, VK_NULL_HANDLE);
+        if (r == VK_SUCCESS) r = vkQueueWaitIdle(c->gfx_queue);
+        vk_queue_unlock();
+        vkFreeCommandBuffers(c->device, pool, 1, &cb);
+        uint8_t *px = r == VK_SUCCESS ? malloc((size_t)w * h * 4) : NULL;
+        if (px) {
+            vmaInvalidateAllocation(c->vma, ba, 0, VK_WHOLE_SIZE);
+            const uint8_t *b = info.pMappedData;
+            float lo = 1, hi = 0;
+            uint64_t ones = 0;
+            float *d = malloc((size_t)w * h * sizeof(float));
+            if (d) {
+                for (uint64_t i = 0; i < (uint64_t)w * h; i++) {
+                    float v;
+                    if (bpt == 2) v = (float)((const uint16_t *)b)[i] / 65535.0f;
+                    else if (im->format == VK_FORMAT_D32_SFLOAT || im->format == VK_FORMAT_D32_SFLOAT_S8_UINT) memcpy(&v, b + 4 * i, 4);
+                    else v = (float)(((const uint32_t *)b)[i] & 0xffffff) / 16777215.0f;
+                    d[i] = v;
+                    if (v >= 1.0f) ones++;
+                    else { if (v < lo) lo = v; if (v > hi) hi = v; }
+                }
+                for (uint64_t i = 0; i < (uint64_t)w * h; i++) {
+                    float v = d[i] >= 1.0f ? 1.0f : hi > lo ? (d[i] - lo) / (hi - lo) * 0.9f : 0.0f;
+                    uint8_t g = (uint8_t)(v * 255.0f);
+                    px[4 * i] = px[4 * i + 1] = px[4 * i + 2] = g, px[4 * i + 3] = 255;
+                }
+                free(d);
+                rt_write_png(path, px, w, h);
+                rt_log("capture: %s (depth %g..%g below 1, %llu of %u texels at 1)", path, lo, hi, (unsigned long long)ones, w * h);
+            }
+            free(px);
+        }
+    }
+    vmaDestroyBuffer(c->vma, buf, ba);
+}
+
+static float half_to_float(uint16_t h) {
+    uint32_t sg = h >> 15, e = h >> 10 & 31, m = h & 1023;
+    float v = e == 0 ? m / 1024.0f / 16384.0f : e == 31 ? 65504.0f : (1.0f + m / 1024.0f) * ldexpf(1.0f, (int)e - 15);
+    return sg ? -v : v;
+}
+static float uf(uint32_t bits, int mb) {   // unsigned 5-bit-exponent float with mb mantissa bits (B10G11R11)
+    uint32_t e = bits >> mb & 31, m = bits & ((1u << mb) - 1);
+    return e == 0 ? m / (float)(1u << mb) * ldexpf(1.0f, -14) : e == 31 ? 65504.0f : (1.0f + m / (float)(1u << mb)) * ldexpf(1.0f, (int)e - 15);
+}
+static int cmpf_cap(const void *a, const void *b) {
+    float x = *(const float *)a, y = *(const float *)b;
+    return x < y ? -1 : x > y;
+}
+
+// mlbts-native: level 0 of an R11G11B10F or RGBA16F image decoded from its raw bits: value statistics of the brightest
+// channel per texel to the log, and a PNG scaled so the 99th percentile is white (sRGB-encoded), no 8-bit blit first.
+static void save_hdr(VkCtx *c, VkCommandPool pool, const VkTexImage *im, const char *path) {
+    uint32_t w = im->width, h = im->height, bpt = im->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ? 4 : 8;
+    VkBuffer buf;
+    VmaAllocation ba;
+    VmaAllocationInfo info;
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = (VkDeviceSize)w * h * bpt,
+                             .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                  .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+    if (vmaCreateBuffer(c->vma, &bi, &ai, &buf, &ba, &info) != VK_SUCCESS) return;
+    VkCommandBufferAllocateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pool,
+                                      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+    VkCommandBuffer cb;
+    if (vkAllocateCommandBuffers(c->device, &ci, &cb) == VK_SUCCESS) {
+        VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                          .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+        vkBeginCommandBuffer(cb, &begin);
+        VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
+        vkCmdCopyImageToBuffer(cb, im->image, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &copy);
+        vkEndCommandBuffer(cb);
+        VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
+        vk_queue_lock();
+        VkResult r = vkQueueSubmit(c->gfx_queue, 1, &si, VK_NULL_HANDLE);
+        if (r == VK_SUCCESS) r = vkQueueWaitIdle(c->gfx_queue);
+        vk_queue_unlock();
+        vkFreeCommandBuffers(c->device, pool, 1, &cb);
+        uint64_t n = (uint64_t)w * h;
+        float *rgb = r == VK_SUCCESS ? malloc(n * 3 * sizeof(float)) : NULL, *mx = rgb ? malloc(n * sizeof(float)) : NULL;
+        uint8_t *px = mx ? malloc(n * 4) : NULL;
+        if (px) {
+            vmaInvalidateAllocation(c->vma, ba, 0, VK_WHOLE_SIZE);
+            const uint8_t *b = info.pMappedData;
+            for (uint64_t i = 0; i < n; i++) {
+                float v[3];
+                if (bpt == 4) {
+                    uint32_t x;
+                    memcpy(&x, b + 4 * i, 4);
+                    v[0] = uf(x & 0x7ff, 6), v[1] = uf(x >> 11 & 0x7ff, 6), v[2] = uf(x >> 22, 5);
+                } else {
+                    uint16_t x[4];
+                    memcpy(x, b + 8 * i, 8);
+                    for (int k = 0; k < 3; k++) v[k] = half_to_float(x[k]);
+                }
+                memcpy(rgb + 3 * i, v, sizeof v);
+                mx[i] = v[0] > v[1] ? (v[0] > v[2] ? v[0] : v[2]) : (v[1] > v[2] ? v[1] : v[2]);
+            }
+            qsort(mx, n, sizeof(float), cmpf_cap);
+            float p50 = mx[n / 2], p99 = mx[n * 99 / 100], top = mx[n - 1], scale = p99 > 0 ? 1.0f / p99 : 1.0f;
+            uint64_t distinct = 1;
+            for (uint64_t i = 1; i < n; i++) distinct += mx[i] != mx[i - 1];
+            for (uint64_t i = 0; i < n; i++)
+                for (int k = 0; k < 3; k++) {
+                    float v = rgb[3 * i + k] * scale;
+                    v = v <= 0 ? 0 : v >= 1 ? 1 : v < 0.0031308f ? v * 12.92f : 1.055f * powf(v, 1 / 2.4f) - 0.055f;
+                    px[4 * i + k] = (uint8_t)(v * 255.0f + 0.5f);
+                }
+            for (uint64_t i = 0; i < n; i++) px[4 * i + 3] = 255;
+            rt_write_png(path, px, w, h);
+            rt_log("capture: %s (brightest channel: median %g, 99th percentile %g, max %g, min %g; %llu distinct values; "
+                   "scaled x%g)", path, p50, p99, top, mx[0], (unsigned long long)distinct, scale);
+        }
+        free(rgb), free(mx), free(px);
+    }
+    vmaDestroyBuffer(c->vma, buf, ba);
+}
+
 void vk_capture_targets(const tex_t *const *ts, int n, uint64_t frame) {
     VkCtx *c = vk_ctx();
     if (!c || !n) return;
@@ -221,6 +370,21 @@ void vk_capture_targets(const tex_t *const *ts, int n, uint64_t frame) {
     vk_queue_unlock();
     for (int i = 0; i < n; i++) {
         const VkTexImage *im = ts[i] ? vk_texture_get(ts[i]) : NULL;
+        if (im && im->image != VK_NULL_HANDLE && (im->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && im->samples == 1 &&
+            im->type == VK_IMAGE_TYPE_2D) {
+            char path[1200];
+            snprintf(path, sizeof path, "%s/shot-%llu-%d-%ux%u-fmt%#x-depth.png", rt_config()->profile,
+                     (unsigned long long)frame, i, im->width, im->height, (unsigned)ts[i]->d.format);
+            save_depth(c, pool, im, path);
+            continue;
+        }
+        if (im && im->image != VK_NULL_HANDLE && im->samples == 1 && im->type == VK_IMAGE_TYPE_2D &&
+            (im->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || im->format == VK_FORMAT_R16G16B16A16_SFLOAT)) {
+            char hp[1200];
+            snprintf(hp, sizeof hp, "%s/shot-%llu-%d-%ux%u-fmt%#x-hdr.png", rt_config()->profile, (unsigned long long)frame,
+                     i, im->width, im->height, (unsigned)ts[i]->d.format);
+            save_hdr(c, pool, im, hp);
+        }
         if (!im || im->image == VK_NULL_HANDLE || !(im->aspect & VK_IMAGE_ASPECT_COLOR_BIT) || im->samples > 1 ||
             im->type != VK_IMAGE_TYPE_2D || !blit_src_ok(c->phys, im->format))
             continue;

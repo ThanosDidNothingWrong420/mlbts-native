@@ -1370,12 +1370,27 @@ static Tex *entry_of(const tex_t *t) {
         e->use_seq = ++use_counter;
         // released entries of another descriptor at this address are replaced by the new one; a live one holding
         // GPU-written content is the alias source, preferring the one that differs only in swizzle (same_but_swizzle)
-        int alias = 0;
-        Tex *src = NULL;
-        uint32_t src_levels = 0, lv;
+        int alias = 0, ndead = 0;
+        Tex *src = NULL, *rsrc = NULL, *dead[16];
+        uint32_t src_levels = 0, rsrc_levels = 0, lv;
         for (Tex *p = nvn_hm_get(&by_addr, &k.addr), *nx; p; p = nx) {
             nx = p->next_at;
-            if (p->released) { destroy_tex(p); continue; }
+            if (p->released) {
+                // mlbts-native: a released entry whose image holds GPU content the storage does not (never written
+                // back) can still give it to the new one, newest first; it goes after the copy is recorded. MLB fills
+                // the RTTS room's irradiance probe through a 2D-array storage image, releases it and samples the same
+                // storage as a cube: the cube read the empty storage, and the room went dark and banded.
+                if (tex_alias && (lv = alias_compatible(e, p)) && alias_has_gpu_content(p) &&
+                    (!rsrc || p->use_seq > rsrc->use_seq))
+                    rsrc = p, rsrc_levels = lv;
+                if (vk_watch_hit(k.addr, t->L.size))
+                    rt_log("watch:   released candidate fmt %#x %ux%u: compatible levels %u, gpu content %d",
+                           (unsigned)p->t.d.format, (unsigned)p->t.d.width, (unsigned)p->t.d.height, alias_compatible(e, p),
+                           alias_has_gpu_content(p));
+                if (ndead < 16) dead[ndead++] = p;
+                else destroy_tex(p);
+                continue;
+            }
             alias = 1;
             if (vk_watch_hit(k.addr, t->L.size)) {
                 uint32_t now;
@@ -1389,6 +1404,7 @@ static Tex *entry_of(const tex_t *t) {
                 (lv = alias_compatible(e, p)) && alias_has_gpu_content(p))
                 src = p, src_levels = lv;
         }
+        if (!src && rsrc) src = rsrc, src_levels = rsrc_levels, alias = 1;
         if (alias) perf_count(PERF_CNT_TEX_ALIAS);
         if (vk_watch_hit(k.addr, t->L.size)) {
             rt_log("watch: alias source at %#llx: %s (%u levels)", (unsigned long long)k.addr,
@@ -1413,6 +1429,7 @@ static Tex *entry_of(const tex_t *t) {
                 }
             }
         }
+        for (int i = 0; i < ndead; i++) destroy_tex(dead[i]);   // after the alias copy that may read one of them
         e->next_at = nvn_hm_get(&by_addr, &k.addr);
         nvn_hm_put(&by_addr, &k.addr, e);
         nvn_hm_put(&by_key, &k, e);

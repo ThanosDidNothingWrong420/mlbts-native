@@ -3679,7 +3679,6 @@ static int drawtex_match(uint32_t fs) {
     if (n < 0) {
         n = 0;
         const char *e = cfg_get("MLB_DRAWTEX");
-        if (!e) e = "d3b91243,4db69cf5,ebeb772c";   // for now: the RTTS player body and face, the room
         while (e && *e && n < 16) {
             char *end;
             want[n++] = (uint32_t)strtoul(e, &end, 16);
@@ -3705,6 +3704,21 @@ static void draw_note(VkExec *ex, const char *kind, int prim, int count) {
         }
     }
     int face = q >= 0 && dq_a0[q].fmt == 0x2e && dq_a0[q].stride == 16;
+    if (q >= 0 && (h[0] == 0x4a65a97du || h[0] == 0x74d4d733u || h[0] == 0xff8fe22du)) {
+        // mlbts-native (RTTS room lamp shadow): the vertex shader reads its light matrices at c3 0xe0 + 64 x face and
+        // clamps at 0x3d0, past the 0x90 bytes the game binds; what the guest memory holds there
+        const p_bind_buf *u = &ex->ubo[NVN_STAGE_VS][0];
+        VkMemSpan sp;
+        if (u->addr && vk_mem_resolve(u->addr, 0x400, &sp)) {
+            const float *f = (const float *)(uintptr_t)u->addr;
+            char line[1200];
+            int o = snprintf(line, sizeof line, "drawlog   q %d vs c3 %#llx+%#llx past its size:", q, (unsigned long long)u->addr,
+                             (unsigned long long)u->size);
+            for (int k = 0xe0 / 4; k < 0x1a0 / 4; k++) o += snprintf(line + o, sizeof line - o, " %g", f[k]);
+            o += snprintf(line + o, sizeof line - o, " | 0x3d0: %g %g %g %g", f[0x3d0 / 4], f[0x3d4 / 4], f[0x3d8 / 4], f[0x3dc / 4]);
+            rt_log("%s", line);
+        }
+    }
     if (q >= 0 && (face || drawtex_match(h[1])) && B.st_valid && B.st.fs) {
         // mlbts-native: a face draw (positions from the face skinning pass) or an MLB_DRAWTEX shader's: every texture
         // its fragment shader reads, resolved as the binding resolves it, with its NVN and view formats.
@@ -3712,6 +3726,22 @@ static void draw_note(VkExec *ex, const char *kind, int prim, int count) {
         int nt = gfx_shader_resources(B.st.fs, GFX_RES_TEX, &tr);
         dq_ft[q].n = 0;
         dq_ft[q].save = drawtex_match(h[1]);
+        if (dq_ft[q].save) {   // the fragment stage's uniform buffers c3..c10: address, size, and the vec4 at 0x320 (c8[50])
+            char line[900];
+            int o = snprintf(line, sizeof line, "drawlog   q %d fs ubo:", q);
+            for (int k = 0; k < 8; k++) {
+                const p_bind_buf *u = &ex->ubo[NVN_STAGE_FS][k];
+                if (!u->addr) continue;
+                o += snprintf(line + o, sizeof line - o, " c%d %#llx+%#llx", k + 3, (unsigned long long)u->addr,
+                              (unsigned long long)u->size);
+                VkMemSpan sp;
+                if (u->size >= 0x330 && vk_mem_resolve(u->addr + 0x320, 16, &sp)) {
+                    const float *f = (const float *)(uintptr_t)(u->addr + 0x320);
+                    o += snprintf(line + o, sizeof line - o, " [0x320: %g %g %g %g]", f[0], f[1], f[2], f[3]);
+                }
+            }
+            rt_log("%s", line);
+        }
         for (int i = 0; i < nt; i++) {
             uint64_t h = res_tex_handle(ex, NVN_STAGE_FS, &tr[i], 0);
             if (h && dq_ft[q].n < 24) dq_ft[q].id[dq_ft[q].n] = (uint32_t)(h & 0xfffff), dq_ft[q].bind[dq_ft[q].n++] = (uint8_t)tr[i].binding;
@@ -3730,10 +3760,11 @@ static void draw_note(VkExec *ex, const char *kind, int prim, int count) {
                    im ? im->gpu_owned : 0);
         }
     }
-    rt_log("drawlog %s q %d prim %d count %d pass %ux%u fmt %d/%d ds %#llx L%u+%u prog %llu vs %08x fs %08x blend0 en %u "
+    rt_log("drawlog %s q %d prim %d count %d pass %ux%u fmt %d/%d ds %#llx L%u+%u rt0 %#llx vk %d prog %llu vs %08x fs %08x blend0 en %u "
            "src %u dst %u chmask %#x tex1 %llx %llx %llx %llx samp1 %llx %llx ubo1 %llx+%llx",
            kind, q, prim, count, ex->pass_w, ex->pass_h, ex->pipe.color_fmt[0], ex->pipe.depth_fmt,
            (unsigned long long)(uintptr_t)(ex->depth.tex ? ex->depth.tex->mem : NULL), ex->depth.base_layer, ex->depth.layers,
+           (unsigned long long)(uintptr_t)(ex->color[0].tex ? ex->color[0].tex->mem : NULL), (int)ex->color[0].format,
            (unsigned long long)(ex->prog ? ex->prog->serial : 0), h[0], h[1], (unsigned)ex->pipe.color.blend_en,
            (unsigned)ex->pipe.blend[0].src_rgb, (unsigned)ex->pipe.blend[0].dst_rgb, ex->pipe.chmask.mask,
            (unsigned long long)ex->tex[1][0], (unsigned long long)ex->tex[1][1], (unsigned long long)ex->tex[1][2],
