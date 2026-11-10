@@ -1222,6 +1222,7 @@ typedef struct {
     uint64_t snap_bytes, merge_bytes, merge_dispatches, snap_allocs;   // write-back merge
     uint64_t quiet_bytes, quiet_ranges, quiet_broken;                  // mlbts-native: quiet pages copied (gpu_wrote)
     uint64_t age_bytes[4];                                             // merged page bytes by CPU write age (q_age)
+    uint64_t merge_union, merge_ranges;                                // distinct bytes and ranges of the merges
     uint64_t page_bytes, flush_n, flush_bytes, flush_calls, flush_sum;   // what mirror_sync queues, by source
 } MirrorAcc;
 static MirrorAcc mrep;                 // replay: this submission
@@ -1585,10 +1586,29 @@ fail:
     return 0;
 }
 
+// mlbts-native diagnosis: MLB_WB_AB=1 turns the merge off (plain copies, which can lose a CPU write made while the GPU
+// runs) in every other window of 300 presents, so one run shows the GPU time with and without it.
+static int ab_cfg = -1;
 static int merging(void) {
     if (merge_on < 0) {
         merge_on = cfg_bool("TOTK_WB_MERGE");
         rt_log("mem: write-back merge %s (TOTK_WB_MERGE)", merge_on ? "on" : "off");
+    }
+    if (ab_cfg < 0) {
+        const char *e = cfg_get("MLB_WB_AB");
+        ab_cfg = e && strcmp(e, "0");
+        if (ab_cfg) rt_log("mem: write-back merge A/B: off in every other window of 300 presents (MLB_WB_AB)");
+    }
+    if (ab_cfg) {
+        static int last = -1;
+        uint64_t fr = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+        int off = (int)((fr / 300) & 1);
+        if (off != last) {
+            last = off;
+            rt_log("mem: write-back merge A/B at frame %llu: %s until frame %llu", (unsigned long long)fr,
+                   off ? "OFF (plain copies)" : "on", (unsigned long long)((fr / 300 + 1) * 300));
+        }
+        if (off) return 0;
     }
     if (!merge_on) return 0;
     if (!WM.tried) merge_init(vk_ctx());
@@ -1731,6 +1751,24 @@ static int wb_merge_record(VkCommandBuffer cb) {
         i = j;
     }
     vmaFlushAllocation(c->vma, chunks[list].alloc, 0, VK_WHOLE_SIZE);
+    {   // diagnosis: the distinct bytes the ranges cover, per pool (s is sorted by pool, then chunk: re-sort by offset)
+        MRange *u = malloc(sizeof *u * (size_t)nsnl);
+        if (u) {
+            for (int i = 0; i < nsnl; i++) u[i] = (MRange){s[i].r, s[i].off, s[i].size};
+            qsort(u, (size_t)nsnl, sizeof *u, range_cmp);
+            uint64_t end = 0;
+            const PoolRec *pr = NULL;
+            for (int i = 0; i < nsnl; i++) {
+                uint64_t lo = u[i].off, hi = u[i].off + u[i].size;
+                if (u[i].r != pr) pr = u[i].r, end = 0;
+                if (hi <= end) continue;
+                mrep.merge_union += hi - (lo > end ? lo : end);
+                end = hi;
+            }
+            free(u);
+        }
+        mrep.merge_ranges += (uint64_t)nsnl;
+    }
     for (int i = 0; i < nsnl; i++) snl[i].r->wb_sub = msub;
     free(s);
     return rec;
@@ -1789,7 +1827,8 @@ static uint64_t q_age[4];      // replay: merged page bytes by the age of the CP
 static int quiet_on(void) {
     if (quiet_cfg < 0) {
         const char *e = cfg_get("MLB_WB_QUIET");
-        quiet_cfg = !e || strcmp(e, "0");
+        quiet_cfg = e && strcmp(e, "0");   // off unless MLB_WB_QUIET=1: the draft cutscene had none (every page
+                                            // the GPU wrote, the CPU wrote within a submission), and it costs replay time
         const char *ns = cfg_get("MLB_WB_QUIET_SUBS");   // cfg_get: cfg_int needs a row in the settings table
         int n = ns ? atoi(ns) : 0;
         if (n > 0 && n < 60) quiet_subs = n;
@@ -2198,7 +2237,7 @@ static void mirror_log(uint64_t frame) {
     rt_log("mem: mirror frame %llu: pools %lld, %.1f MiB device-local; stay imported: budget %lld (%.1f MiB), untracked "
            "%lld, overlapping %lld, failed %lld; per frame: submits %.2f, syncs %.1f, upload %.3f MiB in %.1f ranges, "
            "first use %.2f pools %.3f MiB, write-back %.3f MiB in %.1f ranges, merge %.3f MiB in %.1f dispatches "
-           "(snapshots %.3f MiB, new buffers %.2f; quiet pages copied instead %.3f MiB in %.1f runs, written by the CPU right "
+           "(distinct %.3f MiB in %.1f ranges; snapshots %.3f MiB, new buffers %.2f; quiet pages copied instead %.3f MiB in %.1f runs, written by the CPU right "
            "after %llu; merged pages by the CPU's last write: 0-1 submissions ago %.3f MiB, 2-4 %.3f, older %.3f, "
            "write-watch set %.3f), flush calls %.1f (%.3f MiB), queries "
            "%.1f pre-snap (%.1f MiB) + %.1f sync, prologues %.2f, tracking cpu %.3f ms (pre-snap %.3f, syncs %.3f)%s",
@@ -2206,7 +2245,8 @@ static void mirror_log(uint64_t frame) {
            m_refused_bytes[MR_BUDGET] / M, (long long)m_refused_n[MR_UNTRACKED], (long long)m_refused_n[MR_OVERLAP],
            (long long)m_refused_n[MR_ALLOC], a.subs / f, a.syncs / f, a.upload_bytes / f / M, a.upload_copies / f,
            a.first_n / f, a.first_bytes / f / M, a.wb_bytes / f / M, a.wb_copies / f, a.merge_bytes / f / M,
-           a.merge_dispatches / f, a.snap_bytes / f / M, a.snap_allocs / f, a.quiet_bytes / f / M, a.quiet_ranges / f,
+           a.merge_dispatches / f, a.merge_union / f / M, a.merge_ranges / f, a.snap_bytes / f / M, a.snap_allocs / f,
+           a.quiet_bytes / f / M, a.quiet_ranges / f,
            (unsigned long long)a.quiet_broken, a.age_bytes[0] / f / M, a.age_bytes[1] / f / M, a.age_bytes[2] / f / M,
            a.age_bytes[3] / f / M, fc / f, fb / f / M,
            a.presnap_queries / f, a.presnap_bytes / f / M, a.sync_queries / f, a.prologues / f, qpc_ms(a.presnap_t + a.sync_t) / f,
