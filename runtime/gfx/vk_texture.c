@@ -1607,11 +1607,12 @@ void vk_texture_debug(const VkTexImage *img, uint32_t *uploads, int *last_change
     unlock();
 }
 
+static void alias_overwritten(Tex *e);   // mlbts-native, below
 const VkTexImage *vk_texture_get(const tex_t *t) {
     if (!t || !t->mem) return NULL;
     lock();
     Tex *e = entry_of(t);
-    if (e) make_fresh(e);
+    if (e) alias_overwritten(e), make_fresh(e);
     unlock();
     return e ? &e->pub : NULL;
 }
@@ -1837,6 +1838,77 @@ static void cube_refresh(Tex *e) {
                e->pub.width, e->pub.height, src->pub.width, src->pub.height, cube ? "array" : "block image", lv);
 }
 
+// mlbts-native: GPU content another image over the same storage overwrote. On the console an image is its memory: a
+// render into another image at the same address (any shape) replaces its bytes. Here each image is its own, and one the
+// GPU last wrote kept its content after an image of another shape rendered over the storage. MLB's menus share scratch
+// render-target memory: the post-game screen draws its team logos into an 820x824 target at 0x139810000 without
+// clearing it, over what was there, and the target still held the buttons another menu had rendered into it, though a
+// 1280x720 and 1024x1024 targets had rendered there since. Those buttons showed faintly behind the screen; the same in
+// other menus as cut and mixed-in images. Before e is bound as a render target (vk_texture_get) or sampled
+// (vk_texture_by_id_locked): when an image at its address was written by the GPU after e's content, e takes that
+// content where the console's bytes are the same (same shape: alias_copy); a cube or block view keeps its own refresh
+// (cube_refresh); otherwise e's old content is gone and it is cleared to zero (the console's would be the other image's
+// bytes in e's layout, which nothing depends on). The clear is not game content: no write-back of it.
+static volatile int32_t n_ow_log;
+static uint64_t n_ow_copied, n_ow_cleared;
+static int ow_rows(Tex *e, const Tex *src) {   // level 0 rows both have: same width, texel size and GOB tiling
+    int ew, eh, sw, sh, eb = nvn_fmt_bpb(e->t.d.format, &ew, &eh), sb = nvn_fmt_bpb(src->t.d.format, &sw, &sh);
+    if (!eb || eb != sb || ew != 1 || eh != 1 || sw != 1 || sh != 1 || e->pub.width != src->pub.width) return 0;
+    if (e->pub.type != VK_IMAGE_TYPE_2D || src->pub.type != VK_IMAGE_TYPE_2D || e->pub.layers != 1 || src->pub.layers != 1)
+        return 0;
+    if (e->f.vk != e->f.ideal || src->f.vk != src->f.ideal || e->f.expand_rgb || src->f.expand_rgb) return 0;
+    if (nvn_tex_is_linear(&e->t.d) != nvn_tex_is_linear(&src->t.d)) return 0;
+    unsigned th0, td0, th1, td1;
+    nvn_tex_level_tiles(&e->t.d, 0, &th0, &td0), nvn_tex_level_tiles(&src->t.d, 0, &th1, &td1);
+    if (th0 != th1 || td0 != td1) return 0;
+    int reopen;
+    VkCommandBuffer cb = vk_exec_inline_begin(&reopen);
+    if (!cb) return 0;
+    uint32_t h = e->pub.height < src->pub.height ? e->pub.height : src->pub.height;
+    VkImageCopy c = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                     .extent = {e->pub.width, h, 1}};
+    barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    vkCmdCopyImage(cb, src->pub.image, VK_IMAGE_LAYOUT_GENERAL, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
+    vk_exec_inline_end(reopen);
+    return 1;
+}
+static void alias_overwritten(Tex *e) {
+    if (!e->pub.gpu_owned || e->released || e->f.depth || e->f.stencil || e->pub.samples > 1) return;
+    Tex *src = NULL;
+    for (Tex *p = nvn_hm_get(&by_addr, &e->key.addr); p; p = p->next_at)
+        if (p != e && p->pub.gpu_owned && p->wseq > e->cseq && (!src || p->wseq > src->wseq)) src = p;
+    if (!src || follows(e, src) || follows(src, e)) return;
+    if (!vk_exec_recording_fence()) return;   // no replay recording: at the next binding
+    uint32_t lv = alias_compatible(e, src);
+    const char *what;
+    if (lv && alias_copy(e, src, lv)) {
+        what = "took its content", n_ow_copied++;
+    } else if (!src->f.depth && !src->f.stencil && ow_rows(e, src)) {
+        what = "took the rows both have", n_ow_copied++;
+    } else if (src->t.L.size >= e->t.L.size && e->pub.type == VK_IMAGE_TYPE_2D) {
+        int reopen;
+        VkCommandBuffer cb = vk_exec_inline_begin(&reopen);
+        if (!cb) return;
+        barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        VkClearColorValue zero = {{0}};
+        VkImageSubresourceRange r = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+        vkCmdClearColorImage(cb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &r);
+        barrier(cb, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
+        vk_exec_inline_end(reopen);
+        n_ow_cleared++;
+        if (e->pub.mirrored) e->gpu_dirty = 0;
+        what = "old content cleared";
+    } else {
+        what = "left as it is (the other image covers part of its storage)";
+    }
+    log_limited(&n_ow_log, "vk: image %#llx fmt %#x %ux%u: the GPU wrote the %ux%u fmt %#x image over its storage since "
+                "(write %llu > %llu): %s", (unsigned long long)e->pub.addr, (unsigned)e->t.d.format, e->pub.width,
+                e->pub.height, src->pub.width, src->pub.height, (unsigned)src->t.d.format,
+                (unsigned long long)src->wseq, (unsigned long long)e->cseq, what);
+    e->cseq = src->wseq;
+}
+
 // Cubes behind an array write, live or released (MLB finalizes and recreates its texture objects, and a slot falls back
 // to its released cube, which the resolution never refreshed: after a game the RTTS room kept the stadium's
 // environment and irradiance, chrome-looking lockers and dark players). gpu_wrote queues them; the replay copies at the
@@ -2010,6 +2082,7 @@ const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view) {
     // replay race the GPU read on hardware too). After one check an entry is either uploaded or never uploads (not
     // mirrored, GPU-owned or no CPU layout), so a slot that checked its entry in this submit has nothing left to do.
     if (e && s->cepoch != submit_epoch) {
+        alias_overwritten(e);   // mlbts-native
         if (!e->uploaded || e->checked != submit_epoch) {
             make_fresh_snap(e);
             e->checked = submit_epoch;
@@ -2045,9 +2118,11 @@ void vk_texture_new_submit(void) {
     uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) / 60;
     if ((rt_trace & RT_TRACE_PERF) && f != log_at && tex_alias > 0) {
         log_at = f;
-        rt_log("perf: frame %llu: texture aliases: content copied %llu, filled from storage %llu, left uninitialised %llu",
+        rt_log("perf: frame %llu: texture aliases: content copied %llu, filled from storage %llu, left uninitialised %llu; "
+               "overwritten by another image: content taken %llu, cleared %llu",
                (unsigned long long)f * 60, (unsigned long long)n_alias_copied, (unsigned long long)n_alias_upload,
-               (unsigned long long)n_alias_uninit);
+               (unsigned long long)n_alias_uninit, (unsigned long long)n_ow_copied, (unsigned long long)n_ow_cleared);
+        n_ow_copied = n_ow_cleared = 0;
         n_alias_copied = n_alias_upload = n_alias_uninit = 0;
         rt_log("perf: frame %llu: texture re-uploads %llu (%.1f MiB, %.2f ms), after WriteTexels %llu (%.1f MiB, %.2f ms)",
                (unsigned long long)f * 60, (unsigned long long)ru_n, ru_bytes / 1048576.0, ru_ns / 1e6,
