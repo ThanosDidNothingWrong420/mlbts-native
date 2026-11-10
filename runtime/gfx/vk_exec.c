@@ -592,7 +592,9 @@ static VkImageMemoryBarrier2 layout_barrier(VkImage img, VkImageAspectFlags aspe
 
 // Full barrier. The images in the feedback layout become want[] (pass begin) or none (every other barrier): the others
 // go back to GENERAL and the new ones leave it, in the same command.
+void vk_exec_dispatch_run_close(VkExec *ex);   // vk_exec_draw.c: the timing mark of a run of dispatches ends here
 static void barrier_to(VkExec *ex, const VkImage *want, const VkImageAspectFlags *wasp, int nwant) {
+    vk_exec_dispatch_run_close(ex);
     vk_exec_pass_end(ex);
     vk_exec_ub_flush(ex);   // uniform updates overlaid in the pass reach their buffers before the barrier below
     VkImageMemoryBarrier2 ib[18];
@@ -885,6 +887,7 @@ static void maybe_split(VkExec *ex) {
     if (split_ns && kern_now_ns() - part_t0 < split_ns) return;   // split_draws stays: the next draw asks again
     split_draws = 0;
     if (ex->recorded == part_start) return;
+    vk_exec_dispatch_run_close(ex);
     ex->cb = vk_sync_split();
     part_start = ex->recorded;
     part_t0 = kern_now_ns();

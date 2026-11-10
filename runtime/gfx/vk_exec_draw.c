@@ -256,6 +256,34 @@ static VkPassMark *dispatch_mark(VkExec *ex, const GfxShader *cs, uint32_t x, ui
     return m;
 }
 
+// mlbts-native: one mark per run of chained dispatches (dispatch_chain_on), not one per dispatch. A GPU timestamp
+// waits for the work before it, so a pair around each of the 700-1,800 dispatches a frame of the draft cutscene
+// drained the GPU between them all (17-19 ms of GPU time a frame became 21-27). A run starts after a barrier, which
+// drains anyway, and ends at the next one (vk_exec.c barrier_to calls vk_exec_dispatch_run_close). The mark counts
+// its dispatches (draws), their workgroups (w) and the largest dispatch's (h); last[0] is the run's last shader.
+static VkPassMark *run_m;
+static VkCommandBuffer run_cb;
+void vk_exec_dispatch_run_close(VkExec *ex) {
+    if (!run_m) return;
+    if (run_cb == ex->cb) vk_pass_mark_end(ex->cb, run_m);   // another command buffer: the mark stays unended, untimed
+    run_m = NULL;
+}
+static void dispatch_run_mark(VkExec *ex, const GfxShader *cs, int chained, uint32_t x, uint32_t y, uint32_t z) {
+    if (!(rt_trace & RT_TRACE_PERF)) return;
+    if (!chained || !run_m || run_cb != ex->cb) {
+        vk_exec_dispatch_run_close(ex);
+        run_m = dispatch_mark(ex, cs, x, y, z);
+        run_cb = ex->cb;
+        if (!run_m) return;
+        run_m->w = run_m->h = run_m->d = 0;
+    }
+    uint64_t g = (uint64_t)x * y * z, sum = (uint64_t)run_m->w + g;
+    run_m->draws++;
+    run_m->w = sum > UINT32_MAX ? UINT32_MAX : (uint32_t)sum;
+    if (g > run_m->h) run_m->h = g > UINT32_MAX ? UINT32_MAX : (uint32_t)g;
+    run_m->last[0] = cs;
+}
+
 static CbRes *cb_res(VkExec *ex) {
     if (cur && cur_fence == ex->fence) return cur;
     cur = calloc(1, sizeof *cur);
@@ -4327,9 +4355,8 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
                 }
         }
     }
-    VkPassMark *m = dispatch_mark(ex, cs, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
+    dispatch_run_mark(ex, cs, chained, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     vkCmdDispatch(ex->cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
-    vk_pass_mark_end(ex->cb, m);
     ex->recorded++;
     disp_cb = ex->cb, disp_fence = ex->fence, disp_rec = ex->recorded;
     if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, d);
@@ -4367,7 +4394,9 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
         vk_exec_barrier(ex);
         B.c0_valid[2] = 0;   // the range no longer holds B.c0[2]
     }
+    vk_exec_dispatch_run_close(ex);
     VkPassMark *m = dispatch_mark(ex, cs, 0, 0, 0);
+    if (m) m->draws = 1, m->w = m->h = m->d = 0, m->last[0] = cs;
     vkCmdDispatchIndirect(ex->cb, ip.buffer, ip.offset);
     vk_pass_mark_end(ex->cb, m);
     ex->recorded++;

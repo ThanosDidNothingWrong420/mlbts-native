@@ -1,8 +1,11 @@
-// mlbts-native, our own: GPU time per render pass and per compute dispatch (MLB_TRACE=perf). The pass marks of vk.h
-// (vk_exec.c pass begin and end, vk_exec_draw.c dispatch_mark) each get a pair of timestamps written at
-// ALL_COMMANDS, so a mark measures its own work after the work before it finished. Results are read without waiting,
-// in mark order, once the mark's submission completed; every 600 presents a line lists the passes and compute shaders
-// that took the most GPU time per frame. A mark whose ring slot is still in flight gets no timestamps.
+// mlbts-native, our own: GPU time per render pass and per run of compute dispatches (MLB_TRACE=perf). The pass marks
+// of vk.h (vk_exec.c pass begin and end; vk_exec_draw.c one per run of dispatches with no barrier between them) each
+// get a pair of timestamps written at ALL_COMMANDS, so a mark measures its own work after the work before it finished.
+// Marks sit next to barriers, which drain the GPU anyway: a mark per dispatch drained it 1,500-3,600 more times a
+// frame (+4-8 ms in the draft cutscene). Results are read without waiting, in mark order, once the mark's submission
+// completed; every 300 presents a line lists the passes and dispatch runs that took the most GPU time per frame, and
+// the time between marks of one submission (barriers, copies, uploads). A mark whose ring slot is still in flight
+// gets no timestamps.
 //
 // TotK's pass marks (breadcrumbs for device-lost reports, its overlay's GPU timing) were not ported: this replaces the
 // stubs in gfx_stubs.c with timing only.
@@ -24,10 +27,10 @@ static double tick_ns;
 static uint32_t next_id = 1, collected = 1;
 
 #define AGG_N 1024
-static struct { char key[96]; double ns; uint64_t n; } agg[AGG_N];
+static struct { char key[96]; double ns; uint64_t n, disp, groups, maxg; } agg[AGG_N];
 static int nagg;
-static uint64_t frame0, n_marks, n_skipped;
-static double total_ns;
+static uint64_t frame0, n_marks, n_skipped, prev_end, prev_fence;
+static double total_ns, gap_ns, gap_max_ns;
 
 static int init(void) {
     if (state) return state > 0;
@@ -53,8 +56,9 @@ static void id_hex(const GfxShader *s, char *out) {
 static void key_of(const VkPassMark *m, char *key, size_t n) {
     char a[9], b[9];
     if (m->kind == VK_MARK_DISPATCH) {
-        id_hex(m->first[0], a);
-        snprintf(key, n, "dispatch cs %s", a);
+        id_hex(m->first[0], a), id_hex(m->last[0], b);
+        if (m->last[0] && m->last[0] != m->first[0]) snprintf(key, n, "dispatch run cs %s..%s", a, b);
+        else snprintf(key, n, "dispatch run cs %s", a);
     } else {
         id_hex(m->first[1], a), id_hex(m->last[1], b);
         snprintf(key, n, "pass %ux%u x%u c%d/%d d%d fs %s..%s", m->w, m->h, m->d, m->ncolor ? (int)m->color[0] : 0,
@@ -62,7 +66,7 @@ static void key_of(const VkPassMark *m, char *key, size_t n) {
     }
 }
 
-static void add(const char *key, double ns) {
+static void add(const char *key, double ns, const VkPassMark *m) {
     unsigned h = 2166136261u;
     for (const char *p = key; *p; p++) h = (h ^ (uint8_t)*p) * 16777619u;
     for (unsigned i = h % AGG_N, k = 0; k < AGG_N; k++, i = (i + 1) % AGG_N) {
@@ -73,6 +77,10 @@ static void add(const char *key, double ns) {
         }
         if (!strcmp(agg[i].key, key)) {
             agg[i].ns += ns, agg[i].n++;
+            if (m->kind == VK_MARK_DISPATCH) {
+                agg[i].disp += m->draws, agg[i].groups += m->w;
+                if (m->h > agg[i].maxg) agg[i].maxg = m->h;
+            }
             return;
         }
     }
@@ -97,29 +105,41 @@ static void collect(void) {
                                   VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) < 0 || !r[1] || !r[3])
             continue;
         double ns = r[2] > r[0] ? (double)(r[2] - r[0]) * tick_ns : 0;
+        if (m->fence == prev_fence && r[0] > prev_end) {   // GPU time between this mark and the one before, same submission
+            double g = (double)(r[0] - prev_end) * tick_ns;
+            gap_ns += g;
+            if (g > gap_max_ns) gap_max_ns = g;
+        }
+        prev_end = r[2], prev_fence = m->fence;
         char key[96];
         key_of(m, key, sizeof key);
-        add(key, ns);
+        add(key, ns, m);
         total_ns += ns, n_marks++;
     }
     uint64_t fr = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     if (!frame0) frame0 = fr;
-    if (fr < frame0 + 600) return;
+    if (fr < frame0 + 300) return;
     double nf = (double)(fr - frame0);
     int idx[AGG_N], n = 0;
     for (int i = 0; i < AGG_N; i++)
         if (agg[i].key[0]) idx[n++] = i;
     qsort(idx, (size_t)n, sizeof *idx, cmp_ns);
-    rt_log("perf: frame %llu: GPU time in marked passes and dispatches %.2f ms per frame (%.0f marks per frame, %llu "
-           "untimed); the most expensive:", (unsigned long long)fr, total_ns / 1e6 / nf, n_marks / nf,
-           (unsigned long long)n_skipped);
-    for (int k = 0; k < n && k < 16; k++) {
+    rt_log("perf: frame %llu: GPU time in marked passes and dispatch runs %.2f ms per frame (%.0f marks per frame, %llu "
+           "untimed); between marks of a submission %.2f ms per frame (longest %.3f ms); the most expensive:",
+           (unsigned long long)fr, total_ns / 1e6 / nf, n_marks / nf, (unsigned long long)n_skipped, gap_ns / 1e6 / nf,
+           gap_max_ns / 1e6);
+    for (int k = 0; k < n && k < 20; k++) {
         int i = idx[k];
-        rt_log("perf:   %6.3f ms per frame, %5.1f per frame, %.3f ms each: %s", agg[i].ns / 1e6 / nf, agg[i].n / nf,
-               agg[i].ns / 1e6 / (double)agg[i].n, agg[i].key);
+        char extra[128] = "";
+        if (agg[i].disp)
+            snprintf(extra, sizeof extra, " (%.1f dispatches per frame, %.1f per run, %.1f workgroups each, largest %llu)",
+                     agg[i].disp / nf, (double)agg[i].disp / (double)agg[i].n, (double)agg[i].groups / (double)agg[i].disp,
+                     (unsigned long long)agg[i].maxg);
+        rt_log("perf:   %6.3f ms per frame, %5.1f per frame, %.3f ms each: %s%s", agg[i].ns / 1e6 / nf, agg[i].n / nf,
+               agg[i].ns / 1e6 / (double)agg[i].n, agg[i].key, extra);
     }
     memset(agg, 0, sizeof agg);
-    nagg = 0, total_ns = 0, n_marks = n_skipped = 0, frame0 = fr;
+    nagg = 0, total_ns = gap_ns = gap_max_ns = 0, n_marks = n_skipped = 0, frame0 = fr;
 }
 
 VkPassMark *vk_pass_mark_begin(VkCommandBuffer cb, int kind, uint64_t fence) {
