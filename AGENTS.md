@@ -1,170 +1,155 @@
-\# AGENTS.md — MLB The Show 26 PC Recomp
-
-
-
-\## Project Goal
-
-
-
-Create a native Windows 11 x86-64 static recompilation of the \*\*Nintendo Switch version of MLB The Show 26\*\*, targeting offline gameplay.
-
-
-
-The initial goal is a playable experience covering:
-
-
-
-\- Exhibition games
-
-\- Road to the Show
-
-\- Franchise
-
-\- Local progression and save data
-
-\- Menus and other offline functionality
-
-
-
-Online features and Diamond Dynasty are out of scope initially.
-
-
-
-\*\*Target game version: 1.0.15 (Switch version 1.015).\*\* Do not silently switch to a different update version.
-
-
-
-\## Reference Projects
-
-
-
-Study these projects before designing or implementing major components:
-
-
-
-1\. \*\*TotK PC Recomp\*\*
-
-&#x20;  \[https://github.com/valentderah/totk-pc-recomp](https://github.com/valentderah/totk-pc-recomp)
-
-
-
-&#x20;  Primary architectural reference. Investigate its ARM64 recompilation pipeline, runtime, Switch SDK compatibility layer, graphics translation, shader handling, and build system.
-
-
-
-2\. \*\*Astral Chain PC Recomp\*\*
-
-&#x20;  \[https://github.com/captainj-sparrow/astral-chain-pc-recomp](https://github.com/captainj-sparrow/astral-chain-pc-recomp)
-
-
-
-&#x20;  Secondary reference for another Switch-to-Windows static recompilation built on similar foundations. Compare its implementation choices and identify reusable improvements.
-
-
-
-3\. \*\*Power Moon Recomp\*\*
-
-&#x20;  \[https://gitlab.com/zzzarathustra-dev/power-moon-recomp](https://gitlab.com/zzzarathustra-dev/power-moon-recomp)
-
-
-
-&#x20;  Additional reference for static recompilation architecture and implementation techniques.
-
-
-
-These projects are references, not drop-in solutions. Their extraction pipelines, game-specific assumptions, title IDs, module layouts, and compatibility implementations must not be assumed to work with MLB The Show 26.
-
-
-
-\## Development Environment
-
-
-
-\- OS: Windows 11
-
-\- CPU: AMD Ryzen 5 5600X
-
-\- GPU: NVIDIA RTX 3060 Ti
-
-\- Target: Windows x86-64
-
-\- Graphics backend: Investigate Vulkan compatibility and requirements before committing to an implementation.
-
-
-
-\## Initial Priorities
-
-
-
-Before attempting a full recompilation, perform technical reconnaissance of the supplied game files.
-
-
-
-Determine:
-
-
-
-1\. Game title ID, build metadata, and exact version.
-
-2\. Executable modules, their sizes, hashes, and relationships between base game and update.
-
-3\. ARM64 architecture details and instruction coverage required.
-
-4\. Imported Switch SDK functions, system services, and SVC usage.
-
-5\. Graphics API, shader formats, and GPU requirements.
-
-6\. Audio, filesystem, input, threading, and memory requirements.
-
-7\. Which components from the reference projects can realistically be reused.
-
-
-
-Produce a concise technical report documenting findings, uncertainties, compatibility gaps, and recommended next steps.
-
-
-
-Do not begin large-scale implementation based on unverified assumptions.
-
-
-
-\## Engineering Guidelines
-
-
-
-\- Prioritize correctness and reproducibility over premature optimization.
-
-\- Investigate existing implementations before reinventing infrastructure.
-
-\- Keep generic recompilation/runtime infrastructure separate from MLB-specific code.
-
-\- Do not assume MLB uses the same engine, SDK version, graphics architecture, or runtime behavior as the reference games.
-
-\- Verify instruction support, system calls, and imported functions against the actual game binaries.
-
-\- Implement missing functionality incrementally and test each component independently.
-
-\- Clearly distinguish confirmed findings from hypotheses.
-
-\- Document architectural decisions and significant discoveries.
-
-\- Avoid unnecessary abstractions and overengineering.
-
-
-
-\## Repository and Asset Safety
-
-
-
-\- Never commit copyrighted game files, extracted game assets, encryption keys, or other sensitive material.
-
-\- Keep all game dumps and local extraction artifacts outside version control.
-
-\- Add appropriate `.gitignore` rules before generating large amounts of extracted data.
-
-\- Do not upload proprietary game files to external services.
-
-\- Keep the project buildable and its research reproducible without distributing the original game files.
-
-
-
+# AGENTS.md — MLB The Show 26 native Windows port
+
+Native Windows x86-64 static recompilation of **MLB The Show 26 for Switch, version 1.0.15** (do not switch versions).
+Goal: offline play (exhibition, Road to the Show, Franchise, menus, local saves). Online and Diamond Dynasty are out of
+scope. Status: boots, menus, RTTS and full matches run at 60 fps on the dev machine (Ryzen 5 5600X, RTX 3060 Ti,
+Windows 11). Most current work is graphics correctness (wrong or missing images, lighting) and performance.
+
+## How the user works (read first)
+
+- The user tests in the game themselves and reports what they see; they launch `work/build/mlb.exe` directly.
+  Don't launch long runs unasked. Short smoke runs (start, check the log, kill) are fine.
+- **Performance comes first.** The user notices any fps loss. Diagnostics must cost nothing during normal play: gate
+  them behind F12, a cfg knob or RenderDoc. Remove test code that slows the game once it has done its job.
+- They want real fixes backed by evidence, not rounds of guesses. Trace the cause (RenderDoc, logs), then fix.
+- Commits stay local (no push). End each commit message with the `Co-Authored-By:` line the session gives.
+- Write explanations in plain language. The user is not a graphics programmer.
+
+## Repository and asset safety (never break)
+
+- Never commit copyrighted game files, extracted game assets, encryption keys, or other sensitive material.
+- Keep all game dumps and local extraction artifacts outside version control (`gamefiles/`, `work/`, `refs/` are
+  gitignored). Add `.gitignore` rules before generating large amounts of extracted data.
+- Do not upload proprietary game files to external services.
+- Keys are the user's own: `%APPDATA%/Ryujinx/system/prod.keys` and `title.keys`. Pass their paths to tools and never
+  print key values.
+- Keep the project buildable and its research reproducible without distributing the original game files.
+
+## Layout
+
+| Path | What |
+|---|---|
+| `recomp/` | ARM64 → C generator (from TotK Recomp `ae30a61`, unmodified) |
+| `runtime/core/` | Generic host: CPU, guest memory, kernel and threads, SVCs, IPC, fs, audio, Win32 platform. Nothing MLB-specific |
+| `runtime/mlb/` | MLB layer: `main.c` (log, crash reporter), `boot.c`, `cfg.c` (all settings), `services.c`, `hid.c` (input) |
+| `runtime/gfx/` | NVN front end and Vulkan back end (from TotK), present, window, RenderDoc support (`rdoc.c`) |
+| `tools/` | Build, extraction and analysis scripts (below) |
+| `docs/` | `recon-report.md` (binary facts), `runtime-port.md` (build and boot), `graphics-plan.md` |
+| `work/` (ignored) | `gen/` generated C, `build/` exe and logs, `profile/` saves and captures, `romfs/`, `scratch/` |
+| `refs/` (ignored) | Reference checkouts: TotK Recomp (primary), Astral Chain Recomp, Power Moon Recomp |
+
+Changes to vendored TotK files are marked `mlbts-native` with a comment saying what MLB does and why. Keep that style:
+comments explain the observed case (screen, texture, address) that made the code necessary.
+Third-party code goes in `THIRD_PARTY_NOTICES.md`.
+
+## Build and run
+
+Run Python as `.venv/Scripts/python -I <script>`. `-I` matters: user site-packages must not load.
+
+```
+.venv/Scripts/python -I tools/build.py          # incremental build of work/build/mlb.exe (clang + lld + ninja)
+work/build/mlb.exe                               # paths default to work/update/exefs, work/romfs/romfs, work/profile
+```
+
+First-time setup (only for a fresh checkout): see `docs/runtime-port.md`. In short: extract the ExeFS and RomFS with
+`tools/romfs_dump.py` and the keys, then `recomp/gen.py`, `tools/fetch_deps.py` and `tools/build_xlate.py`.
+`mlb.exe` is locked while the game runs: the link fails then, so check `tasklist` first.
+
+Settings: `work/build/mlb.cfg`, one `KEY=VALUE` per line. Environment variables `MLB_<KEY>` (or `TOTK_<KEY>`) override
+it. The full list is the table in `runtime/mlb/cfg.c`; `main.c` turns `FRAME_QUEUE` and `REPLAY_ASYNC` on by default.
+With async replay, the NVN command replay runs on its own thread, and a recorder thread makes the Vulkan commands
+(`vk_rec.c`).
+
+For edits across several files, a small script in `work/scratch/edit_*.py` using exact-match
+replace-and-assert is reliable.
+
+## Logs and crash reports
+
+- `work/build/logs/mlb.log`: the whole run. It is replaced at the next start, so **copy it to `work/scratch/` before
+  launching anything** if it holds evidence. `[lm 0]` lines are the game's own log; `[host]` lines are ours.
+- Once a second: `perf: frame N:` lines (fps, GPU time, texture uploads and aliases, VRAM), `mem:` and `sched:`.
+  `sched: <thread> wait N: host on exe+0x...` names where a thread is stuck.
+- Crash: `FATAL: ...` with host frames like `mlb+0xc0944`. Symbolize them with
+  `"/c/Program Files/LLVM/bin/llvm-symbolizer.exe" --obj=work/build/mlb.exe --relative-address 0xc0944`.
+- Slow frames (19 ms+) dump a sampler profile to `work/profile/prof.txt.f<frame>`. Read it with
+  `.venv/Scripts/python -I tools/prof_report.py <profile> [map] --top 40 --chains 30`.
+
+## In-game diagnostic keys
+
+- **F12** (no RenderDoc): our own capture, 2 frames ahead, with a beep. It writes:
+  - the frame's draw log into `mlb.log` (`drawlog` lines: every draw's pass, formats, shader hashes, textures and
+    their guest addresses);
+  - `work/profile/shot-<frame>.png`, the presented picture;
+  - `shot-<frame>-<n>-<w>x<h>-fmt<nvn>.png`, every render target of the frame;
+  - `shot-2<frame>-*`, textures noted for diagnosis;
+  - `verify:` lines comparing large drawn textures with their guest memory.
+  It costs nothing until pressed.
+- **F11**: fullscreen toggle.
+- **Under RenderDoc**, F12 is RenderDoc's capture (see below) and our capture moves to **F9**.
+- Knobs for the same machinery: `MLB_DRAWLOG=<frame>|game`, `MLB_SHOT=<frame>,...`, `MLB_DRAWTEX=<fs hash>,...`
+  (save the textures of draws with those fragment shaders), `MLB_WATCH=<addr>,<size>;...` (log texture creations and
+  GPU writes in a guest range), and `MLB_TRACE=svc,host,ipc,fs,gfx,perf,sched,audio,present,all`.
+
+## RenderDoc (the main graphics debugging tool)
+
+- RenderDoc 1.43: `C:\Users\Ariel Osvaldo\tools\renderdoc-1.43\x\RenderDoc_1.43_64`. The **renderdoc MCP server** is
+  configured (`mcp__renderdoc__*` tools: open_capture, list_draws, list_events, pixel_history, debug_pixel,
+  get_resource_usage, export_texture, export_render_target, ...).
+- The user launches `tools/renderdoc.cmd`. It runs the game under `renderdoccmd` with a 2 GB soft memory limit, and
+  captures go to `work/scratch/rd/mlb_frame<N>_capture.rdc`. **F12** captures one whole game frame: from a present to
+  the first present after game work (`rdoc.c`; menus present some frames without drawing). `MLB_RDOC_FRAME=<frame>`
+  captures without a key, which is useful for tests. The MCP's `capture_frame` also works, but it reports "file not
+  found" because of the frame suffix; the file is still there.
+- Under RenderDoc the port:
+  - uses shadow pool storage, because RenderDoc hides `VK_EXT_external_memory_host` (slower, same content);
+  - names every image `tex <guest addr> fmt <nvn fmt> WxH [mips] [rt]` and pool buffers `pool <addr>+<size>`;
+  - puts a label before each draw: `<kind> <count> rt0 <addr>: t<binding> <addr> ...` (the fragment textures it
+    samples). Use `list_events` for the labels, and `list_resources` with a name filter (e.g. `tex 0x18b000000`).
+- Tracing a wrong pixel:
+  1. Find the final target (`list_resources` name `1920x1080`, then `get_resource_usage`).
+  2. `pixel_history` on the bad pixel finds the draw that wrote it.
+  3. `debug_pixel` with `mode=trace` shows the sampled values. The output is huge: it lands in a file, so condense it
+     with `.venv/Scripts/python -I tools/rd_trace.py <file> 40`.
+  4. The draw's label gives the texture address; `export_texture` shows its contents.
+- Memory: a capture needs several GB of commit. The page file is now 32 GB (with 1 GB, RenderDoc crashed at F12). The
+  MCP process holds about 6 GB while a big capture is open: afterwards open the small
+  `work/scratch/rd/test900_frame955.rdc` to release it. If RenderDoc crashes, its log is in `%TEMP%\RenderDoc\`.
+
+## Graphics architecture notes (where bugs have been)
+
+- Switch textures live in guest memory (block-linear tiling). The port keeps a texture cache (`vk_texture.c`) keyed
+  by the full descriptor, plus a list of entries per address (`by_addr`).
+- Several images often share one address. On the console an image *is* its memory: a render into one replaces the
+  bytes of the others there. The port has a VkImage per descriptor. So aliasing is the most common source of "images
+  from another menu":
+  - `alias_copy` (a new entry takes a live entry's GPU content);
+  - `alias_overwritten` (an entry another image rendered over takes or clears its content);
+  - `slot_resolve`: a texture slot follows another-size entry only if that entry holds GPU content (fixed in
+    `54e23e8`: badges and the diamond HUD sampled stale menu images).
+- MLB compresses some textures on the GPU (BC7 via an R32G32B32A32_UINT render plus a copy: player portraits and
+  hairstyles). A CPU rewrite of a GPU-owned texture is caught by `cpu_rewrite_refresh` (the hairstyle fix).
+- Pools: on a discrete GPU, CPU-visible pools get device-local mirrors synced from write-watched pages (`vk_memory.c`).
+  GPU writes are written back to guest memory at fences.
+- Shaders: Maxwell shaders are translated by a .NET tool built from `tools/xlate` (Ryujinx's translator plus TotK's
+  patches). Pipelines and shader caches live in `work/build/`.
+
+## Reference projects
+
+Study these before designing major components. They are references, not drop-in solutions: MLB's engine, SDK version,
+title IDs and module layout differ.
+
+1. **TotK PC Recomp**, https://github.com/valentderah/totk-pc-recomp (`ae30a61`): the source of recomp/, runtime/core
+   and runtime/gfx. Read it first for anything in those trees.
+2. **Astral Chain PC Recomp**, https://github.com/captainj-sparrow/astral-chain-pc-recomp: `audout:u` came from it.
+3. **Power Moon Recomp**, https://gitlab.com/zzzarathustra-dev/power-moon-recomp.
+
+Ask before running code from a reference repo, except TotK's lifter, which the user approved as a coverage oracle.
+Ryujinx runs 1.0.15 for the user and can be used as a correctness oracle.
+
+## Engineering guidelines
+
+- Correctness and reproducibility over premature optimization; but never regress the user's frame rate.
+- Keep generic runtime code (`runtime/core`) separate from MLB-specific code (`runtime/mlb`, marked game cases).
+- Verify against the actual binaries and captures; clearly separate confirmed findings from hypotheses.
+- Fix root causes in the port, not symptoms per screen. Implement incrementally; build and smoke-test each change.
+- Document significant discoveries in code comments and `docs/`. Avoid unnecessary abstractions.
