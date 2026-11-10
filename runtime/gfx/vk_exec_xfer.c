@@ -38,7 +38,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cfg.h"
 #include "host.h"
+#include "platform/platform.h"
 #include "nvn_api.h"
 #include "nvn_tex.h"
 #include "tex.h"
@@ -98,10 +100,25 @@ static void write_counter(uint64_t addr, uint64_t counter) {
     memcpy((void *)(uintptr_t)addr, rec, sizeof rec);
 }
 
+// mlbts-native experiment (MLB_OQ_FORCE=1; off by default): samples-passed reports
+// write at least 1 << 20, and the other non-timestamp counters 1 << 20, instead of the count (or 0).
+static int oq_force = -1;
+static int oq_force_on(void) {
+    if (oq_force < 0) {
+        const char *e = cfg_get("MLB_OQ_FORCE");
+        oq_force = e && *e && strcmp(e, "0");   // off unless MLB_OQ_FORCE=1 (did not bring the RTTS room's lights back)
+        rt_log("vk: counters: %s", oq_force ? "EXPERIMENT: samples-passed and statistics reports forced to at least 1<<20 "
+                                              "(MLB_OQ_FORCE=1)" : "as counted");
+    }
+    return oq_force;
+}
+
+typedef struct { uint64_t addr; uint32_t type; } CounterWrite;
 static void counter_cb(void *arg) {
-    uint64_t *addr = arg;
-    write_counter(*addr, 0);
-    free(addr);
+    CounterWrite *c = arg;
+    int stat = c->type != NVN_COUNTER_TYPE_TIMESTAMP && c->type != NVN_COUNTER_TYPE_TIMESTAMP_TOP;
+    write_counter(c->addr, stat && oq_force_on() ? 1u << 20 : 0);
+    free(c);
 }
 
 // Reports queued by the replay that the GPU has not finished. The condition of RENDER_COND reads a timestamp one as 0
@@ -235,7 +252,11 @@ static void oq_cb(void *arg) {
     else {
         oq_count += sum;
         if (s->lost && !oq_count) oq_count = 1;
-        if (s->addr) write_counter(s->addr, oq_count);
+        static volatile int32_t n_logged;
+        if (plat_inc32(&n_logged) <= 300)   // mlbts-native diagnosis
+            rt_log("counter: samples passed report %#llx: %llu (queries %u%s)", (unsigned long long)s->addr,
+                   (unsigned long long)oq_count, s->n, s->lost ? ", some uncounted" : "");
+        if (s->addr) write_counter(s->addr, oq_force_on() && oq_count < (1u << 20) ? 1u << 20 : oq_count);
     }
     free(s);
 }
@@ -277,6 +298,21 @@ static void signal_event(VkExec *ex, const p_signal_event *p) {
 }
 
 static void report_counter(VkExec *ex, const p_report_counter *p) {
+    {   // mlbts-native diagnosis: the game's counter reports by type
+        static uint64_t by_type[18], total;
+        by_type[p->type < 17 ? p->type : 17]++;
+        static volatile int32_t n_logged;
+        if (plat_inc32(&n_logged) <= 60)
+            rt_log("counter: report type %u at %#llx%s", (unsigned)p->type, (unsigned long long)p->addr,
+                   nvn_gpu_only(p->addr) ? " (GPU-only pool)" : "");
+        if (++total % 5000 == 0) {
+            char line[400];
+            int o = snprintf(line, sizeof line, "counter: %llu reports by type:", (unsigned long long)total);
+            for (int t = 0; t < 18; t++)
+                if (by_type[t]) o += snprintf(line + o, sizeof line - o, " %d:%llu", t, (unsigned long long)by_type[t]);
+            rt_log("%s", line);
+        }
+    }
     int samples = p->type == NVN_COUNTER_TYPE_SAMPLES_PASSED && oq_ready();
     if (nvn_gpu_only(p->addr)) {   // CPU-invisible pool: no host memory behind it
         if (samples) oq_report(ex, 0);
@@ -288,9 +324,9 @@ static void report_counter(VkExec *ex, const p_report_counter *p) {
     vk_mem_count(m.cls, VK_MUSE_GPU_WRITE, sizeof(NVNcounterData));
     if (samples) oq_report(ex, p->addr);
     else {
-        uint64_t *a = malloc(sizeof *a);
+        CounterWrite *a = malloc(sizeof *a);
         if (!a) rt_fatal("vk: out of memory");
-        *a = p->addr;
+        *a = (CounterWrite){p->addr, (uint32_t)p->type};
         vk_completion_add(ex->fence, counter_cb, a);
     }
     pending[pending_head++ % PENDING] = (typeof(pending[0])){p->addr, ex->fence, samples};

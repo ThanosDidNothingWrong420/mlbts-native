@@ -318,8 +318,8 @@ static int cmpf_cap(const void *a, const void *b) {
 // channel per texel to the log, and a PNG scaled so the 99th percentile is white (sRGB-encoded), no 8-bit blit first.
 static void save_hdr_layer(VkCtx *c, VkCommandPool pool, const VkTexImage *im, const char *path, uint32_t layer);
 static void save_hdr(VkCtx *c, VkCommandPool pool, const VkTexImage *im, const char *path) {
-    uint32_t nl = im->layers < 8 ? im->layers : 8;
-    for (uint32_t l = 0; l < nl; l++) {
+    uint32_t nl = im->type == VK_IMAGE_TYPE_3D ? (im->depth < 64 ? im->depth : 64) : im->layers < 8 ? im->layers : 8;
+    for (uint32_t l = 0; l < nl; l++) {   // layers, or depth slices of a 3D image
         char p[1300];
         if (l) snprintf(p, sizeof p, "%.*s-layer%u.png", (int)(strlen(path) - 4), path, l);
         save_hdr_layer(c, pool, im, l ? p : path, l);
@@ -342,7 +342,9 @@ static void save_hdr_layer(VkCtx *c, VkCommandPool pool, const VkTexImage *im, c
         VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                           .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
         vkBeginCommandBuffer(cb, &begin);
-        VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1}, .imageExtent = {w, h, 1}};
+        int is3d = im->type == VK_IMAGE_TYPE_3D;
+        VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, is3d ? 0 : layer, 1},
+                                  .imageOffset = {0, 0, is3d ? (int32_t)layer : 0}, .imageExtent = {w, h, 1}};
         vkCmdCopyImageToBuffer(cb, im->image, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &copy);
         vkEndCommandBuffer(cb);
         VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
@@ -357,17 +359,26 @@ static void save_hdr_layer(VkCtx *c, VkCommandPool pool, const VkTexImage *im, c
         if (px) {
             vmaInvalidateAllocation(c->vma, ba, 0, VK_WHOLE_SIZE);
             const uint8_t *b = info.pMappedData;
+            uint64_t n_bad = 0, n_zero = 0;   // texels with an Inf/NaN colour channel; texels with all colour channels 0
             for (uint64_t i = 0; i < n; i++) {
                 float v[3];
+                int bad = 0;
                 if (bpt == 4) {
                     uint32_t x;
                     memcpy(&x, b + 4 * i, 4);
+                    bad = (x >> 6 & 31) == 31 || (x >> 17 & 31) == 31 || (x >> 27 & 31) == 31;
                     v[0] = uf(x & 0x7ff, 6), v[1] = uf(x >> 11 & 0x7ff, 6), v[2] = uf(x >> 22, 5);
                 } else {
                     uint16_t x[4];
                     memcpy(x, b + 8 * i, 8);
-                    for (int k = 0; k < 3; k++) v[k] = half_to_float(x[k]);
+                    for (int k = 0; k < 3; k++) {
+                        bad |= (x[k] >> 10 & 31) == 31;
+                        v[k] = half_to_float(x[k]);
+                        if (v[k] != v[k] || v[k] > 65504.0f) v[k] = 65504.0f;
+                        if (v[k] < -65504.0f) v[k] = -65504.0f;
+                    }
                 }
+                n_bad += bad, n_zero += v[0] == 0 && v[1] == 0 && v[2] == 0;
                 memcpy(rgb + 3 * i, v, sizeof v);
                 mx[i] = v[0] > v[1] ? (v[0] > v[2] ? v[0] : v[2]) : (v[1] > v[2] ? v[1] : v[2]);
             }
@@ -384,7 +395,8 @@ static void save_hdr_layer(VkCtx *c, VkCommandPool pool, const VkTexImage *im, c
             for (uint64_t i = 0; i < n; i++) px[4 * i + 3] = 255;
             rt_write_png(path, px, w, h);
             rt_log("capture: %s (brightest channel: median %g, 99th percentile %g, max %g, min %g; %llu distinct values; "
-                   "scaled x%g)", path, p50, p99, top, mx[0], (unsigned long long)distinct, scale);
+                   "scaled x%g; %llu of %llu texels Inf/NaN, %llu black)", path, p50, p99, top, mx[0], (unsigned long long)distinct,
+                   scale, (unsigned long long)n_bad, (unsigned long long)n, (unsigned long long)n_zero);
         }
         free(rgb), free(mx), free(px);
     }
@@ -468,7 +480,8 @@ void vk_capture_targets(const tex_t *const *ts, int n, uint64_t frame) {
                      im->width, im->height, (unsigned)ts[i]->d.format);
             save_bc6h(c, pool, im, hp);
         }
-        if (im && im->image != VK_NULL_HANDLE && im->samples == 1 && im->type == VK_IMAGE_TYPE_2D &&
+        if (im && im->image != VK_NULL_HANDLE && im->samples == 1 &&
+            (im->type == VK_IMAGE_TYPE_2D || im->type == VK_IMAGE_TYPE_3D) &&
             (im->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || im->format == VK_FORMAT_R16G16B16A16_SFLOAT)) {
             char hp[1200];
             snprintf(hp, sizeof hp, "%s/shot-%llu-%d-%ux%u-fmt%#x-hdr.png", rt_config()->profile, (unsigned long long)frame,

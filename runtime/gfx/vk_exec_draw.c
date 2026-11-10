@@ -805,12 +805,20 @@ static void answers_for(VkExec *ex, int st, const uint8_t *ctl, uint32_t mask, G
             a->alpha_ref_lo = (uint16_t)ex->alpha_ref, a->alpha_ref_hi = (uint16_t)(ex->alpha_ref >> 16);
         }
     }
-    else
+    else {
         for (int k = 0; k < 3; k++) {
             uint32_t l;
             memcpy(&l, ctl + 0x748 + 4 * k, 4);
             a->local[k] = (uint16_t)(l ? l : 1);
         }
+        // mlbts-native: the program's shared memory size (NVN compute control +0x754, beside the local size). Ryujinx
+        // otherwise declares 4 KiB, and stores past it are lost: MLB's reflection-probe atlas shader 0e0c2eb9 keeps 28
+        // bytes per thread for 8x8x6 threads (10752), so cube faces 3-5 of every probe stayed black (the player's
+        // dark patches in the RTTS room). Part of the answers, so the cache key changes only for shaders using it.
+        uint32_t sh;
+        memcpy(&sh, ctl + 0x754, 4);
+        a->shared_bytes = sh <= 0xc000 ? sh : 0xc000;
+    }
     typeof(AC[0]) *c = &AC[st];
     // The generation and tokens are read before the lookups (one that creates an entry changes them) and unlocked: a
     // registration racing with them is ordered after this draw, and a slot stored under older ones is only looked up
@@ -3805,6 +3813,7 @@ static int drawtex_match(uint32_t fs) {
     if (n < 0) {
         n = 0;
         const char *e = cfg_get("MLB_DRAWTEX");
+        // off by default (the RTTS player's body was d3b91243)
         while (e && *e && n < 16) {
             char *end;
             want[n++] = (uint32_t)strtoul(e, &end, 16);
@@ -4177,8 +4186,8 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
         int nu = gfx_shader_resources(cs, GFX_RES_UBO, &ur);
         for (int i = 0; i < nu; i++) {
             int sl = ur[i].slot;
-            if (sl < 0 || sl >= 16) continue;
-            const p_bind_buf *b = &ex->ubo[NVN_STAGE_CS][sl];
+            if (sl < 3 || sl - 3 >= 16) continue;
+            const p_bind_buf *b = &ex->ubo[NVN_STAGE_CS][sl - 3];
             char hex[3 * 64 + 1] = {0};
             VkMemSpan sp;
             if (b->addr && vk_mem_resolve(b->addr, 64, &sp))
@@ -4188,9 +4197,31 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
         }
         const GfxShaderRes *sr;
         int ns = gfx_shader_resources(cs, GFX_RES_SSBO, &sr);
-        for (int i = 0; i < ns; i++)
-            rt_log("watch:   ssbo slot %d cbuf c%d+%#x flags %u", (int)sr[i].slot, (int)sr[i].cbuf_slot,
-                   (unsigned)sr[i].handle, (unsigned)sr[i].flags);
+        static struct { uint32_t h; int n; } ssd[32];
+        int si = 0;
+        while (si < 32 && ssd[si].h && ssd[si].h != h32) si++;
+        int dump = si < 32 && ssd[si].n < 3;
+        if (dump) ssd[si].h = h32, ssd[si].n++;
+        for (int i = 0; i < ns; i++) {
+            int ubo, slot = ssbo_slot(&sr[i], NVN_STAGE_CS, &ubo);
+            p_bind_buf up = {0};
+            const p_bind_buf *b = NULL;
+            if (slot >= 0 && slot < 16) b = ubo ? &ex->ubo[NVN_STAGE_CS][slot] : &ex->ssbo[NVN_STAGE_CS][slot];
+            else if (ubo_ptr_res(&sr[i])) up.addr = ubo_ptr(ex, NVN_STAGE_CS, &sr[i]), b = &up;
+            rt_log("watch:   ssbo slot %d cbuf c%d+%#x flags %u: %#llx+%#llx", (int)sr[i].slot, (int)sr[i].cbuf_slot,
+                   (unsigned)sr[i].handle, (unsigned)sr[i].flags, b ? (unsigned long long)b->addr : 0ull,
+                   b ? (unsigned long long)b->size : 0ull);
+            VkMemSpan sp;
+            uint64_t nbytes = b && b->size ? (b->size < 4096 ? b->size : 4096) : 1024;
+            if (dump && b && b->addr && vk_mem_resolve(b->addr, nbytes, &sp))
+                for (uint64_t o = 0; o + 64 <= nbytes; o += 64) {
+                    const float *f = (const float *)(uintptr_t)(b->addr + o);
+                    char line[16 * 16 + 64];
+                    int k = snprintf(line, sizeof line, "watch:     +%04llx:", (unsigned long long)o);
+                    for (int j = 0; j < 16; j++) k += snprintf(line + k, sizeof line - k, " %g", f[j]);
+                    rt_log("%s", line);
+                }
+        }
     }
     VkPassMark *m = dispatch_mark(ex, cs, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     vkCmdDispatch(ex->cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);

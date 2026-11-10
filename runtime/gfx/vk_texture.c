@@ -347,8 +347,9 @@ static volatile int w_n = -1;
 int vk_watch_hit(uint64_t a, uint64_t n) {
     if (w_n < 0) {
         const char *e = cfg_get("MLB_WATCH");
-        // for now: the RTTS room's lighting chain (dark room, banding): the 512x512x3 RGBA16F lighting array, its
-        // 512x512 source, the 1024x1024 R8 map, the 16x16 irradiance probe and the 128x128 capture cube
+        // Off by default. The RTTS room's lighting (player probes and environment cubes) was traced with
+        // MLB_WATCH=1663cce00,e10000;166204e00,1c8000;1679bb600,80000;167f7de00,80000;168001e00,1800;167a3f600,1800
+        if (!e || !*e) e = "off";
         int k = 0;
         while (e && *e && k < WATCH_N && strcmp(e, "off")) {
             char *end;
@@ -1642,10 +1643,18 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
         // thumbnail of the fused object, RGBA8 at the same storage, was the live entry, and the menu drew it behind
         // the wheel (the object's silhouette, or garbled colours). Without such an entry the released one keeps the
         // slot: its image holds what was last written through that descriptor.
+        // mlbts-native: a cube slot follows only a cube entry. Vulkan makes cube views of cube-compatible images only
+        // (get_view), so a cube slot that followed the 2D array a compute shader filled bound nothing: MLB writes the
+        // RTTS room's environment cubes through 2D-array storage images and samples them as cubes, and the room's
+        // lighting and some objects stayed black until something else created the cube entry (an F12 capture). Without
+        // a cube entry the slot gets its own below (entry_of), which takes the array's content (alias_copy).
+        int want_cube = k.d.target == NVN_TEXTURE_TARGET_CUBEMAP || k.d.target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY;
         Tex *own = e, *any = NULL;
         e = NULL;
         for (Tex *p = nvn_hm_get(&by_addr, &k.addr); p; p = p->next_at) {
             if (p->released || linear_format(p->key.d.format) != linear_format(k.d.format)) continue;
+            if (want_cube && p->key.d.target != NVN_TEXTURE_TARGET_CUBEMAP && p->key.d.target != NVN_TEXTURE_TARGET_CUBEMAP_ARRAY)
+                continue;
             if (!any) any = p;
             if (same_but_swizzle(&p->key, &k)) { e = p; break; }
         }
