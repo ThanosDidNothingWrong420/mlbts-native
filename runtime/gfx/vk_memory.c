@@ -708,6 +708,9 @@ void vk_guest_written(uint64_t addr, uint64_t size) {
     plat_mutex_unlock(&gen_lock);
 }
 
+// mlbts-native: core/fs_host.c reports the bytes a file read wrote into guest memory (no Vulkan needed: page stamps only)
+void rt_host_wrote(uint64_t addr, uint64_t size) { vk_guest_written(addr, size); }
+
 int vk_mem_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now) {
     if (!size) { *now = since; return 0; }
     uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;

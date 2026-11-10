@@ -4075,6 +4075,11 @@ static void draw_note(VkExec *ex, const char *kind, int prim, int count) {
                (unsigned long long)nz, (void *)im->image, (int)im->format);
         void vk_texture_log_at(uint64_t addr, const char *who);   // vk_texture.c (mlbts-native diagnosis)
         if (im->width >= 128 && im->height >= 128) vk_texture_log_at(im->addr, "drawlog");
+        if (im->mirrored && !im->gpu_owned) {   // mlbts-native diagnosis: the image against the game's memory
+            void vk_texture_verify(const tex_t *t);
+            tex_t vt;
+            if (vk_texture_slot_desc((int)(dh & 0xfffff), &vt)) vk_texture_verify(&vt);
+        }
     }
 }
 

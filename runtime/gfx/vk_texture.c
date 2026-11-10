@@ -68,7 +68,7 @@ typedef struct Tex {
     uint64_t rel_seq;             // while released: use_seq of the newest entry placed before this release; an entry
                                   // with a later use_seq on overlapping storage replaced this one's bytes
     uint32_t hot_epoch;           // mlbts-native: submit_epoch of the last upload of new CPU data (hot_note)
-    uint8_t hot_run;              // consecutive submissions with such an upload, up to 255
+    uint16_t hot_hist;            // bit k: such an upload k submissions before hot_epoch
     uint64_t snap_seq;            // the submit copy (hot_upload) the image holds
 } Tex;
 
@@ -1289,11 +1289,11 @@ static void make_fresh(Tex *e) {
 // sample it, and a texture the CPU rewrites every frame may be half rewritten by then: MLB decodes its menu background
 // videos on the CPU into 1280x720 and 640x360 R8 planes, and the menus showed torn frames (an image cut across, its
 // halves from two video frames). The game hands a frame over complete at the submit call. A CPU texture the replay
-// uploads new data for in HOT_RUN consecutive submissions becomes hot: at each submit the game thread copies its
+// uploads new data for in HOT_RUN of the last 16 submissions becomes hot: at each submit the game thread copies its
 // storage (two buffers in turn), and the replay uploads it from the newest copy instead of the storage. A hot texture
 // whose copy has not changed for HOT_COOL submits stops being copied.
 #define HOT_N 16
-#define HOT_RUN 8
+#define HOT_RUN 6   // uploads of new CPU data in the last 16 submissions
 #define HOT_COOL 600
 #define HOT_MAX (8u << 20)      // largest texture copied
 #define HOT_TOTAL (24u << 20)   // all of them: the copies run on the game's submitting thread
@@ -1339,9 +1339,10 @@ void gfx_tex_snap_submit(void) {
 static void hot_note(Tex *e) {
     if (!gfx_replay_async() || e->pub.gpu_owned || e->t.L.size > HOT_MAX || e->f.astc_bw || e->f.astc_bc) return;
     if (e->hot_epoch == submit_epoch) return;
-    e->hot_run = e->hot_epoch + 1 == submit_epoch ? (uint8_t)(e->hot_run < 255 ? e->hot_run + 1 : 255) : 1;
+    uint32_t gap = submit_epoch - e->hot_epoch;   // a 30 fps video changes every other submission
+    e->hot_hist = (uint16_t)(gap >= 16 ? 1 : (e->hot_hist << gap) | 1);
     e->hot_epoch = submit_epoch;
-    if (e->hot_run != HOT_RUN) return;
+    if (__builtin_popcount(e->hot_hist) < HOT_RUN) return;
     plat_mutex_lock(&hot_lock);
     int have = -1, free_i = -1;
     uint64_t total = 0;
@@ -2404,6 +2405,68 @@ int vk_texture_read_image(const tex_t *t, const view_t *v, const NVNcopyRegion *
     unlock();
     if (!ok) zero_rows(&g, dst);
     return ok;
+}
+
+// mlbts-native diagnosis (sliced menu and HUD images, hard to reproduce): a texture with CPU content (mirrored, not
+// GPU-owned) that a draw of the F12 frame samples is read back from its image and compared with its storage, level 0
+// layer 0. A difference means the image missed CPU writes (an upload the write tracking did not ask for); equal bytes
+// with a sliced image on screen mean the storage itself holds them (the game's data, or its loading). Each address once
+// per capture; at most 8 MiB.
+void vk_texture_verify(const tex_t *t) {
+    static uint64_t seen[512];
+    static int nseen;
+    static long seen_frame = -1;
+    long fr = (long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    if (fr != seen_frame && fr != seen_frame + 1) nseen = 0;
+    seen_frame = fr;
+    if (!t || !t->mem) return;
+    uint64_t addr = (uint64_t)(uintptr_t)t->mem;
+    for (int i = 0; i < nseen; i++)
+        if (seen[i] == addr) return;
+    if (nseen < 512) seen[nseen++] = addr;
+    lock();
+    TexKey k;
+    make_key(t, &k);
+    Tex *e = nvn_hm_get(&by_key, &k);
+    if (!e || !e->pub.mirrored || e->pub.gpu_owned || t->L.size > (8u << 20) || e->f.vk != e->f.ideal || e->f.astc_bw ||
+        e->f.astc_bc || e->f.expand_rgb || e->pub.samples > 1 || e->f.depth || e->f.stencil) {
+        unlock();
+        return;
+    }
+    NVNcopyRegion r = {0, 0, 0, (int)t->d.width, t->d.target == 0 ? 1 : (int)t->d.height, 1};
+    Region g;
+    if (!region_of(t, NULL, &r, 0, 0, &g)) { unlock(); return; }
+    size_t n = g.img * (size_t)g.nz;
+    uint8_t *a = malloc(n), *b = malloc(n);
+    if (!a || !b) { free(a), free(b), unlock(); return; }
+    int oka = image_texels(e, &g, &r, a, 0), okb = storage_texels(t, &g, &r, b, 0);
+    if (oka && okb) {
+        uint64_t diff = 0, nzs = 0;
+        long r0 = -1, r1 = -1;
+        for (size_t y = 0; y < g.hb; y++) {
+            const uint8_t *pa = a + y * g.row, *pb = b + y * g.row;
+            int rd = 0;
+            for (size_t x = 0; x < g.wb; x++) {
+                nzs += pb[x] != 0;
+                if (pa[x] != pb[x]) diff++, rd = 1;
+            }
+            if (rd) { if (r0 < 0) r0 = (long)y; r1 = (long)y; }
+        }
+        uint32_t now;
+        int ch = vk_mem_changed(e->pub.addr, t->L.size, e->wgen, &now);
+        if (diff)
+            rt_log("verify: STALE texture %#llx fmt %#x %ux%u: the image differs from the storage in %llu of %llu bytes, "
+                   "block rows %ld-%ld of %zu; uploads %u, storage written since the last check %d, storage %llu bytes "
+                   "non-zero", (unsigned long long)addr, (unsigned)t->d.format, t->d.width, t->d.height,
+                   (unsigned long long)diff, (unsigned long long)(g.wb * g.hb), r0, r1, g.hb, e->n_up, ch,
+                   (unsigned long long)nzs);
+        else
+            rt_log("verify: texture %#llx fmt %#x %ux%u matches its storage (%llu of %llu bytes non-zero, uploads %u)",
+                   (unsigned long long)addr, (unsigned)t->d.format, t->d.width, t->d.height, (unsigned long long)nzs,
+                   (unsigned long long)(g.wb * g.hb), e->n_up);
+    }
+    free(a), free(b);
+    unlock();
 }
 
 // ReadTexels: the pool bytes are the content of a mirrored texture the GPU has not rendered into; every other texture
