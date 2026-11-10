@@ -4055,18 +4055,22 @@ static void draw_note(VkExec *ex, const char *kind, int prim, int count) {
         for (int i = 0; i < n && o < (int)sizeof line - 16; i++) o += snprintf(line + o, sizeof line - o, " %g", f[i]);
         rt_log("%s", line);
     }
-    for (int k = 0; k < 4; k++) {
-        if (!ex->tex[1][k]) continue;
+    // mlbts-native: every texture the fragment shader uses (its resources and their handles), not slots 0-3
+    const GfxShaderRes *dtr = NULL;
+    int dnt = B.st_valid && B.st.fs ? gfx_shader_resources(B.st.fs, GFX_RES_TEX, &dtr) : 0;
+    for (int k = 0; k < dnt && k < 32; k++) {
+        uint64_t dh = res_tex_handle(ex, NVN_STAGE_FS, &dtr[k], 0);
+        if (!dh) continue;
         view_t v; int hv;
-        const VkTexImage *im = vk_texture_by_id((int)(ex->tex[1][k] & 0xfffff), &v, &hv);
-        if (!im) { rt_log("drawlog   tex %d: id %#llx unresolved", k, (unsigned long long)(ex->tex[1][k] & 0xfffff)); continue; }
+        const VkTexImage *im = vk_texture_by_id((int)(dh & 0xfffff), &v, &hv);
+        if (!im) { rt_log("drawlog   tex %d: id %#llx unresolved", k, (unsigned long long)(dh & 0xfffff)); continue; }
         uint64_t sum = 0, nz = 0;
         const uint8_t *b = (const uint8_t *)(uintptr_t)im->addr;
         uint64_t n = (uint64_t)im->width * im->height;
         if (n > (1u << 22)) n = 1u << 22;
         for (uint64_t i = 0; b && im->mirrored && i < n; i++) sum += b[i], nz += b[i] != 0;
         rt_log("drawlog   tex %d: id %#llx %ux%u addr %#llx mirrored %u gpu_owned %u bytes sum %llu nonzero %llu image %p "
-               "vkfmt %d", k, (unsigned long long)(ex->tex[1][k] & 0xfffff), im->width, im->height,
+               "vkfmt %d", k, (unsigned long long)(dh & 0xfffff), im->width, im->height,
                (unsigned long long)im->addr, im->mirrored, im->gpu_owned, (unsigned long long)sum,
                (unsigned long long)nz, (void *)im->image, (int)im->format);
         void vk_texture_log_at(uint64_t addr, const char *who);   // vk_texture.c (mlbts-native diagnosis)
