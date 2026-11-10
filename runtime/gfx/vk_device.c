@@ -525,6 +525,13 @@ int vk_debug_names_on(void) {
     }
     return on;
 }
+static PFN_vkCmdInsertDebugUtilsLabelEXT p_label;
+void vk_debug_label_cmd(VkCommandBuffer cb, const char *text) {   // the recorder's side of rec_label (vk_rec.c)
+    if (!p_label) p_label = (PFN_vkCmdInsertDebugUtilsLabelEXT)vkGetDeviceProcAddr(g_vk.device, "vkCmdInsertDebugUtilsLabelEXT");
+    if (!p_label) return;
+    VkDebugUtilsLabelEXT l = {.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT, .pLabelName = text};
+    p_label(cb, &l);
+}
 void vk_debug_name(VkObjectType type, uint64_t handle, const char *fmt, ...) {
     if (!handle || !vk_debug_names_on()) return;
     char name[160];

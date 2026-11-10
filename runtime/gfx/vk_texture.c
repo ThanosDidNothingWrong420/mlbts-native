@@ -2005,10 +2005,17 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
             uint32_t vl = (uint32_t)s->v.base_level + (s->v.nlevels ? s->v.nlevels : 1);
             if (vl > need) need = vl;
         }
+        // mlbts-native: and an entry of another geometry only for GPU content the storage does not have (a render
+        // target, the case above). A texture the game loaded into the storage is in the storage: the slot gets its own
+        // entry from it. MLB loads UI images into memory a 1920x1080 BC7 menu background left (still live, never
+        // released): the RTTS rating badges' BC7 circle mask at its address followed the background, and the badges
+        // sampled the background through the mask's coordinates (an opaque dark square and a dark oval behind the ring:
+        // an image from another menu showing through).
         for (Tex *p = nvn_hm_get(&by_addr, &k.addr); p; p = p->next_at) {
             if (p->released || linear_format(p->key.d.format) != linear_format(k.d.format)) continue;
             if (want_cube != is_cube(p)) continue;
             if (p->pub.levels < need) continue;
+            if (!same_but_swizzle(&p->key, &k) && !alias_has_gpu_content(p)) continue;
             if (!any) any = p;
             if (same_but_swizzle(&p->key, &k)) { e = p; break; }
         }

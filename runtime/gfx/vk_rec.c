@@ -59,7 +59,7 @@ enum {
     R_SetRasterizerDiscardEnable, R_SetScissorWithCount, R_SetStencilCompareMask, R_SetStencilOp, R_SetStencilReference,
     R_SetStencilTestEnable, R_SetStencilWriteMask, R_SetViewportWithCount, R_WriteTimestamp, R_WriteTimestamp2,
     R_PushTpl, R_Push, R_VertexInput, R_Bool, R_PolygonMode, R_BlendEnable, R_BlendEquation, R_WriteMask, R_EndCb,
-    R_PassMark, R_BeginCb, R_Submit,
+    R_PassMark, R_BeginCb, R_Submit, R_Label,
 };
 
 static uint64_t now_ns(void) { return plat_now_ns(); }
@@ -719,6 +719,15 @@ void rec_polygon_mode(PFN_vkCmdSetPolygonModeEXT fn, VkCommandBuffer cb, VkPolyg
 }
 
 typedef struct { uint32_t id; int end; } A_PassMark;
+// mlbts-native: a debug label (under RenderDoc, vk_exec_draw.c draw_label), the text after the packet header
+void rec_label(VkCommandBuffer cb, const char *text) {
+    if (!OWNED(cb)) { vk_debug_label_cmd(cb, text); return; }
+    size_t n = strlen(text) + 1;
+    char *a = put(R_Label, A8(n));
+    memcpy(a, text, n);
+    pub();
+}
+
 void rec_pass_mark(VkCommandBuffer cb, uint32_t id, int end) {
     if (!OWNED(cb)) { vk_pass_mark_cmd(cb, id, end); return; }
     A_PassMark *a = put(R_PassMark, sizeof *a);
@@ -822,6 +831,7 @@ static void exec_packet(uint32_t op, void *p) {
     case R_BlendEquation: { A_Targets *a = p; ((PFN_vkCmdSetColorBlendEquationEXT)a->fn)(cb, a->first, a->n, a->v); break; }
     case R_WriteMask: { A_Targets *a = p; ((PFN_vkCmdSetColorWriteMaskEXT)a->fn)(cb, a->first, a->n, a->v); break; }
     case R_PassMark: { A_PassMark *a = p; vk_pass_mark_cmd(cb, a->id, a->end); break; }
+    case R_Label: vk_debug_label_cmd(cb, (const char *)p); break;
     case R_EndCb: {
         A_EndCb *a = p;
         if (a->kind) vk_crumb(cb, a->kind, a->n);

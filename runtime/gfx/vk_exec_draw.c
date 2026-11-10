@@ -3922,8 +3922,28 @@ static int drawtex_match(uint32_t fs) {
     return 0;
 }
 
+// mlbts-native: under RenderDoc each draw is preceded by a label naming its colour target and the guest address of
+// every texture its fragment shader reads (by binding), so a capture shows what a draw samples; the MCP's binding view
+// has no resource ids.
+static void draw_label(VkExec *ex, const char *kind, int count) {
+    char s[640];
+    int o = snprintf(s, sizeof s, "%s %d rt0 %#llx:", kind, count,
+                     (unsigned long long)(uintptr_t)(ex->color[0].tex ? ex->color[0].tex->mem : NULL));
+    const GfxShaderRes *tr;
+    int nt = B.st.fs ? gfx_shader_resources(B.st.fs, GFX_RES_TEX, &tr) : 0;
+    for (int i = 0; i < nt && o < (int)sizeof s - 48; i++) {
+        uint64_t h = res_tex_handle(ex, NVN_STAGE_FS, &tr[i], 0);
+        view_t v;
+        int hv = 0;
+        const VkTexImage *im = h ? vk_texture_by_id((int)(h & 0xfffff), &v, &hv) : NULL;
+        o += snprintf(s + o, sizeof s - o, " t%d %#llx", (int)tr[i].binding, im ? (unsigned long long)im->addr : 0ull);
+    }
+    rec_label(ex->cb, s);
+}
+
 static void draw_note(VkExec *ex, const char *kind, int prim, int count) {
     watch_draw(ex, kind, count);
+    if (vk_debug_names_on()) draw_label(ex, kind, count);
     if (!drawlog_now()) return;
     int q = dq_begin(ex);
     uint32_t h[2] = {0, 0};
