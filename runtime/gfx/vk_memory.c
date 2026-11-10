@@ -1220,7 +1220,8 @@ typedef struct {
     uint64_t subs, syncs, upload_bytes, upload_copies, first_n, first_bytes, wb_bytes, wb_copies, wb_ranges;
     uint64_t presnap_queries, sync_queries, presnap_t, sync_t, prologues, presnap_bytes;
     uint64_t snap_bytes, merge_bytes, merge_dispatches, snap_allocs;   // write-back merge
-    uint64_t quiet_bytes, quiet_ranges, quiet_broken;                  // mlbts-native: quiet ranges copied (gpu_wrote)
+    uint64_t quiet_bytes, quiet_ranges, quiet_broken;                  // mlbts-native: quiet pages copied (gpu_wrote)
+    uint64_t age_bytes[4];                                             // merged page bytes by CPU write age (q_age)
     uint64_t page_bytes, flush_n, flush_bytes, flush_calls, flush_sum;   // what mirror_sync queues, by source
 } MirrorAcc;
 static MirrorAcc mrep;                 // replay: this submission
@@ -1768,47 +1769,94 @@ static void gpu_writes(const PoolRec *r, uint64_t off, uint64_t size) {
     if (frozen) mem_thaw(a, b - a), plat_inc64(&n_thaw_gpu);
 }
 
-// mlbts-native: quiet ranges. The merge keeps the words the CPU writes while the GPU runs, but its shader writes guest
-// memory a changed word at a time, and those partial writes over PCIe are slow: 23 MiB a frame took 14.4 ms of GPU
-// time in MLB's draft cutscene (skinned characters), where plain copies run at about 16 GB/s. A range whose pages the
-// CPU has not written for QUIET_SUBS submissions (no stamped page write since then, no write-watch bit set now) has
-// no CPU words to keep: guest memory equals the mirror's state before this submission there, so a plain copy of the
-// range writes exactly what the merge would, and it needs no snapshot. The exception is a CPU write into the range
-// during this very submission; quiet_broken counts the ranges the CPU wrote within 4 submissions of such a copy (the
-// write-back summary line) to show whether that happens. MLB_WB_QUIET=0: every shader range merges, as before.
-#define QUIET_SUBS 30
+// mlbts-native: quiet pages. The merge keeps the words the CPU writes while the GPU runs, but its shader writes guest
+// memory a changed word at a time, and those partial writes over PCIe are slow: 23-25 MiB a frame took 12-14 ms of
+// GPU time in MLB's draft cutscene (skinned characters), where plain copies run at about 16 GB/s. Guest memory equals
+// the mirror's state before the submission on every page the CPU did not write since the prologue copied its writes
+// up, so on a page the CPU leaves alone a plain copy writes exactly what the merge would, and needs no snapshot. Which
+// pages the CPU writes while the GPU runs cannot be seen when the write-back is recorded; a page counts as quiet when
+// no write to it was observed in the last quiet_subs submissions (stamped page generations, sub_gen) and its
+// write-watch bit is clear now. Pages written more recently are merged as before. quiet_broken counts merged runs
+// that overlap a page plain-copied within the last 4 submissions (the CPU wrote it right after), and the summary
+// splits the merged bytes by how recently the CPU wrote them. MLB_WB_QUIET=0: everything merges; MLB_WB_QUIET_SUBS:
+// the history in submissions (default 4).
 #define QUIET_RING 512
 static uint32_t sub_gen[64];   // replay: gen_now when submission msub & 63 began
-static struct { const PoolRec *r; uint64_t off; uint32_t sub; } quiet_ring[QUIET_RING];
-static int quiet_at, quiet_cfg = -1;
-static int quiet_range(PoolRec *r, uint64_t off, uint64_t size) {
+static struct { const PoolRec *r; uint64_t off, size; uint32_t sub; } quiet_ring[QUIET_RING];
+static int quiet_at, quiet_cfg = -1, quiet_subs = 4;
+static uint64_t q_age[4];      // replay: merged page bytes by the age of the CPU write: 0-1 submissions, 2-4, older,
+                               // write-watch bit set now; into mrep at the next submission
+static int quiet_on(void) {
     if (quiet_cfg < 0) {
         const char *e = cfg_get("MLB_WB_QUIET");
         quiet_cfg = !e || strcmp(e, "0");
-        rt_log("mem: write-back of shader ranges the CPU leaves alone: %s (MLB_WB_QUIET)", quiet_cfg ? "plain copies" : "merged");
+        int n = cfg_int("MLB_WB_QUIET_SUBS");
+        if (n > 0 && n < 60) quiet_subs = n;
+        rt_log("mem: write-back of shader-written pages the CPU left alone for %d submissions: %s (MLB_WB_QUIET, "
+               "MLB_WB_QUIET_SUBS)", quiet_subs, quiet_cfg ? "plain copies" : "merged");
     }
-    if (!quiet_cfg || msub < QUIET_SUBS + 2) return 0;
-    uint32_t old = sub_gen[(msub - QUIET_SUBS) & 63];
-    uint64_t a0 = r->import_lo + off, a1 = a0 + size;
-    for (uint64_t a = a0 & ~((1ull << GEN_PAGE_SHIFT) - 1); a < a1; a += 1ull << GEN_PAGE_SHIFT) {
-        uint32_t *s = gen_slot(a, 0);
-        if (s && __atomic_load_n(s, __ATOMIC_RELAXED) > old) return 0;
-    }
-    uint64_t p[1];
-    return mem_written_peek(a0, size, p, 1) == 0;   // UINT64_MAX (not watched) is not quiet
+    return quiet_cfg && msub > 64;
 }
-static void quiet_note(const PoolRec *r, uint64_t off, int quiet) {
-    if (quiet) {
-        quiet_ring[quiet_at] = (typeof(quiet_ring[0])){r, off, msub};
-        quiet_at = (quiet_at + 1) % QUIET_RING;
-        return;
-    }
+// The submissions since the CPU's last observed write to the page (0: during the current one); 63 for none in 60.
+static int page_age(uint64_t a) {
+    uint32_t *sl = gen_slot(a, 0);
+    uint32_t g = sl ? __atomic_load_n(sl, __ATOMIC_RELAXED) : 0;
+    if (!g) return 63;
+    for (int k = 0; k < 60; k++)
+        if ((int32_t)(g - sub_gen[(msub - k) & 63]) > 0) return k;
+    return 63;
+}
+static void quiet_note(const PoolRec *r, uint64_t off, uint64_t size) {
+    quiet_ring[quiet_at].r = r, quiet_ring[quiet_at].off = off, quiet_ring[quiet_at].size = size;
+    quiet_ring[quiet_at].sub = msub;
+    quiet_at = (quiet_at + 1) % QUIET_RING;
+}
+static void quiet_check(const PoolRec *r, uint64_t off, uint64_t size) {   // a merged run: plain-copied lately?
     for (int i = 0; i < QUIET_RING; i++)
-        if (quiet_ring[i].r == r && quiet_ring[i].off == off && msub - quiet_ring[i].sub <= 4) {
+        if (quiet_ring[i].r == r && quiet_ring[i].off < off + size && off < quiet_ring[i].off + quiet_ring[i].size &&
+            msub != quiet_ring[i].sub && msub - quiet_ring[i].sub <= 4) {
             mrep.quiet_broken++;
             quiet_ring[i].r = NULL;
             return;
         }
+}
+static void quiet_run(PoolRec *r, uint64_t off, uint64_t size, int quiet) {
+    if (!size) return;
+    if (quiet) {
+        range_add(&wbl, &nwbl, &cwbl, r, off, size);
+        quiet_note(r, off, size);
+        mrep.quiet_bytes += size, mrep.quiet_ranges++;
+    } else if (snap_add(r, off, size)) {
+        quiet_check(r, off, size);
+    } else {
+        range_add(&wbl, &nwbl, &cwbl, r, off, size);
+    }
+}
+// Splits a shader-written range into runs of quiet pages (plain copies) and merged runs. 0: merge the whole range.
+static int quiet_split(PoolRec *r, uint64_t off, uint64_t size) {
+    if (!quiet_on()) return 0;
+    const uint64_t PM = (1ull << GEN_PAGE_SHIFT) - 1;
+    uint64_t a0 = r->import_lo + off, a1 = a0 + size;
+    static uint64_t wp[1100];
+    uint64_t nw = mem_written_peek(a0, size, wp, 1100);
+    if (nw == UINT64_MAX || nw > 1100) return 0;   // not watched, or more written pages than the list holds
+    uint64_t run0 = off;
+    int run_q = -1;
+    for (uint64_t a = a0; a < a1;) {
+        uint64_t pe = (a | PM) + 1;
+        if (pe > a1) pe = a1;
+        int age = page_age(a & ~PM), set = 0;
+        for (uint64_t i = 0; i < nw; i++)
+            if ((wp[i] & ~PM) == (a & ~PM)) { set = 1; break; }
+        int q = !set && age > quiet_subs;
+        if (!q) q_age[set ? 3 : age <= 1 ? 0 : age <= 4 ? 1 : 2] += pe - a;
+        uint64_t o = a - r->import_lo;
+        if (run_q >= 0 && q != run_q) quiet_run(r, run0, o - run0, run_q), run0 = o;
+        run_q = q;
+        a = pe;
+    }
+    quiet_run(r, run0, a1 - r->import_lo - run0, run_q);
+    return 1;
 }
 
 static void gpu_wrote(const VkMemSpan *sp, uint64_t size, int shader) {
@@ -1817,13 +1865,8 @@ static void gpu_wrote(const VkMemSpan *sp, uint64_t size, int shader) {
     if (!r || r->mstate != MS_ON || sp->buffer != r->mbuf || !size) return;
     // A binding to the end of its pool (no size) can span hundreds of MiB: those stay copies.
     if (shader && !(sp->offset & 3) && !(size & 3) && size <= MERGE_MAX && merging()) {
-        int q = quiet_range(r, sp->offset, size);
-        quiet_note(r, sp->offset, q);
-        if (q) {
-            mrep.quiet_bytes += size, mrep.quiet_ranges++;
-        } else if (snap_add(r, sp->offset, size)) {
-            return;
-        }
+        if (quiet_split(r, sp->offset, size)) return;
+        if (snap_add(r, sp->offset, size)) return;
     }
     range_add(&wbl, &nwbl, &cwbl, r, sp->offset, size);
 }
@@ -1928,7 +1971,8 @@ void vk_mem_mirror_begin(void) {
     nsnl = snl_copied = nchunks = 0;   // the previous submission handed its chunks to snap_free
     uint32_t prev = msub;
     msub = msub + 1 ? msub + 1 : 1;
-    sub_gen[msub & 63] = __atomic_load_n(&gen_now, __ATOMIC_RELAXED);   // quiet_range: the generation at its start
+    sub_gen[msub & 63] = __atomic_load_n(&gen_now, __ATOMIC_RELAXED);   // page_age: the generation at its start
+    for (int i = 0; i < 4; i++) mrep.age_bytes[i] += q_age[i], q_age[i] = 0;
     __atomic_add_fetch(&mirror_gen, 1, __ATOMIC_RELEASE);
     mepoch = vk_texture_epoch();
     uint64_t q = 0, run0 = 0, run1 = 0;
@@ -2153,15 +2197,17 @@ static void mirror_log(uint64_t frame) {
     rt_log("mem: mirror frame %llu: pools %lld, %.1f MiB device-local; stay imported: budget %lld (%.1f MiB), untracked "
            "%lld, overlapping %lld, failed %lld; per frame: submits %.2f, syncs %.1f, upload %.3f MiB in %.1f ranges, "
            "first use %.2f pools %.3f MiB, write-back %.3f MiB in %.1f ranges, merge %.3f MiB in %.1f dispatches "
-           "(snapshots %.3f MiB, new buffers %.2f; quiet ranges copied instead %.3f MiB in %.1f, written by the CPU right after "
-           "%llu), flush calls %.1f (%.3f MiB), queries "
+           "(snapshots %.3f MiB, new buffers %.2f; quiet pages copied instead %.3f MiB in %.1f runs, written by the CPU right "
+           "after %llu; merged pages by the CPU's last write: 0-1 submissions ago %.3f MiB, 2-4 %.3f, older %.3f, "
+           "write-watch set %.3f), flush calls %.1f (%.3f MiB), queries "
            "%.1f pre-snap (%.1f MiB) + %.1f sync, prologues %.2f, tracking cpu %.3f ms (pre-snap %.3f, syncs %.3f)%s",
            (unsigned long long)frame, (long long)m_live_n, m_live_bytes / M, (long long)m_refused_n[MR_BUDGET],
            m_refused_bytes[MR_BUDGET] / M, (long long)m_refused_n[MR_UNTRACKED], (long long)m_refused_n[MR_OVERLAP],
            (long long)m_refused_n[MR_ALLOC], a.subs / f, a.syncs / f, a.upload_bytes / f / M, a.upload_copies / f,
            a.first_n / f, a.first_bytes / f / M, a.wb_bytes / f / M, a.wb_copies / f, a.merge_bytes / f / M,
            a.merge_dispatches / f, a.snap_bytes / f / M, a.snap_allocs / f, a.quiet_bytes / f / M, a.quiet_ranges / f,
-           (unsigned long long)a.quiet_broken, fc / f, fb / f / M,
+           (unsigned long long)a.quiet_broken, a.age_bytes[0] / f / M, a.age_bytes[1] / f / M, a.age_bytes[2] / f / M,
+           a.age_bytes[3] / f / M, fc / f, fb / f / M,
            a.presnap_queries / f, a.presnap_bytes / f / M, a.sync_queries / f, a.prologues / f, qpc_ms(a.presnap_t + a.sync_t) / f,
            qpc_ms(a.presnap_t) / f, qpc_ms(a.sync_t) / f, ver);
     rt_log("mem: mirror frame %llu: upload sources per frame, overlaps counted twice: written pages %.3f MiB; flush ranges "
