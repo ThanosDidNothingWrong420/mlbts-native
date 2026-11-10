@@ -1337,6 +1337,14 @@ void gfx_tex_snap_submit(void) {
 
 // Replay: e (CPU data, not GPU-owned) was uploaded again for new CPU data; after HOT_RUN submissions in a row it is hot.
 static void hot_note(Tex *e) {
+    // Off unless MLB_HOT_COPY=1: the menus' video planes cost 9.3 ms a frame on the game thread to copy (their memory
+    // reads slowly from the CPU) and halved the frame rate, and the copies never showed that they fixed a torn image.
+    static int on = -1;
+    if (on < 0) {
+        const char *v = cfg_get("MLB_HOT_COPY");
+        on = v && strcmp(v, "0");
+    }
+    if (!on) return;
     if (!gfx_replay_async() || e->pub.gpu_owned || e->t.L.size > HOT_MAX || e->f.astc_bw || e->f.astc_bc) return;
     if (e->hot_epoch == submit_epoch) return;
     uint32_t gap = submit_epoch - e->hot_epoch;   // a 30 fps video changes every other submission
