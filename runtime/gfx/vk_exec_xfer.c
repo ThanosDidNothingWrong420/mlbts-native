@@ -573,6 +573,12 @@ static int buffer_side(const VkExec *ex, const Sub *s, uint64_t addr, uint64_t *
 
 static void copy_buffer_image(VkExec *ex, const p_copy_b2t *p, int to_image) {
     Sub s;
+    int dl_near = vk_drawlog_near();
+    if (dl_near)   // mlbts-native diagnosis
+        rt_log("drawlog%s copy%s buffer %#llx %s texture %#llx fmt %#x %ux%u, region %d,%d %dx%d",
+               dl_near > 1 ? (dl_near == 2 ? "+1" : "+2") : "", to_image ? "b2t" : "t2b", (unsigned long long)p->src,
+               to_image ? "->" : "<-", (unsigned long long)(uintptr_t)p->tex->mem, (unsigned)p->tex->d.format,
+               p->tex->d.width, p->tex->d.height, p->r.xoffset, p->r.yoffset, p->r.width, p->r.height);
     if (!sub_resolve(p->tex, &p->view, p->has_view, &p->r, 1, &s)) return;
     if (s.img->scale > 1) {   // the buffer holds the game's texel count, the image more
         warn_once(W_REGION, "buffer copy of a shadow map enlarged by TOTK_SHADOW_SCALE: skipped");
@@ -604,8 +610,26 @@ static void copy_buffer_image(VkExec *ex, const p_copy_b2t *p, int to_image) {
 int vk_watch_hit(uint64_t a, uint64_t n);   // vk_texture.c (mlbts-native diagnosis)
 static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
     Sub s, d;
-    if (!sub_resolve(p->src, &p->sv, p->has_sv, &p->sr, 1, &s)) return;
-    if (!sub_resolve(p->dst, &p->dv, p->has_dv, &p->dr, 1, &d)) return;
+    int dl_near = vk_drawlog_near();
+    if (dl_near)   // mlbts-native diagnosis: drawlog frame and the two after it
+        rt_log("drawlog%s copytex %#llx fmt %#x %ux%u s%d level %u -> %#llx fmt %#x %ux%u s%d level %u, region %d,%d %dx%d -> "
+               "%d,%d %dx%d flags %#x", dl_near > 1 ? (dl_near == 2 ? "+1" : "+2") : "",
+               (unsigned long long)(uintptr_t)p->src->mem, (unsigned)p->src->d.format, p->src->d.width, p->src->d.height,
+               p->src->d.samples, p->has_sv && p->sv.set_levels ? p->sv.base_level : 0,
+               (unsigned long long)(uintptr_t)p->dst->mem, (unsigned)p->dst->d.format, p->dst->d.width, p->dst->d.height,
+               p->dst->d.samples, p->has_dv && p->dv.set_levels ? p->dv.base_level : 0, p->sr.xoffset, p->sr.yoffset,
+               p->sr.width, p->sr.height, p->dr.xoffset, p->dr.yoffset, p->dr.width, p->dr.height, p->flags);
+    if (!sub_resolve(p->src, &p->sv, p->has_sv, &p->sr, 1, &s)) {
+        if (dl_near) rt_log("drawlog   copytex: source has no image or region: skipped");
+        return;
+    }
+    if (!sub_resolve(p->dst, &p->dv, p->has_dv, &p->dr, 1, &d)) {
+        if (dl_near) rt_log("drawlog   copytex: destination has no image or region: skipped");
+        return;
+    }
+    if (dl_near)
+        rt_log("drawlog   copytex images: src %p vk fmt %d %u samples, dst %p vk fmt %d %u samples", (void *)s.img->image,
+               (int)s.img->format, s.img->samples, (void *)d.img->image, (int)d.img->format, d.img->samples);
     d.nz = s.nz;
     int same_size = s.w == d.w && s.h == d.h;
     int same_format = s.img->format == d.img->format;

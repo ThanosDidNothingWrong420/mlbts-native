@@ -667,6 +667,15 @@ void vk_exec_pass_begin(VkExec *ex) {
     }
     // The start mark goes between the barrier and vkCmdBeginRendering, its end right after vkCmdEndRendering
     // (vk_exec_pass_end): outside the pass, and without breaking it.
+    {   // mlbts-native diagnosis: the targets of the passes of the two frames after the drawlog frame (its own draws log them)
+        int nr = vk_drawlog_near();
+        if (nr > 1)
+            rt_log("drawlog+%d pass %ux%u rt0 %#llx fmt %d rt1 %#llx ds %#llx", nr - 1, ex->pass_w, ex->pass_h,
+                   (unsigned long long)(uintptr_t)(ex->color[0].tex ? ex->color[0].tex->mem : NULL),
+                   ex->color[0].tex ? ex->color[0].tex->d.format : 0,
+                   (unsigned long long)(uintptr_t)(ex->pass_ncolor > 1 && ex->color[1].tex ? ex->color[1].tex->mem : NULL),
+                   (unsigned long long)(uintptr_t)(ex->depth.tex ? ex->depth.tex->mem : NULL));
+    }
     VkPassMark *m = ex->mark = vk_pass_mark_begin(ex->cb, VK_MARK_PASS, ex->fence);
     if (m) {
         m->step = ex->mark_passes++;

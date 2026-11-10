@@ -3536,6 +3536,13 @@ static int dq_begin(VkExec *ex) {
 }
 
 int vk_drawlog_now(void) { return drawlog_now(); }
+// mlbts-native diagnosis: 1 in the drawlog frame, 2-3 in the two frames after it (their copies and pass targets are
+// logged too, so a texture another frame fills shows where it comes from); 0 otherwise.
+int vk_drawlog_near(void) {
+    long want = vk_drawlog_frame();
+    long f = (long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
+    return want >= 0 && f >= want && f <= want + 2 ? (int)(f - want) + 1 : 0;
+}
 
 // The first four vertices' attribute 0 of a draw that wrote no pixel: as floats (RGBA32F 0x2e, RGB32F 0x22, RGBA16F
 // 0x29) and the first words raw.
