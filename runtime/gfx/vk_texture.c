@@ -352,7 +352,9 @@ int vk_watch_hit(uint64_t a, uint64_t n) {
         const char *e = cfg_get("MLB_WATCH");
         // Off by default. The RTTS room's lighting (player probes and environment cubes) was traced with
         // MLB_WATCH=1663cce00,e10000;166204e00,1c8000;1679bb600,80000;167f7de00,80000;168001e00,1800;167a3f600,1800
-        if (!e || !*e) e = "off";
+        // mlbts-native: default for now, the created player's hair layer (a 256x128 RGBA8 image with 8 levels the GPU
+        // draws and the BC encoder compresses; stale hairstyles). Its draws add the textures they sample.
+        if (!e || !*e) e = "139b3b000,40000";
         int k = 0;
         while (e && *e && k < WATCH_N && strcmp(e, "off")) {
             char *end;
@@ -1268,7 +1270,24 @@ static void make_fresh(Tex *e) {
 static volatile int32_t n_rewrite_log;
 static uint64_t n_rewrite_up;      // GPU-owned textures uploaded again after a CPU rewrite (perf line in the cube flush)
 static void make_fresh_snap(Tex *e) {
-    if (!e->pub.mirrored) return;
+    if (!e->pub.mirrored) {
+        if (vk_watch_hit(e->pub.addr, e->t.L.size))
+            rt_log("watch: binding of %#llx fmt %#x %ux%u: not mirrored (GPU memory only), never uploaded",
+                   (unsigned long long)e->pub.addr, (unsigned)e->t.d.format, e->pub.width, e->pub.height);
+        return;
+    }
+    if (!e->pub.gpu_owned && vk_watch_hit(e->pub.addr, e->t.L.size)) {   // mlbts-native diagnosis
+        uint32_t now;
+        int ch = vk_mem_changed_snap(e->pub.addr, e->t.L.size, e->uploaded ? e->wgen : 0, submit_epoch, &now);
+        rt_log("watch: binding of %#llx fmt %#x %ux%u (CPU data): written since generation %u: %d (now %u)%s",
+               (unsigned long long)e->pub.addr, (unsigned)e->t.d.format, e->pub.width, e->pub.height, e->wgen, ch, now,
+               e->uploaded ? "" : ", first upload");
+        e->wgen = now;
+        n_checks++;
+        if (!e->uploaded || ch) upload(e);
+        e->last_ch = ch;
+        return;
+    }
     if (e->pub.gpu_owned) {
         // mlbts-native: the CPU rewrote the storage of an image whose GPU content the storage already holds (written
         // back, or copied in from a block image that was): the image takes the storage again. A GPU-owned image was
