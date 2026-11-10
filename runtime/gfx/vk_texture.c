@@ -67,6 +67,9 @@ typedef struct Tex {
     uint64_t use_seq;             // order of the last creation or take-back among all entries
     uint64_t rel_seq;             // while released: use_seq of the newest entry placed before this release; an entry
                                   // with a later use_seq on overlapping storage replaced this one's bytes
+    uint32_t hot_epoch;           // mlbts-native: submit_epoch of the last upload of new CPU data (hot_note)
+    uint8_t hot_run;              // consecutive submissions with such an upload, up to 255
+    uint64_t snap_seq;            // the submit copy (hot_upload) the image holds
 } Tex;
 
 // A slot keeps what vk_texture_by_id resolved for it, so a draw binding skips the key lookup and the address chain: the
@@ -894,6 +897,9 @@ static int upload_gpu(Tex *e);
 // mlbts-native: the levels an upload copies (bit per level; all by default). make_fresh_snap narrows it to the levels
 // whose storage the CPU rewrote in a GPU-owned image.
 static uint32_t up_lvmask = ~0u;
+// mlbts-native: the bytes an upload reads instead of the storage (a submit-time copy, hot_upload); NULL: the storage.
+// Set, the upload takes the CPU path (the GPU deswizzle reads the pool's GPU copy of guest memory).
+static const uint8_t *up_src;
 
 // The CPU side of upload: deswizzles (and decodes or expands) into staging buffers, then copies them into the image.
 static void upload_cpu(Tex *e) {
@@ -943,7 +949,7 @@ static void upload_cpu(Tex *e) {
             size_t raw = (size_t)rb * rows * sl;
             rg[k].bufferOffset -= base;
             uint8_t *dst = stg + rg[k].bufferOffset, *tmp = (astc && !agpu) || rgb ? malloc(raw) : NULL;
-            if (nvn_deswizzle(d, lv, ly, t->mem, tmp ? tmp : dst, rb)) {
+            if (nvn_deswizzle(d, lv, ly, up_src ? up_src : t->mem, tmp ? tmp : dst, rb)) {
                 log_limited(&n_bad, "texture %#llx fmt %#x target %d: level %u layer %u has no CPU layout; uploaded as zeros",
                             (unsigned long long)e->pub.addr, d->format, d->target, lv, ly);
                 memset(tmp ? tmp : dst, 0, raw);
@@ -1202,7 +1208,8 @@ static void upload(Tex *e) {
     }
     uint64_t p0 = perf_begin(), u0 = kern_now_ns();
     int why = UP_GPU;
-    if (!upload_gpu(e)) why = up_why, upload_cpu(e);
+    if (up_src) why = UP_MODE, upload_cpu(e);   // mlbts-native: from a submit-time copy
+    else if (!upload_gpu(e)) why = up_why, upload_cpu(e);
     uint64_t dt = kern_now_ns() - u0;
     up_n[why]++, up_bytes[why] += t->L.size, up_ns[why] += dt;
     if (e->uploaded) {
@@ -1277,6 +1284,126 @@ static void make_fresh(Tex *e) {
 // make_fresh for draw bindings: the page check answers from this submission's write-watch snapshot (vk_memory.c
 // vk_mem_changed_snap) instead of a system call per texture. A write the snapshot of the texture's region missed (made
 // after it, during this replay) keeps its write-watch bit and is caught by the next submission's snapshot.
+// ---- mlbts-native: submit-time copies of CPU textures rewritten every frame (asynchronous replay)
+// With TOTK_REPLAY_ASYNC the replay reads a texture's storage up to a frame after the game submitted the draws that
+// sample it, and a texture the CPU rewrites every frame may be half rewritten by then: MLB decodes its menu background
+// videos on the CPU into 1280x720 and 640x360 R8 planes, and the menus showed torn frames (an image cut across, its
+// halves from two video frames). The game hands a frame over complete at the submit call. A CPU texture the replay
+// uploads new data for in HOT_RUN consecutive submissions becomes hot: at each submit the game thread copies its
+// storage (two buffers in turn), and the replay uploads it from the newest copy instead of the storage. A hot texture
+// whose copy has not changed for HOT_COOL submits stops being copied.
+#define HOT_N 16
+#define HOT_RUN 8
+#define HOT_COOL 600
+#define HOT_MAX (8u << 20)      // largest texture copied
+#define HOT_TOTAL (24u << 20)   // all of them: the copies run on the game's submitting thread
+typedef struct { uint64_t addr, size; uint8_t *buf[2]; uint64_t seq[2]; int cur, busy, unchanged, live; } HotSnap;
+static HotSnap hot[HOT_N];
+static PlatMutex hot_lock = PLAT_MUTEX_INIT;
+static volatile int32_t n_hot;
+static uint64_t hot_seq, hs_copies, hs_bytes, hs_ns, hs_skipped;   // hot_lock
+static uint64_t hs_uses;                                             // replay
+
+// Game thread, at an asynchronous submit (nvn_api_core.c nvnQueueSubmitCommands).
+void gfx_tex_snap_submit(void) {
+    if (!__atomic_load_n(&n_hot, __ATOMIC_ACQUIRE)) return;
+    uint64_t t0 = kern_now_ns();
+    plat_mutex_lock(&hot_lock);
+    hot_seq++;
+    for (int i = 0; i < HOT_N; i++) {
+        HotSnap *h = &hot[i];
+        if (!h->live) continue;
+        int slot = h->cur ^ 1;
+        if (slot == h->busy) { hs_skipped++; continue; }   // the replay is uploading from it: the older copy stays
+        if (!h->buf[slot] && !(h->buf[slot] = malloc(h->size))) continue;
+        if (!plat_mem_readable(h->addr, h->size)) { h->live = 0, __atomic_sub_fetch(&n_hot, 1, __ATOMIC_RELEASE); continue; }
+        memcpy(h->buf[slot], (const void *)(uintptr_t)h->addr, h->size);
+        if (h->seq[h->cur] && h->buf[h->cur] && !memcmp(h->buf[slot], h->buf[h->cur], h->size)) h->unchanged++;
+        else h->unchanged = 0;
+        h->seq[slot] = hot_seq, h->cur = slot;
+        hs_copies++, hs_bytes += h->size;
+        if (h->unchanged >= HOT_COOL && h->busy < 0) {   // no longer rewritten: back to the storage
+            rt_log("vk: texture %#llx (%llu bytes) no longer rewritten every frame: submit copies stop",
+                   (unsigned long long)h->addr, (unsigned long long)h->size);
+            free(h->buf[0]), free(h->buf[1]);
+            memset(h, 0, sizeof *h);
+            h->busy = -1;
+            __atomic_sub_fetch(&n_hot, 1, __ATOMIC_RELEASE);
+        }
+    }
+    hs_ns += kern_now_ns() - t0;
+    plat_mutex_unlock(&hot_lock);
+}
+
+// Replay: e (CPU data, not GPU-owned) was uploaded again for new CPU data; after HOT_RUN submissions in a row it is hot.
+static void hot_note(Tex *e) {
+    if (!gfx_replay_async() || e->pub.gpu_owned || e->t.L.size > HOT_MAX || e->f.astc_bw || e->f.astc_bc) return;
+    if (e->hot_epoch == submit_epoch) return;
+    e->hot_run = e->hot_epoch + 1 == submit_epoch ? (uint8_t)(e->hot_run < 255 ? e->hot_run + 1 : 255) : 1;
+    e->hot_epoch = submit_epoch;
+    if (e->hot_run != HOT_RUN) return;
+    plat_mutex_lock(&hot_lock);
+    int have = -1, free_i = -1;
+    uint64_t total = 0;
+    for (int i = 0; i < HOT_N; i++) {
+        if (hot[i].live && hot[i].addr == e->pub.addr && hot[i].size == e->t.L.size) have = i;
+        if (hot[i].live) total += hot[i].size;
+        if (!hot[i].live && !hot[i].buf[0] && !hot[i].buf[1] && free_i < 0) free_i = i;
+    }
+    if (have < 0 && free_i >= 0 && total + e->t.L.size <= HOT_TOTAL) {
+        hot[free_i] = (HotSnap){.addr = e->pub.addr, .size = e->t.L.size, .busy = -1, .live = 1};
+        __atomic_add_fetch(&n_hot, 1, __ATOMIC_RELEASE);
+        rt_log("vk: texture %#llx fmt %#x %ux%u (%llu bytes) is rewritten by the CPU every frame: copied at each submit "
+               "from now on (asynchronous replay)", (unsigned long long)e->pub.addr, (unsigned)e->t.d.format,
+               e->pub.width, e->pub.height, (unsigned long long)e->t.L.size);
+    }
+    plat_mutex_unlock(&hot_lock);
+}
+
+// Replay: uploads e from its newest submit copy when it has one; 1 when e is hot and has a copy (uploaded or current).
+static int hot_upload(Tex *e) {
+    plat_mutex_lock(&hot_lock);
+    HotSnap *h = NULL;
+    for (int i = 0; i < HOT_N; i++)
+        if (hot[i].live && hot[i].addr == e->pub.addr && hot[i].size == e->t.L.size) { h = &hot[i]; break; }
+    if (!h || !h->seq[h->cur]) { plat_mutex_unlock(&hot_lock); return 0; }
+    int slot = h->cur;
+    uint64_t seq = h->seq[slot];
+    const uint8_t *buf = h->buf[slot];
+    if (seq != e->snap_seq) h->busy = slot;
+    plat_mutex_unlock(&hot_lock);
+    uint32_t now;
+    vk_mem_changed_snap(e->pub.addr, e->t.L.size, e->wgen, submit_epoch, &now);   // the storage's write bits: seen
+    e->wgen = now;
+    if (seq == e->snap_seq) return 1;
+    up_src = buf;
+    upload(e);
+    up_src = NULL;
+    plat_mutex_lock(&hot_lock);
+    h->busy = -1;
+    plat_mutex_unlock(&hot_lock);
+    e->snap_seq = seq;
+    e->uploaded = 1;
+    hs_uses++;
+    return 1;
+}
+
+// Replay: the summary line (every 600 frames, MLB_TRACE=perf).
+static void hot_report(void) {
+    static uint64_t last;
+    uint64_t fr = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    if (!(rt_trace & RT_TRACE_PERF) || fr < last + 600) return;
+    plat_mutex_lock(&hot_lock);
+    double nf = last ? (double)(fr - last) : 600.0;
+    rt_log("perf: frame %llu: submit copies of CPU textures rewritten every frame: %d textures, %.1f copies and %.2f MiB per "
+           "frame, %.3f ms per frame on the submitting thread, %llu skipped (copy in use), %llu uploads from them",
+           (unsigned long long)fr, (int)n_hot, hs_copies / nf, hs_bytes / nf / 1048576.0, hs_ns / nf / 1e6,
+           (unsigned long long)hs_skipped, (unsigned long long)hs_uses);
+    hs_copies = hs_bytes = hs_ns = hs_skipped = hs_uses = 0;
+    plat_mutex_unlock(&hot_lock);
+    last = fr;
+}
+
 static volatile int32_t n_rewrite_log;
 static uint64_t n_rewrite_up;      // GPU-owned textures uploaded again after a CPU rewrite (perf line in the cube flush)
 // mlbts-native: for a GPU-owned mirrored image, the levels the CPU rewrote take the storage again; 1 when it uploaded.
@@ -1359,13 +1486,14 @@ static void make_fresh_snap(Tex *e) {
         cpu_rewrite_refresh(e);
         return;
     }
+    if (__atomic_load_n(&n_hot, __ATOMIC_ACQUIRE) && e->uploaded && hot_upload(e)) return;   // mlbts-native
     uint32_t now;
     n_checks++;
     int ch = vk_mem_changed_snap(e->pub.addr, e->t.L.size, e->uploaded ? e->wgen : 0, submit_epoch, &now);
     e->wgen = now;
     if (!e->uploaded) { upload(e); return; }
     e->last_ch = ch;
-    if (ch) upload(e);
+    if (ch) upload(e), hot_note(e);
 }
 
 // ---------------------------------------------------------------- aliases (TOTK_TEX_ALIAS)
@@ -2039,6 +2167,7 @@ uint32_t vk_texture_epoch(void) { return __atomic_load_n(&submit_epoch, __ATOMIC
 void vk_texture_new_submit(void) {
     lock();
     if (!++submit_epoch) submit_epoch = 1;
+    hot_report();   // mlbts-native
     coarse_ms = plat_now_ms();
     sweep_pressure();
     static uint64_t log_at;
