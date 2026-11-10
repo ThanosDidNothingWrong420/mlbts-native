@@ -890,11 +890,61 @@ static void maybe_split(VkExec *ex) {
     n_parts++;
 }
 
+// mlbts-native diagnosis (the batting frame rate), MLB_TRACE=perf: the replay's CPU time and count per command type
+// (TSC ticks from one command to the next on this thread; OP_CALL and OP_JUMP are not commands of their own), and
+// every 600 presents a line with the commands that took the most time per frame.
+static uint64_t opn[OP_COUNT_], opt[OP_COUNT_], op_t0;
+static int op_cur = -1, op_on = -1;
+static void op_mark(int op) {
+    uint64_t now = __builtin_ia32_rdtsc();
+    if (op_cur >= 0) opt[op_cur] += now - op_t0;
+    op_cur = op, op_t0 = now;
+}
+static int op_cmp(const void *x, const void *y) {
+    uint64_t a = opt[*(const int *)x], b = opt[*(const int *)y];
+    return a < b ? 1 : a > b ? -1 : 0;
+}
+static void op_report(void) {
+    static uint64_t fr0, tsc0, ns0;
+    uint64_t fr = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), tsc = __builtin_ia32_rdtsc(), ns = kern_now_ns();
+    if (!ns0) {
+        fr0 = fr, tsc0 = tsc, ns0 = ns;
+        return;
+    }
+    if (fr < fr0 + 600 || ns <= ns0) return;
+    double tick_ns = (double)(ns - ns0) / (double)(tsc - tsc0), nf = (double)(fr - fr0);
+    int idx[OP_COUNT_];
+    uint64_t total = 0, cnt = 0;
+    for (int i = 0; i < OP_COUNT_; i++) idx[i] = i, total += opt[i], cnt += opn[i];
+    qsort(idx, OP_COUNT_, sizeof *idx, op_cmp);
+    char line[2048];
+    uint64_t vk_exec_dispatches_chained(void);   // vk_exec_draw.c
+    static uint64_t chained0;
+    uint64_t chained = vk_exec_dispatches_chained();
+    int o = snprintf(line, sizeof line, "perf: frame %llu: replay by command over %.0f frames: %.2f ms and %.0f commands per frame "
+                     "(%.0f dispatches without a barrier before them);", (unsigned long long)fr, nf, total * tick_ns / 1e6 / nf,
+                     cnt / nf, (chained - chained0) / nf);
+    chained0 = chained;
+    for (int k = 0; k < 14 && opt[idx[k]] && o < (int)sizeof line - 120; k++) {
+        int i = idx[k];
+        o += snprintf(line + o, sizeof line - o, " %s %.3f ms (%.0f x %.2f us)", nvn_op_name((uint32_t)i), opt[i] * tick_ns / 1e6 / nf,
+                      opn[i] / nf, opn[i] ? opt[i] * tick_ns / 1e3 / opn[i] : 0.0);
+    }
+    rt_log("%s", line);
+    memset(opn, 0, sizeof opn), memset(opt, 0, sizeof opt);
+    fr0 = fr, tsc0 = tsc, ns0 = ns;
+}
+
 static void walk(VkExec *ex, const op_hdr *h, int depth) {
     for (;;) {
         if (h->size < sizeof *h || (h->size & 7) || h->op >= OP_COUNT_)
             rt_fatal("vk: corrupt command record at %p: op %u size %u", (const void *)h, h->op, h->size);
         const void *a = nvn_op_payload(h);
+        if (op_on) {
+            int cmd = h->op != OP_CALL && h->op != OP_JUMP && h->op != OP_END;
+            op_mark(cmd ? (int)h->op : -1);
+            if (cmd) opn[h->op]++;
+        }
         switch (h->op) {
         case OP_END: return;
         case OP_BEGIN: break;
@@ -978,6 +1028,8 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
 }
 
 int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t fence) {
+    if (op_on < 0) op_on = (rt_trace & RT_TRACE_PERF) != 0;
+    if (op_on) op_mark(-1), op_report();
     VkExec *ex = &X;
     if (!x_ready) state_reset(ex), vk_dump_init(), x_ready = 1;
     const tex_t *keep[9];   // the render targets carry over to this submission (set_rt compares them by pointer)

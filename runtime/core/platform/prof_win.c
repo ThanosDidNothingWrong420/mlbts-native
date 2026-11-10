@@ -65,7 +65,7 @@ static uint64_t frame_lo, frame_hi; // MLB_SAMPLER_FRAMES=<lo>-<hi>: sample only
 static int64_t world_lo, world_hi;  // MLB_SAMPLER_FRAMES=w<lo>-<hi>: only while the world clock is in [lo, hi) s (us)
 
 #define SLOW_RING (1u << 15)        // MLB_SAMPLER_SLOW: about 0.5 s of samples of every thread
-#define SLOW_DUMPS 64
+#define SLOW_DUMPS 400   // mlbts-native: 64 in TotK; one every 3 s at most (prof_sampler_frame)
 typedef struct { uint64_t t; DWORD tid; uint32_t depth; uint64_t rip[PROF_DEPTH]; } Sample;
 static Sample ring[SLOW_RING];
 static uint64_t ring_n;
@@ -122,7 +122,17 @@ static uint32_t unwind_copy(CONTEXT *c, uintptr_t lo, size_t n, uint64_t *rip) {
         if (f) {
             void *hd;
             DWORD64 est;
-            RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c->Rip, f, c, &hd, &est, NULL);
+            // mlbts-native: the unwind can read through a frame register that points outside the copy (a value the
+            // suspended thread held for something else); that fault, in ntdll, ended the game in an RTTS cutscene
+            // (reading 0x898). The chain ends at that frame instead. The fault is raised inside the call, which clang's
+            // SEH catches without -fasync-exceptions; crash_veh leaves faults outside this executable alone.
+            int bad = 0;
+            __try {
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c->Rip, f, c, &hd, &est, NULL);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                bad = 1;
+            }
+            if (bad) break;
         } else {   // a leaf function: the return address is on top
             c->Rip = *(DWORD64 *)c->Rsp;
             c->Rsp += 8;
@@ -361,7 +371,9 @@ int prof_sampler_start(void) {
 // dump of a present at least slow_ns after the previous one (d 0 on the first present).
 void prof_sampler_frame(uint64_t frame, uint64_t now, uint64_t d) {
     cur_frame = frame;
-    if (slow_ns && d >= slow_ns && !dump_hi) {
+    static uint64_t last_dump;
+    if (slow_ns && d >= slow_ns && !dump_hi && (!last_dump || now - last_dump >= 3000000000ull)) {
+        last_dump = now;
         dump_lo = (LONG64)(now - d - 20000000ull);
         dump_frame = (LONG64)frame;
         InterlockedExchange64(&dump_hi, (LONG64)now);

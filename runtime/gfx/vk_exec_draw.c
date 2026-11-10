@@ -1115,6 +1115,34 @@ static void upd_apply(const VkExec *ex, uint64_t a, uint8_t *out, size_t n) {
     }
 }
 
+// mlbts-native (the batting frame rate): consecutive dispatches without a barrier between them. NVN orders compute
+// work only at the game's barriers (OP_BARRIER, replayed as a full barrier), and MLB's batting scenes run one compute
+// shader (99604eee) about 1,800-2,300 times a frame with about 140 barriers; a full ALL_COMMANDS barrier before each
+// dispatch drained the GPU every time, and the frame took 25 ms of GPU time (33 fps). A dispatch now skips that barrier
+// when the last command recorded in this command buffer was the previous dispatch: any other command (a barrier, copy,
+// clear, draw or pass, a uniform update's copy) in between still gets it. MLB_DISPATCH_CHAIN=0: a barrier before every
+// dispatch, as before.
+static int chain_cfg = -1;
+static VkCommandBuffer disp_cb;
+static uint64_t disp_fence;
+static int disp_rec = -1;   // ex->recorded right after the last dispatch in disp_cb
+static uint64_t n_chained;  // dispatches recorded without a barrier before them (vk_exec.c op_report)
+uint64_t vk_exec_dispatches_chained(void) { return n_chained; }
+static int dispatch_chain_on(void) {
+    if (chain_cfg < 0) {
+        const char *e = cfg_get("MLB_DISPATCH_CHAIN");
+        chain_cfg = !e || strcmp(e, "0");
+        rt_log("vk_exec: consecutive dispatches %s", chain_cfg ? "run without a barrier between them (MLB_DISPATCH_CHAIN=0: one each)"
+                                                               : "each wait for a full barrier");
+    }
+    return chain_cfg;
+}
+// A GPU copy recorded while binding, out of a pass: a dispatch recorded since the last barrier may still read the
+// copy's destination or write its source, so the copy waits for it.
+static void dispatch_copy_guard(VkExec *ex) {
+    if (disp_rec > ex->barrier_at && ex->cb == disp_cb && ex->fence == disp_fence) vk_exec_barrier(ex);
+}
+
 // That address as the bound block holds it at this point of the replay; 0 when the block is unbound or too short. The
 // block has no size field.
 static uint64_t ubo_ptr(const VkExec *ex, int st, const GfxShaderRes *r) {
@@ -1342,6 +1370,7 @@ static VkBufferView texel_view(VkExec *ex, uint64_t h, int written) {
         // around the copy as for ub_bind. Images (written) keep the zero view.
         int reopen = ex->in_pass;
         if (reopen) vk_exec_barrier(ex);
+        else dispatch_copy_guard(ex);   // dispatches chained without a barrier may still use the source
         scratch(ex, bytes, &vb, &vo);
         VkBufferCopy cp = {sp.offset, vo, bytes};
         vkCmdCopyBuffer(ex->cb, sp.buffer, vb, 1, &cp);
@@ -4146,7 +4175,16 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     const VkPipeInfo *info = NULL;
     VkPipeline p = vk_pipeline_compute(cs, &info);
     if (!p || !info) return warn_once(W_PIPELINE, "a compute pipeline could not be created: dispatches with it are skipped");
-    vk_exec_barrier(ex);   // ends the pass; earlier writes are visible to the shader
+    // mlbts-native: right after another dispatch (nothing recorded since), no barrier unless the uniform flush records
+    // copies (dispatch_chain_on)
+    int chained = dispatch_chain_on() && !ex->in_pass && ex->cb == disp_cb && ex->fence == disp_fence && ex->recorded == disp_rec;
+    if (chained) {
+        int r = ex->recorded;
+        vk_exec_ub_flush(ex);
+        chained = ex->recorded == r;
+    }
+    if (!chained) vk_exec_barrier(ex);   // ends the pass; earlier writes are visible to the shader
+    else n_chained++;
     bind_pipeline(ex, VK_PIPELINE_BIND_POINT_COMPUTE, p);
     c0_dim[0] = (uint32_t)d->x, c0_dim[1] = (uint32_t)d->y, c0_dim[2] = (uint32_t)d->z;
     twin_dispatch = 1;
@@ -4227,6 +4265,7 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     vkCmdDispatch(ex->cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     vk_pass_mark_end(ex->cb, m);
     ex->recorded++;
+    disp_cb = ex->cb, disp_fence = ex->fence, disp_rec = ex->recorded;
     if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, d);
 }
 
