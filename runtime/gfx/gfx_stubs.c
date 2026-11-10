@@ -213,7 +213,16 @@ int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot) {
     static int key;
     if (!key) {
         key = GetModuleHandleA("renderdoc.dll") ? VK_F9 : VK_F12;
-        if (key == VK_F9) rt_log("capture: RenderDoc is loaded: F12 is its capture, ours (draw log, render targets) is F9");
+        if (key == VK_F9) {
+            // A RenderDoc capture copies every dirty resource and keeps two copies of each mapped range in system
+            // memory: several GiB of commit on top of the game's. Short of it, RenderDoc's allocations fail and it
+            // crashes in the capture (seen with a 1 GiB page file: "Allocation for 89128960 bytes failed").
+            MEMORYSTATUSEX ms = {.dwLength = sizeof ms};
+            GlobalMemoryStatusEx(&ms);
+            rt_log("capture: RenderDoc is loaded: F12 is its capture, ours (draw log, render targets) is F9; commit free "
+                   "%.1f of %.1f GiB%s", (double)ms.ullAvailPageFile / 1073741824.0, (double)ms.ullTotalPageFile / 1073741824.0,
+                   ms.ullAvailPageFile < (12ull << 30) ? " (low: a capture may run out of memory and crash; raise the page file)" : "");
+        }
     }
     int f12 = pid == GetCurrentProcessId() && (GetAsyncKeyState(key) & 0x8001);
     if (f12 && !f12_was) gfx_capture_arm(2);
