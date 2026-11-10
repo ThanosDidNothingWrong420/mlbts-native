@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 
 #include "host.h"
 #include "platform/platform.h"
@@ -147,6 +148,40 @@ void cfg_set(const char *name, const char *value) {
     set_values[i].value = copy;
     version++;
     plat_mutex_unlock(&set_lock);
+}
+
+// mlbts-native: settings from mlb.cfg beside the executable, one KEY=VALUE per line (MLB_X, TOTK_X or X; '#' or ';'
+// starts a comment), so a player can switch an experiment without a new build or environment variables. Applied with
+// cfg_set before anything reads a setting: the environment still wins, and the defaults main.c sets for unset keys
+// leave a file's value alone. Returns how many settings it applied (0 without a file).
+int cfg_load_file(void) {
+    wchar_t dir[1024];
+    if (!plat_exe_dir_wide(dir, 1000)) return 0;
+    wcscat(dir, L"mlb.cfg");
+    FILE *f = _wfopen(dir, L"r");
+    if (!f) return 0;
+    char line[512];
+    int n = 0;
+    while (fgets(line, sizeof line, f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        char *hash = strpbrk(p, "#;");
+        if (hash) *hash = 0;
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq = 0;
+        char *k = p, *v = eq + 1, *e;
+        for (e = k + strlen(k); e > k && (e[-1] == ' ' || e[-1] == '\t'); e--) *(e - 1) = 0;
+        while (*v == ' ' || *v == '\t') v++;
+        for (e = v + strlen(v); e > v && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n'); e--) *(e - 1) = 0;
+        if (!*k) continue;
+        cfg_set(k, v);
+        rt_log("cfg: mlb.cfg: %s=%s%s", k, v, getenv(k) ? " (the environment overrides it)" : "");
+        n++;
+    }
+    fclose(f);
+    if (!n) rt_log("cfg: mlb.cfg read, no settings in it");
+    return n;
 }
 
 unsigned cfg_version(void) { return version; }

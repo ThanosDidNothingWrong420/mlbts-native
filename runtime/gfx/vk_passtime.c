@@ -1,0 +1,148 @@
+// mlbts-native, our own: GPU time per render pass and per compute dispatch (MLB_TRACE=perf). The pass marks of vk.h
+// (vk_exec.c pass begin and end, vk_exec_draw.c dispatch_mark) each get a pair of timestamps written at
+// ALL_COMMANDS, so a mark measures its own work after the work before it finished. Results are read without waiting,
+// in mark order, once the mark's submission completed; every 600 presents a line lists the passes and compute shaders
+// that took the most GPU time per frame. A mark whose ring slot is still in flight gets no timestamps.
+//
+// TotK's pass marks (breadcrumbs for device-lost reports, its overlay's GPU timing) were not ported: this replaces the
+// stubs in gfx_stubs.c with timing only.
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "gfx.h"
+#include "host.h"
+#include "nvn_api.h"
+#include "platform/platform.h"
+#include "vk.h"
+
+static VkPassMark ring[VK_PASS_MARKS];
+static uint32_t ended[VK_PASS_MARKS];   // the id whose end was recorded in that slot
+static VkQueryPool qp;
+static int state;                       // 0 not tried, 1 on, -1 off
+static double tick_ns;
+static uint32_t next_id = 1, collected = 1;
+
+#define AGG_N 1024
+static struct { char key[96]; double ns; uint64_t n; } agg[AGG_N];
+static int nagg;
+static uint64_t frame0, n_marks, n_skipped;
+static double total_ns;
+
+static int init(void) {
+    if (state) return state > 0;
+    state = -1;
+    VkCtx *c = vk_ctx();
+    if (!c->props.limits.timestampComputeAndGraphics) return 0;
+    VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                                .queryCount = 2 * VK_PASS_MARKS};
+    if (vkCreateQueryPool(c->device, &qi, NULL, &qp) != VK_SUCCESS) return 0;
+    vkResetQueryPool(c->device, qp, 0, 2 * VK_PASS_MARKS);
+    tick_ns = c->props.limits.timestampPeriod;
+    state = 1;
+    rt_log("vk: GPU time per pass and dispatch: on (MLB_TRACE=perf)");
+    return 1;
+}
+
+static void id_hex(const GfxShader *s, char *out) {
+    const uint8_t *id = s ? gfx_shader_input_id(s) : NULL;
+    if (id) snprintf(out, 9, "%02x%02x%02x%02x", id[0], id[1], id[2], id[3]);
+    else snprintf(out, 9, "-");
+}
+
+static void key_of(const VkPassMark *m, char *key, size_t n) {
+    char a[9], b[9];
+    if (m->kind == VK_MARK_DISPATCH) {
+        id_hex(m->first[0], a);
+        snprintf(key, n, "dispatch cs %s", a);
+    } else {
+        id_hex(m->first[1], a), id_hex(m->last[1], b);
+        snprintf(key, n, "pass %ux%u x%u c%d/%d d%d fs %s..%s", m->w, m->h, m->d, m->ncolor ? (int)m->color[0] : 0,
+                 m->ncolor, (int)m->depth, a, b);
+    }
+}
+
+static void add(const char *key, double ns) {
+    unsigned h = 2166136261u;
+    for (const char *p = key; *p; p++) h = (h ^ (uint8_t)*p) * 16777619u;
+    for (unsigned i = h % AGG_N, k = 0; k < AGG_N; k++, i = (i + 1) % AGG_N) {
+        if (!agg[i].key[0]) {
+            if (nagg >= AGG_N * 3 / 4) return;
+            snprintf(agg[i].key, sizeof agg[i].key, "%s", key);
+            nagg++;
+        }
+        if (!strcmp(agg[i].key, key)) {
+            agg[i].ns += ns, agg[i].n++;
+            return;
+        }
+    }
+}
+
+static int cmp_ns(const void *x, const void *y) {
+    double a = agg[*(const int *)x].ns, b = agg[*(const int *)y].ns;
+    return a < b ? 1 : a > b ? -1 : 0;
+}
+
+// Reads the finished marks, in order, and every 600 presents logs the top ones per frame.
+static void collect(void) {
+    VkCtx *c = vk_ctx();
+    uint64_t done = vk_sync_fence_done();
+    for (; collected != next_id; collected++) {
+        uint32_t s = collected % VK_PASS_MARKS;
+        VkPassMark *m = &ring[s];
+        if (m->id != collected || ended[s] != collected) continue;   // overwritten, or never ended
+        if (m->fence > done) break;
+        uint64_t r[4];
+        if (vkGetQueryPoolResults(c->device, qp, 2 * s, 2, sizeof r, r, 2 * sizeof(uint64_t),
+                                  VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) < 0 || !r[1] || !r[3])
+            continue;
+        double ns = r[2] > r[0] ? (double)(r[2] - r[0]) * tick_ns : 0;
+        char key[96];
+        key_of(m, key, sizeof key);
+        add(key, ns);
+        total_ns += ns, n_marks++;
+    }
+    uint64_t fr = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    if (!frame0) frame0 = fr;
+    if (fr < frame0 + 600) return;
+    double nf = (double)(fr - frame0);
+    int idx[AGG_N], n = 0;
+    for (int i = 0; i < AGG_N; i++)
+        if (agg[i].key[0]) idx[n++] = i;
+    qsort(idx, (size_t)n, sizeof *idx, cmp_ns);
+    rt_log("perf: frame %llu: GPU time in marked passes and dispatches %.2f ms per frame (%.0f marks per frame, %llu "
+           "untimed); the most expensive:", (unsigned long long)fr, total_ns / 1e6 / nf, n_marks / nf,
+           (unsigned long long)n_skipped);
+    for (int k = 0; k < n && k < 16; k++) {
+        int i = idx[k];
+        rt_log("perf:   %6.3f ms per frame, %5.1f per frame, %.3f ms each: %s", agg[i].ns / 1e6 / nf, agg[i].n / nf,
+               agg[i].ns / 1e6 / (double)agg[i].n, agg[i].key);
+    }
+    memset(agg, 0, sizeof agg);
+    nagg = 0, total_ns = 0, n_marks = n_skipped = 0, frame0 = fr;
+}
+
+VkPassMark *vk_pass_mark_begin(VkCommandBuffer cb, int kind, uint64_t fence) {
+    if (!(rt_trace & RT_TRACE_PERF) || !init()) return NULL;
+    if ((next_id & 63) == 0) collect();
+    uint32_t id = next_id, s = id % VK_PASS_MARKS;
+    VkPassMark *m = &ring[s];
+    if (m->id && m->fence > vk_sync_fence_done()) {   // its previous mark is still on the GPU: no timing for this one
+        n_skipped++;
+        return NULL;
+    }
+    vkResetQueryPool(vk_ctx()->device, qp, 2 * s, 2);
+    memset(m, 0, sizeof *m);
+    m->id = id, m->kind = (uint8_t)kind, m->fence = fence, m->draws = UINT32_MAX;
+    ended[s] = 0;
+    vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, qp, 2 * s);
+    next_id = id + 1 ? id + 1 : 1;
+    return m;
+}
+
+void vk_pass_mark_end(VkCommandBuffer cb, const VkPassMark *m) {
+    if (!m || state <= 0) return;
+    uint32_t s = m->id % VK_PASS_MARKS;
+    vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, qp, 2 * s + 1);
+    ended[s] = m->id;
+}

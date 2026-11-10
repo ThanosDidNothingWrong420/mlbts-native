@@ -231,6 +231,19 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
     plat_crash_hook(crash_handler);
+    cfg_load_file();   // mlb.cfg beside the exe: before any setting is read (the defaults below leave its values alone)
+    // mlbts-native, for now (the batting frame rate): the per-second perf lines are on unless MLB_TRACE says otherwise
+    // and the guest scheduler's report every 120 presents (per thread: run, block, sleep and core-wait shares, wake and
+    // core-grant latency, sleep asked against taken): the uneven frames at 60 fps
+    if (!cfg_get("MLB_TRACE")) cfg_set("TRACE", "perf,sched");
+    // mlbts-native, on trial (the batting frame rate): the replay runs on its own thread (vk_backend.c). Synchronous, it
+    // ran on the game's main thread after the game's own work, and busy at-bat scenes took 6-9 ms of replay on top of
+    // 10-12 ms of game work a frame (45-55 fps). MLB_REPLAY_ASYNC=0: synchronous, as before.
+    if (!cfg_get("MLB_REPLAY_ASYNC")) cfg_set("REPLAY_ASYNC", "1");
+    // mlbts-native, on trial (uneven frames at 60): the frame queue (nvn_api_obj.c nvnWindowAcquireTexture). Without
+    // it a window image is free only one period after its present, so a frame that runs a little long misses its slot;
+    // with it the game draws the next frame while the previous one waits for its turn. MLB_FRAME_QUEUE=0: as before.
+    if (!cfg_get("MLB_FRAME_QUEUE")) cfg_set("FRAME_QUEUE", "1");
     parse_trace();
     cfg = (RtConfig){.exefs = cfg_get("MLB_EXEFS") ? cfg_get("MLB_EXEFS") : rt_default_exefs,
                      .romfs = cfg_get("MLB_ROMFS") ? cfg_get("MLB_ROMFS") : rt_default_romfs,
@@ -253,6 +266,14 @@ int main(int argc, char **argv) {
     }
     log_open();
     if (probe) return probe_fs();
+    // mlbts-native, for now (the batting frame rate): the sampling profiler, with every thread's call chains for each
+    // frame of 19 ms or more (one every 3 s at most) in <profile>/prof.txt.f<frame> (MLB_SAMPLER=off: none)
+    if (!cfg_get("MLB_SAMPLER")) {
+        static char sp[1100];
+        snprintf(sp, sizeof sp, "%s/prof.txt", cfg.profile);
+        cfg_set("SAMPLER", sp);
+        if (!cfg_get("MLB_SAMPLER_SLOW")) cfg_set("SAMPLER_SLOW", "19");
+    } else if (!strcmp(cfg_get("MLB_SAMPLER"), "off")) cfg_set("SAMPLER", "");
     prof_start();   // perf.c: the frame-time summary, MLB_TRACE=perf, MLB_SAMPLER
     rt_boot();
     return 0;

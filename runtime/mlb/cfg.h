@@ -12,6 +12,7 @@ void cfg_set(const char *name, const char *value);   // for this run
 unsigned cfg_version(void);                 // changes with every cfg_set
 int cfg_is_set(const char *name);
 int cfg_save(void);                         // no settings file: 0
+int cfg_load_file(void);                    // mlbts-native: <exe dir>/mlb.cfg into cfg_set; the settings it applied
 const CfgMeta *cfg_meta(const char *key);
 const char *cfg_value(const char *name);    // cfg_get, else the table's default; fatal for a key without a row
 int cfg_int(const char *name);              // unparsable: the default
