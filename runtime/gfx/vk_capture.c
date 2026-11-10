@@ -191,12 +191,14 @@ int vk_capture_read(uint64_t addr, void *out, uint32_t n) {
 static tex_t wt[24];
 static int nwt;
 void vk_watch_note_tex(const tex_t *t) {
+    static int next_out;   // mlbts-native: when full, the oldest goes (the newest scene's images are the ones saved)
     for (int i = 0; i < nwt; i++)
         if (wt[i].mem == t->mem && wt[i].d.format == t->d.format && wt[i].d.target == t->d.target) {
             wt[i] = *t;
             return;
         }
     if (nwt < 24) wt[nwt++] = *t;
+    else wt[next_out++ % 24] = *t;
 }
 void vk_capture_targets(const tex_t *const *ts, int n, uint64_t frame);
 void vk_watch_capture(uint64_t frame) {

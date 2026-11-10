@@ -156,6 +156,10 @@ static const char *const dr_name[DR_N] = {
 
 static PlatMutex rl = PLAT_MUTEX_INIT;
 static PlatCond rcv = PLAT_COND_INIT;   // item queued, item taken, item done
+// mlbts-native diagnosis (hitches): per timeline value, when its item was queued and when the replay started and
+// finished it (ns, kern_now_ns); read by gfx_fence_story for a long nvnSyncWait.
+#define FT_N 4096
+static struct { uint64_t value, enq, rs, re; int kind; } ft[FT_N];
 static ReplayItem rq[RQ_CAP];
 static int rq_head, rq_n, r_busy, r_started;
 static uint64_t r_presents_queued, r_presents_done, r_submit_done, game_frames;
@@ -208,6 +212,7 @@ static void replay_main(void *arg) {
         rq_head = (rq_head + 1) % RQ_CAP;
         rq_n--;
         r_busy = 1;
+        if (it.value && ft[it.value % FT_N].value == it.value) ft[it.value % FT_N].rs = kern_now_ns();
         plat_cond_broadcast(&rcv);
         plat_mutex_unlock(&rl);
         if (it.kind == RI_SUBMIT) {
@@ -225,12 +230,36 @@ static void replay_main(void *arg) {
             present_image(it.tex, it.has_crop ? it.crop : NULL, it.at, it.queued, frame, it.value);
         }
         plat_mutex_lock(&rl);
+        if (it.value && ft[it.value % FT_N].value == it.value) ft[it.value % FT_N].re = kern_now_ns();
         if (it.kind == RI_SUBMIT) r_submit_done = it.submit_no;
         else r_presents_done++;
         r_busy = 0;
         plat_cond_broadcast(&rcv);
     }
     return;
+}
+
+// One line on timeline value v for a long sync wait that began at t0: its queueing and replay relative to t0, the GPU's
+// completed value now, and the replay queue.
+void gfx_fence_story(uint64_t v, uint64_t t0, char *b, size_t n) {
+    if (!gfx_replay_async()) {
+        snprintf(b, n, "synchronous replay; GPU done %llu", (unsigned long long)vk_sync_fence_done());
+        return;
+    }
+    plat_mutex_lock(&rl);
+    typeof(ft[0]) e = ft[v % FT_N];
+    int q = rq_n, busy = r_busy;
+    plat_mutex_unlock(&rl);
+    double ms = 1e-6;
+    if (e.value != v)
+        snprintf(b, n, "value %llu not in the replay table (newest queued %llu); GPU done %llu; queue %d busy %d",
+                 (unsigned long long)v, (unsigned long long)ft[(v + FT_N - 1) % FT_N].value,
+                 (unsigned long long)vk_sync_fence_done(), q, busy);
+    else
+        snprintf(b, n, "%s queued %+.1f ms, replay start %+.1f end %+.1f ms (from the wait's start); GPU done %llu; queue %d busy %d",
+                 e.kind == RI_SUBMIT ? "submit" : "present", ((double)e.enq - (double)t0) * ms,
+                 e.rs ? ((double)e.rs - (double)t0) * ms : -1.0, e.re ? ((double)e.re - (double)t0) * ms : -1.0,
+                 (unsigned long long)vk_sync_fence_done(), q, busy);
 }
 
 static void wait_counted(int why, uint64_t t0) {   // rl held
@@ -273,6 +302,8 @@ static uint64_t replay_enqueue(ReplayItem *it) {
         core_back_unlocked(&away);
     }
     it->value = it->kind == RI_RELEASE ? 0 : vk_sync_reserve();   // a release signals nothing
+    if (it->value) ft[it->value % FT_N].value = it->value, ft[it->value % FT_N].enq = kern_now_ns(),
+                   ft[it->value % FT_N].rs = ft[it->value % FT_N].re = 0, ft[it->value % FT_N].kind = it->kind;
     rq[(rq_head + rq_n) % RQ_CAP] = *it;
     rq_n++;
     plat_cond_broadcast(&rcv);
@@ -512,7 +543,7 @@ static void vk_be_guest_read(uint64_t addr, uint64_t size) {
 static uint64_t small_done;
 static volatile int64_t cs_calls, cs_runs;   // diagnosis: syncs the CPU saw complete, and write-back scans they ran
 static void vk_be_cpu_synced(uint64_t fence) {
-    if ((plat_add64(&cs_calls, 1) + 1) % 20000 == 0)
+    if (plat_add64(&cs_calls, 1) % 4000000 == 0)
         rt_log("vk: CPU-synced fences: %lld, of them %lld scanned the dirty targets", (long long)cs_calls, (long long)cs_runs);
     if (!vk_texture_small_dirty() || fence <= __atomic_load_n(&small_done, __ATOMIC_ACQUIRE)) return;
     plat_add64(&cs_runs, 1);

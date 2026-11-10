@@ -1506,6 +1506,33 @@ static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int sto
     if (!view) {
         int di = dummy_index(res_view_type(r->type), ms);
         view = storage ? storage_dummy(di, r->format) : Z.img[di].view;
+        if (h) {   // mlbts-native diagnosis: a named texture that gets the placeholder, once per texture, view type and cause
+            static uint64_t seen[512];
+            static int nseen;
+            view_t v;
+            int hv;
+            const VkTexImage *img = vk_texture_by_id_locked((int)(h & 0xfffff), &v, &hv);
+            uint64_t key = (h & 0xfffff) * 0x9E3779B97F4A7C15ull ^ (uint64_t)r->type << 1 ^ (uint64_t)storage ^ (img ? 0 : 1ull << 63);
+            int known = 0;
+            for (int i = 0; i < nseen; i++) known |= seen[i] == key;
+            if (!known && nseen < 512) {
+                seen[nseen++] = key;
+                tex_t t;
+                int hd = img && vk_texture_slot_desc((int)(h & 0xfffff), &t);
+                rt_log("vk_exec: texture %#x (%s b%d) bound as a placeholder: %s; wanted view type %d%s, image type %d view type %d "
+                       "%ux%u layers %u levels %u vkfmt %d at %#llx (nvn target %d fmt %#x)",
+                       (unsigned)(h & 0xfffff), storage ? "storage image" : "texture", (int)r->binding,
+                       !img ? "no image for the slot" : "no view of the image", (int)res_view_type(r->type), ms ? " (multisample)" : "",
+                       img ? (int)img->type : -1, img ? (int)img->view_type : -1, img ? img->width : 0, img ? img->height : 0,
+                       img ? img->layers : 0, img ? img->levels : 0, img ? (int)img->format : 0,
+                       img ? (unsigned long long)img->addr : 0ull, hd ? (int)t.d.target : -1, hd ? (unsigned)t.d.format : 0);
+                if (img)
+                    rt_log("vk_exec:   view: %s levels %u+%u layers %u+%u; image usage %#x samples %u",
+                           hv ? "set" : "none", hv && v.set_levels ? v.base_level : 0, hv && v.set_levels ? v.nlevels : 0,
+                           hv && v.set_layers ? v.min_layer : 0, hv && v.set_layers ? v.nlayers : 0, (unsigned)img->usage,
+                           (unsigned)img->samples);
+            }
+        }
     }
     if (!samp) samp = r->type & 0x400 ? Z.samp_shadow : Z.samp;
     *out = (VkDescriptorImageInfo){separate || storage ? VK_NULL_HANDLE : samp, view, layout};
@@ -4190,6 +4217,42 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     twin_dispatch = 1;
     bind_resources(ex, info);
     twin_dispatch = 0;
+    // mlbts-native diagnosis: the lighting-probe shaders (MLB_DISPATCH_DUMP, hex FNV hashes; default the RTTS room's
+    // probe and cube generators) get the dump below whatever addresses they use, their first 8 dispatches each.
+    static uint32_t dd_want[16];
+    static int dd_n = -1;
+    if (dd_n < 0) {
+        const char *e = cfg_get("MLB_DISPATCH_DUMP");
+        if (!e) e = "6dfb3fe0,1760ce02,96b26045,029166ea,0e0c2eb9,257c230d,2ef7a42a";
+        dd_n = 0;
+        while (e && *e && dd_n < 16) {
+            char *end;
+            dd_want[dd_n++] = (uint32_t)strtoul(e, &end, 16);
+            e = *end == ',' ? end + 1 : NULL;
+        }
+    }
+    static struct { const void *prog; uint32_t h; } dd_cache[64];
+    uint32_t dd_h = 0;
+    if (dd_n) {   // the program's hash, cached per program object
+        int slot = (int)(((uintptr_t)ex->prog >> 4) % 64);
+        if (dd_cache[slot].prog == ex->prog) dd_h = dd_cache[slot].h;
+        else {
+            const uint8_t *ctl, *code;
+            uint32_t len;
+            dd_h = 2166136261u;
+            if (find_stage(ex->prog, NVN_STAGE_CS, &ctl, &code, &len))
+                for (uint32_t i = 0; i < len; i++) dd_h = (dd_h ^ code[i]) * 16777619u;
+            dd_cache[slot].prog = ex->prog, dd_cache[slot].h = dd_h;
+        }
+    }
+    int dd_hit = 0;
+    for (int i = 0; i < dd_n; i++) dd_hit |= dd_want[i] == dd_h;
+    if (dd_hit) {
+        static struct { uint32_t h; int n; } ddc[16];
+        int i = 0;
+        while (i < 16 && ddc[i].h && ddc[i].h != dd_h) i++;
+        if (i < 16 && ddc[i].n < 8) ddc[i].h = dd_h, ddc[i].n++, watch_dispatch = 1;
+    }
     if (watch_dispatch) {   // mlbts-native: what a dispatch storing into the watched range reads
         watch_dispatch = 0;
         const uint8_t *ctl, *code;
@@ -4238,7 +4301,7 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
         static struct { uint32_t h; int n; } ssd[32];
         int si = 0;
         while (si < 32 && ssd[si].h && ssd[si].h != h32) si++;
-        int dump = si < 32 && ssd[si].n < 3;
+        int dump = si < 32 && ssd[si].n < 8;
         if (dump) ssd[si].h = h32, ssd[si].n++;
         for (int i = 0; i < ns; i++) {
             int ubo, slot = ssbo_slot(&sr[i], NVN_STAGE_CS, &ubo);

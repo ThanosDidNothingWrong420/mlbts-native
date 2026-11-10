@@ -52,6 +52,8 @@ typedef struct Tex {
     uint8_t gpu_dirty;            // mirrored, and the GPU wrote the image after the last write-back to the storage
     uint32_t gpu_gen;             // page generation when the GPU write that set gpu_dirty was recorded
     uint64_t gpu_seq;             // order of that GPU write among all of them (gpu_writes)
+    uint64_t wseq, cseq;          // mlbts-native: the newest GPU write into the image (content_writes), and the write its
+                                  // content comes from (its own, or the alias source's when it was copied)
     uint64_t gpu_fence;           // fence of the submission that made that write (0: not recorded in one)
     uint64_t run_frame;           // mirrored: the frame of the newest GPU write
     uint8_t run;                  // frames in a row up to run_frame with a GPU write, counted up to WB_RUN
@@ -109,6 +111,7 @@ static Tex **owned;
 static int nowned, cowned;
 static uint64_t max_owned;   // largest storage size in owned[]
 static uint64_t gpu_writes;  // GPU writes into mirrored textures so far: Tex.gpu_seq
+static uint64_t content_writes;   // mlbts-native: GPU writes into any texture so far: Tex.wseq
 // Bumped whenever the entry a slot resolves to can change: an entry created or destroyed, released or taken back into
 // use (the slot lookup and the follow of a finalized slot read only by_key, by_addr and the released flags).
 static uint32_t tex_gen = 1;
@@ -1373,6 +1376,8 @@ static int alias_copy(Tex *e, const Tex *src, uint32_t levels) {
     return 1;
 }
 
+static int is_cube(const Tex *e);   // mlbts-native, below
+static int cube_log(void);           // mlbts-native, below
 static Tex *entry_of(const tex_t *t) {
     TexKey k;
     make_key(t, &k);
@@ -1433,6 +1438,7 @@ static Tex *entry_of(const tex_t *t) {
         if (tex_alias) {
             if (src && alias_copy(e, src, src_levels)) {
                 n_alias_copied++;
+                e->cseq = src->wseq;
                 if (e->pub.mirrored) {   // the content is src's GPU render, newer than the storage bytes
                     vk_mem_changed(e->pub.addr, e->t.L.size, 0, &e->wgen);
                     e->uploaded = 1;
@@ -1445,6 +1451,22 @@ static Tex *entry_of(const tex_t *t) {
                     if (e->pub.mirrored) n_alias_upload++;
                     else n_alias_uninit++;
                 }
+            }
+        }
+        if (is_cube(e) || alias) {   // mlbts-native diagnosis: lighting cubes and the arrays under them
+            int cube_there = is_cube(e);
+            for (Tex *p = nvn_hm_get(&by_addr, &k.addr); p && !cube_there; p = p->next_at) cube_there = !p->released && is_cube(p);
+            if (cube_there && cube_log())
+                rt_log("vk: %s %#llx fmt %#x %ux%ux%u levels %u created (usage %#x): %s%s (write %llu); %d released entr%s replaced",
+                       is_cube(e) ? "cube" : "non-cube entry over a cube's storage", (unsigned long long)k.addr,
+                       (unsigned)t->d.format, e->pub.width, e->pub.height, e->pub.layers, e->pub.levels, (unsigned)e->pub.usage,
+                       src ? "content copied from the " : alias ? "content uploaded from storage; other entries there: "
+                                                              : "no other entry there",
+                       src ? (is_cube(src) ? "cube there" : "array there") : alias ? "none usable" : "",
+                       (unsigned long long)e->cseq, ndead, ndead == 1 ? "y" : "ies");
+            if (is_cube(e)) {
+                void vk_watch_note_tex(const tex_t *t);   // vk_capture.c: saved at the next F12
+                vk_watch_note_tex(&e->t);
             }
         }
         for (int i = 0; i < ndead; i++) destroy_tex(dead[i]);   // after the alias copy that may read one of them
@@ -1509,6 +1531,7 @@ static void wb_cfg_init(void) {
 static int wb_wanted(const Tex *e) { return e->t.L.size <= wb_limit || e->run < WB_RUN; }
 
 static void gpu_wrote(Tex *e);
+static int cube_behind(const Tex *src);   // mlbts-native, below
 void vk_texture_gpu_written(const tex_t *t) {
     if (!t || !t->mem) return;
     if (vk_watch_hit((uint64_t)(uintptr_t)t->mem, t->L.size))
@@ -1525,6 +1548,14 @@ void vk_texture_gpu_written(const tex_t *t) {
 static void gpu_wrote(Tex *e) {
     make_fresh(e);   // a partial render keeps what the storage held before
     e->pub.gpu_owned = 1;
+    e->wseq = e->cseq = ++content_writes;
+    if (cube_behind(e)) {
+        tex_gen_bump(e->pub.addr);   // the cube's slot resolves again (cube_refresh)
+        if (cube_log())
+            rt_log("vk: array %#llx fmt %#x %ux%u written by the GPU (write %llu): a cube over its storage is behind",
+                   (unsigned long long)e->pub.addr, (unsigned)e->t.d.format, e->pub.width, e->pub.height,
+                   (unsigned long long)e->wseq);
+    }
     uint64_t f = vk_exec_recording_fence();
     if (f > e->wr_fence) e->wr_fence = f;
     if (e->pub.mirrored) {
@@ -1625,6 +1656,47 @@ void vk_texture_register(int id, const tex_t *t, const view_t *v) {
     unlock();
 }
 
+// mlbts-native: a cube entry over the storage of a 2D array a compute shader fills (MLB's environment and irradiance
+// probes) takes the array's content when it is created (entry_of), and then nothing refreshed it: a gpu-owned image is
+// never uploaded from storage again (make_fresh). When a scene rewrote its probes through the array, the cube kept
+// the previous scene's (the RTTS locker room lit like the bedroom). The array's write bumps its address's generation
+// while a cube there holds older content (gpu_wrote), and the cube's slot resolution copies the newer content in.
+static int is_cube(const Tex *e) {
+    return e->key.d.target == NVN_TEXTURE_TARGET_CUBEMAP || e->key.d.target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY;
+}
+static volatile int32_t n_cube_log;   // diagnosis: cube events logged (cube_log)
+static int cube_log(void) { return plat_inc32(&n_cube_log) <= 600; }
+static int cube_behind(const Tex *src) {   // src (not a cube) wrote content a live cube at its storage lacks
+    if (is_cube(src)) return 0;
+    for (Tex *p = nvn_hm_get(&by_addr, &src->key.addr); p; p = p->next_at)
+        if (p != src && !p->released && is_cube(p) && p->cseq < src->wseq) return 1;
+    return 0;
+}
+static void cube_refresh(Tex *e) {
+    Tex *src = NULL;
+    uint32_t lv = 0, l;
+    for (Tex *p = nvn_hm_get(&by_addr, &e->key.addr); p; p = p->next_at)
+        if (p != e && !p->released && !is_cube(p) && p->pub.gpu_owned && p->wseq > e->cseq &&
+            (!src || p->wseq > src->wseq) && (l = alias_compatible(e, p)))
+            src = p, lv = l;
+    if (!src) return;
+    if (!alias_copy(e, src, lv)) {
+        if (cube_log())
+            rt_log("vk: cube %#llx: newer array content (write %llu > %llu) but no replay is recording: not copied yet",
+                   (unsigned long long)e->pub.addr, (unsigned long long)src->wseq, (unsigned long long)e->cseq);
+        return;
+    }
+    void vk_watch_note_tex(const tex_t *t);   // vk_capture.c: saved at the next F12
+    vk_watch_note_tex(&e->t);
+    e->cseq = src->wseq;
+    e->pub.gpu_owned = 1;
+    if (e->pub.mirrored) vk_mem_changed(e->pub.addr, e->t.L.size, 0, &e->wgen), e->uploaded = 1;
+    if (cube_log())
+        rt_log("vk: cube %#llx fmt %#x %ux%u took newer content from the %ux%u array over its storage (%u levels)",
+               (unsigned long long)e->pub.addr, (unsigned)e->t.d.format, e->pub.width, e->pub.height, src->pub.width,
+               src->pub.height, lv);
+}
+
 // The entry slot s resolves to, and the view and has_view a caller gets with it (the slot's, with the descriptor's
 // swizzle when the entry is another descriptor at the same storage). NULL when the slot names no texture.
 static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
@@ -1633,6 +1705,7 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
     TexKey k;
     make_key(&s->t, &k);
     Tex *e = nvn_hm_get(&by_key, &k);
+    if (e && !e->released && is_cube(e)) cube_refresh(e);
     if (!e || e->released) {   // MNG hle_nvn.c: a finalized slot follows the live texture at its storage
         // Prefer the live entry that differs from the slot descriptor only in its swizzle: transient render targets
         // share storage, and the newest one at the address is usually another size. The map screen samples its
@@ -1648,13 +1721,17 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
         // RTTS room's environment cubes through 2D-array storage images and samples them as cubes, and the room's
         // lighting and some objects stayed black until something else created the cube entry (an F12 capture). Without
         // a cube entry the slot gets its own below (entry_of), which takes the array's content (alias_copy).
+        // And the other way: a slot that is not a cube follows no cube entry. The probe compute shaders bind the 2D
+        // array as a storage image, and once the cube entry existed (the array's released entry gone with its creation)
+        // the storage slot followed the cube, which has no storage usage: the shaders wrote into a placeholder and no
+        // later scene regenerated its probes (the RTTS locker room kept the bedroom's lighting). The array slot gets its
+        // own entry, the shaders write it, and the cube copies the newer content (cube_refresh).
         int want_cube = k.d.target == NVN_TEXTURE_TARGET_CUBEMAP || k.d.target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY;
         Tex *own = e, *any = NULL;
         e = NULL;
         for (Tex *p = nvn_hm_get(&by_addr, &k.addr); p; p = p->next_at) {
             if (p->released || linear_format(p->key.d.format) != linear_format(k.d.format)) continue;
-            if (want_cube && p->key.d.target != NVN_TEXTURE_TARGET_CUBEMAP && p->key.d.target != NVN_TEXTURE_TARGET_CUBEMAP_ARRAY)
-                continue;
+            if (want_cube != is_cube(p)) continue;
             if (!any) any = p;
             if (same_but_swizzle(&p->key, &k)) { e = p; break; }
         }
