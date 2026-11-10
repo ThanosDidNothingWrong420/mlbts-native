@@ -4044,6 +4044,52 @@ static void draw_note(VkExec *ex, const char *kind, int prim, int count) {
                               (unsigned long long)ex->ssbo[NVN_STAGE_VS][i].size);
         rt_log("%s", line);
     }
+    {   // mlbts-native diagnosis (faint UI elements): the vertices' first two floats of a0 (bounding box) and every
+        // RGBA8 attribute (fmt 0x25: vertex colour, its alpha the element's opacity), min and max per channel; and the
+        // vertex stage's c3 (the UI's position transform)
+        va_st v0;
+        memcpy(&v0, &ex->pipe.vattr[0], sizeof v0);
+        uint32_t s = v0.stream, st = s < 16 ? ex->pipe.vstream[s].stride : 0;
+        uint64_t base = s < 16 ? ex->vbuf[s].address : 0, size = s < 16 ? ex->vbuf[s].size : 0;
+        uint32_t nv = st ? (uint32_t)(size / st) : 0;
+        if (nv > 4096) nv = 4096;
+        if (ex->pipe.vattr[0] && base && nv && plat_mem_readable(base, (uint64_t)nv * st)) {
+            float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+            uint8_t cmin[4] = {255, 255, 255, 255}, cmax[4] = {0};
+            int col = -1;
+            for (int i = 1; i < 8 && col < 0; i++) {
+                va_st va;
+                memcpy(&va, &ex->pipe.vattr[i], sizeof va);
+                if (ex->pipe.vattr[i] && va.fmt == 0x25 && va.stream == s && va.offset + 4 <= st) col = (int)va.offset;
+            }
+            for (uint32_t k = 0; k < nv; k++) {
+                const uint8_t *p = (const uint8_t *)(uintptr_t)(base + (uint64_t)k * st);
+                float xy[2];
+                memcpy(xy, p + v0.offset, 8);
+                if (xy[0] < x0) x0 = xy[0];
+                if (xy[0] > x1) x1 = xy[0];
+                if (xy[1] < y0) y0 = xy[1];
+                if (xy[1] > y1) y1 = xy[1];
+                if (col >= 0)
+                    for (int c = 0; c < 4; c++) {
+                        uint8_t b = p[col + c];
+                        if (b < cmin[c]) cmin[c] = b;
+                        if (b > cmax[c]) cmax[c] = b;
+                    }
+            }
+            char cl[96] = "";
+            if (col >= 0)
+                snprintf(cl, sizeof cl, "; colour min %u %u %u %u max %u %u %u %u", cmin[0], cmin[1], cmin[2], cmin[3],
+                         cmax[0], cmax[1], cmax[2], cmax[3]);
+            rt_log("drawlog   verts %u: a0 x %g..%g y %g..%g%s", nv, x0, x1, y0, y1, cl);
+        }
+        const p_bind_buf *u = &ex->ubo[0][0];
+        if (u->addr && u->size >= 64 && plat_mem_readable(u->addr, 64)) {
+            const float *f = (const float *)(uintptr_t)u->addr;
+            rt_log("drawlog   vs c3: %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g", f[0], f[1], f[2], f[3], f[4],
+                   f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
+        }
+    }
     for (int slot = 0; slot < 3; slot++) {   // fragment constant buffers c3..c5: the first floats (guest memory)
         const p_bind_buf *u = &ex->ubo[1][slot];
         if (!u->addr || !u->size || !plat_mem_readable(u->addr, u->size < 64 ? u->size : 64)) continue;
