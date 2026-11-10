@@ -1516,6 +1516,11 @@ static Tex *entry_of(const tex_t *t) {
                     rt_log("watch:   released candidate fmt %#x %ux%u: compatible levels %u, gpu content %d",
                            (unsigned)p->t.d.format, (unsigned)p->t.d.width, (unsigned)p->t.d.height, alias_compatible(e, p),
                            alias_has_gpu_content(p));
+                // mlbts-native: one whose GPU content the new entry cannot take stays (released): a later entry of its
+                // shape can. MLB recreates its BC encoder's descriptors on every created-player hairstyle; the 1x1 block
+                // image of the last level, created at the texture's storage, dropped the BC7 hair texture whose new
+                // blocks were in its image only, and the hair texture recreated next uploaded the previous style.
+                if (alias_has_gpu_content(p) && !alias_compatible(e, p)) continue;
                 if (ndead < 16) dead[ndead++] = p;
                 else destroy_tex(p);
                 continue;
@@ -1819,6 +1824,13 @@ static void cube_refresh(Tex *e) {
     e->cseq = src->wseq;
     e->pub.gpu_owned = 1;
     if (e->pub.mirrored) vk_mem_changed(e->pub.addr, e->t.L.size, 0, &e->wgen), e->uploaded = 1;
+    if (!cube && e->pub.mirrored) {
+        // mlbts-native: a block view's new content is GPU content the storage may not hold (the block image may never
+        // be written back): marked as such, so an entry created over this one when the game recreates the descriptor
+        // takes it (entry_of, alias_has_gpu_content) instead of the storage's older blocks
+        e->gpu_dirty = 1;
+        storage_rewritten(e, 0, &e->gpu_gen);
+    }
     if (cube_log())
         rt_log("vk: %s %#llx fmt %#x %ux%u took newer content from the %ux%u %s over its storage (%u levels)",
                cube ? "cube" : "block-compressed texture", (unsigned long long)e->pub.addr, (unsigned)e->t.d.format,
