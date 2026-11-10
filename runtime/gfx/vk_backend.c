@@ -136,7 +136,10 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
     pending = 1;
     plat_cond_broadcast(&pcv);
     plat_mutex_unlock(&pl);
-    if (rdoc_active()) { vk_present_drain(); rdoc_after_present(frame); }
+    // mlbts-native: no vk_present_drain here (TotK's rdoc did one): with the replay queue it held the replay thread on the
+    // present thread and the game stalled at its first loading screen under RenderDoc. The frame's own submissions are
+    // on the queue before this; its blit may land in the next capture instead, which nothing needs.
+    if (rdoc_active()) rdoc_after_present(frame);
 }
 
 // ---- Asynchronous replay

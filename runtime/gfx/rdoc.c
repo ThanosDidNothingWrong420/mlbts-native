@@ -4,8 +4,8 @@
 // present to the next. In menus the game presents some frames without drawing anything new, so such a capture held only
 // the present's blit (2 of 3 captures of a glitched menu). Here F12 is taken over through the in-application API: the
 // capture starts at a present and ends at the first present after the game submitted work, so it always holds a game
-// frame (and the presents with nothing in between). rdoc_active makes every present drain (vk_backend.c), so the
-// capture's start and end fall between the frame's submissions and its present. Outside RenderDoc nothing runs.
+// frame (and the presents with nothing in between). Start and end come after the present was handed to the present
+// thread, so the frame's submissions are inside; its blit may fall in either capture. Outside RenderDoc nothing runs.
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
