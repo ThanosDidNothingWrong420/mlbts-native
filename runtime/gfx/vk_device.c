@@ -172,8 +172,7 @@ static int create_instance(void) {
 }
 
 static const char *const k_required_ext[] = {
-    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
-    VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME};
+    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME};
 
 // Name of the first missing required extension, or NULL.
 static const char *missing_required(VkPhysicalDevice pd) {
@@ -261,6 +260,17 @@ static int pick_device(void) {
         }
     free(qp);
     rt_log("vk: using gpu %d: %s", best, g_vk.props.deviceName);
+    // Guest pages imported as GPU memory. RenderDoc hides the extension (it cannot capture memory it does not own):
+    // under it the pools are shadow copies instead (vk_memory.c), slower but the same content.
+    uint32_t ne = 0;
+    vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
+    VkExtensionProperties *ep = calloc(ne ? ne : 1, sizeof *ep);
+    vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, ep);
+    g_vk.has_host_import = has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    free(ep);
+    void vk_mem_no_import(void);   // vk_memory.c: before vk_mem_class_log picks the memory mode
+    if (!g_vk.has_host_import)
+        vk_mem_no_import(), rt_log("vk: no VK_EXT_external_memory_host (a capture layer such as RenderDoc): shadow pool storage");
     vk_mem_class_log(&g_vk.props, &g_vk.mem_props);
     return 1;
 }
@@ -296,6 +306,7 @@ static int create_device(void) {
     const char *ext[48];
     uint32_t n_ext = 0;
     for (size_t i = 0; i < sizeof k_required_ext / sizeof *k_required_ext; i++) ext[n_ext++] = k_required_ext[i];
+    if (g_vk.has_host_import) ext[n_ext++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;   // pick_device
 
     FeatureChain *c = calloc(1, sizeof *c);
     void **tail = &c->f2.pNext;
@@ -427,7 +438,8 @@ static int create_device(void) {
     else { g_vk.xfer_queue = g_vk.gfx_queue; g_vk.xfer_shared = 1; }
 
     VkPhysicalDeviceExternalMemoryHostPropertiesEXT emh = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
-    VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &emh};
+    VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                                      .pNext = g_vk.has_host_import ? &emh : NULL};
     vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
     g_vk.min_imported_host_alignment = (uint32_t)emh.minImportedHostPointerAlignment;
     vk_caps_init(&g_vk);

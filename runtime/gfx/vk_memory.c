@@ -1234,6 +1234,8 @@ static PlatMutex mirror_stat_lock = PLAT_MUTEX_INIT;
 static volatile int64_t m_live_n, m_live_bytes, m_refused_n[MR_N], m_refused_bytes[MR_N];
 static volatile int64_t m_flush_calls, m_flush_bytes, v_pages, v_skipped, v_mismatch;
 
+static int mem_no_import;
+void vk_mem_no_import(void) { mem_no_import = 1; }   // vk_device.c pick_device: no VK_EXT_external_memory_host
 static void mirror_mode(int discrete) {
     const char *e = cfg_value("TOTK_MEMORY");
     int mode = discrete ? 1 : 0;   // 0 import, 1 mirror, 2 verify
@@ -1264,8 +1266,10 @@ static void mirror_mode(int discrete) {
 #else
     shadow_on = !sh || !*sh || strcmp(sh, "0");
 #endif
+    int no_import = mem_no_import;   // a capture layer (RenderDoc) hides the extension
+    if (no_import) shadow_on = 1;
     if (shadow_on) rt_log("mem: shadow storage: CPU-visible pools are host-visible copies of guest memory, not imports%s",
-                          sh && *sh ? " (TOTK_SHADOW)" : "");
+                          no_import ? " (no VK_EXT_external_memory_host)" : sh && *sh ? " (TOTK_SHADOW)" : "");
     rt_log("mem: mode %s (%s): %s", mode == 2 ? "verify" : mode ? "mirror" : "import", why,
            mode ? "pools used as buffers get a device-local mirror" : "every CPU-visible pool is imported host memory");
     // Import is the integrated-GPU mode. On a discrete card every draw reads the pools over PCIe (the comment above

@@ -10,7 +10,7 @@
 #include "gfx.h"       // GfxShader, GfxShaderRes, GfxShaderAnswers (pipelines block)
 
 // Required (device choice fails without them): Vulkan 1.3; VK_KHR_swapchain, VK_KHR_push_descriptor,
-// VK_EXT_depth_clip_control, VK_EXT_external_memory_host; features timelineSemaphore, dynamicRendering,
+// VK_EXT_depth_clip_control; features timelineSemaphore, dynamicRendering,
 // synchronization2, shaderStorageImageWriteWithoutFormat, depthClipControl, shaderInt64, samplerAnisotropy,
 // independentBlend, geometryShader, textureCompressionBC.
 // Optional (flag set in VkCtx when enabled): the has_* members.
@@ -34,6 +34,8 @@ typedef struct VkCtx {
         has_conditional_rendering, has_transform_feedback, has_provoking_vertex, has_device_fault, has_memory_budget,
         has_robustness2, has_buffer_device_address, has_fragment_shader_interlock, has_buffer_marker,
         has_nv_checkpoints,                 // VK_NV_device_diagnostic_checkpoints (TOTK_PASS_CRUMBS=1, vk_crumbs.c)
+        has_host_import,                    // VK_EXT_external_memory_host: without it (RenderDoc does not offer it)
+                                            // CPU-visible pools are shadow copies (vk_memory.c, TOTK_SHADOW)
         has_astc_ldr,                       // textureCompressionASTC_LDR (enabled when reported)
         has_calibrated,                     // VK_KHR/EXT_calibrated_timestamps (GPU idle split in the perf line)
         has_hdr_metadata;                   // VK_EXT_hdr_metadata (vk_hdr.c vk_hdr_metadata)

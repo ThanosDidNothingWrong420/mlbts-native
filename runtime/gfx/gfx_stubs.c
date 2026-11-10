@@ -193,7 +193,7 @@ void menu_overlay_draw(VkCommandBuffer cb) { (void)cb; }
 // <profile>/shot-<frame>.png through gfx_present.c's capture path (the one TotK's menu test shots use).
 void vk_drawlog_arm_at(long frame);   // vk_exec_draw.c
 // One frame's capture, `ahead` presents from now: its draws in the log (MLB_DRAWLOG format) and its picture as
-// <profile>/shot-<frame>.png. F12 in the game window asks for one; so does MLB_DRAWLOG=game, 10 s after the game logs
+// <profile>/shot-<frame>.png. F12 (F9 under RenderDoc) in the game window asks for one; so does MLB_DRAWLOG=game, 10 s after the game logs
 // ===GAME ENTERED=== (services.c).
 static volatile long capture_at = -1;
 void gfx_capture_arm(long ahead) {
@@ -209,7 +209,13 @@ int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot) {
     HWND fg = GetForegroundWindow();
     DWORD pid = 0;
     if (fg) GetWindowThreadProcessId(fg, &pid);
-    int f12 = pid == GetCurrentProcessId() && (GetAsyncKeyState(VK_F12) & 0x8001);
+    // Under RenderDoc F12 (and Print Screen) is its frame capture: ours moves to F9, so one key takes one capture.
+    static int key;
+    if (!key) {
+        key = GetModuleHandleA("renderdoc.dll") ? VK_F9 : VK_F12;
+        if (key == VK_F9) rt_log("capture: RenderDoc is loaded: F12 is its capture, ours (draw log, render targets) is F9");
+    }
+    int f12 = pid == GetCurrentProcessId() && (GetAsyncKeyState(key) & 0x8001);
     if (f12 && !f12_was) gfx_capture_arm(2);
     f12_was = f12 != 0;
     if ((long)frame == __atomic_load_n(&capture_at, __ATOMIC_RELAXED)) {
