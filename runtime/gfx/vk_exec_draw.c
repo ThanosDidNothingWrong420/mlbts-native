@@ -2341,7 +2341,7 @@ static void bind_vertex_buffers(VkExec *ex) {
     uint32_t used = vb_used_on() && B.st_valid ? B.vmask : VK_PIPE_ALL_BINDINGS;
     // A stream whose range is the one its bound buffer was resolved from, with no pool or mirror change since
     // (vk_mem_gen, read before any resolve), resolves to that buffer again: most draws change one stream or none.
-    uint64_t gen = vk_mem_gen();
+    uint64_t gen = vk_mem_gen() + vk_usnap_gen();   // both only grow (mlbts-native: vertex ranges from the copy)
     int same_gen = B.vb_valid && B.vgen == gen;
     uint32_t res = 0;
     for (int b = 0; b < 17; b++) {
@@ -2351,6 +2351,11 @@ static void bind_vertex_buffers(VkExec *ex) {
         const NVNbufferRange *r = &ex->vbuf[b];
         if (same_gen && (B.vres >> b & 1) && B.vin[b].address == r->address && B.vin[b].size == r->size) {
             vb[b] = B.vb[b], vo[b] = B.vo[b], vsz[b] = B.vsz[b], vcls[b] = B.vcls[b], vpool[b] = B.vpool[b];
+            continue;
+        }
+        VkDescriptorBufferInfo ub;   // mlbts-native: the bytes as of the submit call (vk_usnap.c)
+        if (r->address && r->size && r->size <= VK_USNAP_MAX && vk_usnap_find(r->address, r->size, 1, &ub)) {
+            vb[b] = ub.buffer, vo[b] = ub.offset, vsz[b] = ub.range;
             continue;
         }
         VkMemSpan sp;
@@ -4150,8 +4155,10 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
         vk_mem_count(VK_MCLS_SCRATCH, VK_MUSE_IB, 2 * bytes);
         uint16_t *ix = malloc(sizeof *ix * (size_t)d->count);
         if (!ix) rt_fatal("vk: out of memory");
+        const uint8_t *src = vk_usnap_bytes(d->ibuf, bytes);   // mlbts-native: as of the submit call
+        if (!src) src = (const uint8_t *)(uintptr_t)d->ibuf;
         for (int i = 0; i < d->count; i++) {
-            uint8_t v = ((const uint8_t *)(uintptr_t)d->ibuf)[i];
+            uint8_t v = src[i];
             ix[i] = restart && v == 0xff ? 0xffff : v;
         }
         bind_index(ex, ix, sizeof *ix * (size_t)d->count, VK_INDEX_TYPE_UINT16);
@@ -4159,11 +4166,18 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
     } else if (sp.offset % isize[d->itype]) {
         return warn_once(W_INDEX, "index buffer %#llx is not aligned to its index size: draw skipped", (unsigned long long)d->ibuf);
     } else {
-        VK_MEM_USE(sp);
-        vkCmdBindIndexBuffer(ex->cb, sp.buffer, sp.offset, d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
-        ex->recorded++;
-        vk_mem_count(sp.cls, VK_MUSE_IB, bytes);
-        VK_MEM_BOUND(sp);
+        VkDescriptorBufferInfo ub;   // mlbts-native: the index bytes as of the submit call (vk_usnap.c)
+        if (bytes <= VK_USNAP_MAX && vk_usnap_find(d->ibuf, bytes, isize[d->itype], &ub)) {
+            sp.buffer = ub.buffer, sp.offset = ub.offset;
+            vkCmdBindIndexBuffer(ex->cb, sp.buffer, sp.offset, d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+            ex->recorded++;
+        } else {
+            VK_MEM_USE(sp);
+            vkCmdBindIndexBuffer(ex->cb, sp.buffer, sp.offset, d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+            ex->recorded++;
+            vk_mem_count(sp.cls, VK_MUSE_IB, bytes);
+            VK_MEM_BOUND(sp);
+        }
     }
     vkCmdDrawIndexed(ex->cb, (uint32_t)d->count, d->instances > 0 ? (uint32_t)d->instances : 1, 0, d->base_vertex,
                      (uint32_t)d->base_instance);
