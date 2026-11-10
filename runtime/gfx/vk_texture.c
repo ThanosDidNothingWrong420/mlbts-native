@@ -352,9 +352,7 @@ int vk_watch_hit(uint64_t a, uint64_t n) {
         const char *e = cfg_get("MLB_WATCH");
         // Off by default. The RTTS room's lighting (player probes and environment cubes) was traced with
         // MLB_WATCH=1663cce00,e10000;166204e00,1c8000;1679bb600,80000;167f7de00,80000;168001e00,1800;167a3f600,1800
-        // mlbts-native: default for now, the created player's hair layer (a 256x128 RGBA8 image with 8 levels the GPU
-        // draws and the BC encoder compresses; stale hairstyles). Its draws add the textures they sample.
-        if (!e || !*e) e = "139b3b000,40000";
+        if (!e || !*e) e = "off";
         int k = 0;
         while (e && *e && k < WATCH_N && strcmp(e, "off")) {
             char *end;
@@ -893,6 +891,9 @@ static void astc_check(const Tex *e, const uint8_t *raw, const VkAstcRegion *ar,
 #define UPLOAD_HELD_MAX (48ull << 20)
 
 static int upload_gpu(Tex *e);
+// mlbts-native: the levels an upload copies (bit per level; all by default). make_fresh_snap narrows it to the levels
+// whose storage the CPU rewrote in a GPU-owned image.
+static uint32_t up_lvmask = ~0u;
 
 // The CPU side of upload: deswizzles (and decodes or expands) into staging buffers, then copies them into the image.
 static void upload_cpu(Tex *e) {
@@ -910,6 +911,7 @@ static void upload_cpu(Tex *e) {
     VkDeviceSize total = 0, decoded = 0;
     for (uint32_t lv = 0; lv < levels; lv++)
         for (uint32_t ly = 0; ly < layers; ly++) {
+            if (lv < 32 && !(up_lvmask >> lv & 1)) continue;   // mlbts-native: a level the upload leaves alone
             uint32_t w = mip(d->width, lv), h = one_d ? 1 : mip(d->height, lv), sl = is3d ? mip(d->depth, lv) : 1;
             uint64_t texels = (uint64_t)w * h * sl, raw = (uint64_t)(w + bw - 1) / bw * bpb * ((h + bh - 1) / bh) * sl;
             uint64_t out = agpu ? raw : astc ? texels * 4 : rgb ? texels * (uint64_t)bpb / 3 * 4 : raw;
@@ -918,6 +920,7 @@ static void upload_cpu(Tex *e) {
             total += (out + 15) & ~15ull;
             decoded += texels * 4;
         }
+    n = k;   // mlbts-native: up_lvmask may have left levels out
     VkBuffer sb, rbuf = VK_NULL_HANDLE;
     VmaAllocation ralloc = NULL;
     uint8_t *rmap = NULL, *raw_copy = NULL;
@@ -1039,6 +1042,7 @@ static int upload_gpu(Tex *e) {
     VkDeviceSize max_dst = DESWZ_CHUNK;
     for (uint32_t lv = 0; ok && lv < levels; lv++)
         for (uint32_t ly = 0; ok && ly < layers; ly++) {
+            if (lv < 32 && !(up_lvmask >> lv & 1)) continue;   // mlbts-native: a level the upload leaves alone
             uint32_t row_bytes, rows, slices, gbpb;
             uint64_t base;
             unsigned th, td;
@@ -1064,6 +1068,7 @@ static int upload_gpu(Tex *e) {
             if (agpu) ar[k] = (VkAstcRegion){.w = w, .h = h, .slices = sl, .level = lv, .layer = ly};
             k++;
         }
+    if (ok && up_lvmask != ~0u) n = k;   // mlbts-native: up_lvmask left levels out
     if (!ok || k != n || !vk_deswz_fits(sp.offset, t->L.size, dr, (int)n, max_dst)) {
         free(dr), free(rg), free(ar);
         return up_why = !ok || k != n ? UP_GEOM : UP_LIMITS, 0;
@@ -1249,8 +1254,13 @@ static int storage_rewritten(const Tex *e, uint32_t since, uint32_t *now) {
 }
 
 // A mirrored texture is uploaded on first use and again when its storage pages carry a newer write generation.
+static int cpu_rewrite_refresh(Tex *e);   // mlbts-native, below
 static void make_fresh(Tex *e) {
-    if (!e->pub.mirrored || e->pub.gpu_owned) return;
+    if (!e->pub.mirrored) return;
+    if (e->pub.gpu_owned) {   // mlbts-native: CPU data written over its GPU content (cpu_rewrite_refresh)
+        cpu_rewrite_refresh(e);
+        return;
+    }
     uint64_t size = e->t.L.size;
     if (!e->uploaded) {
         vk_mem_changed(e->pub.addr, size, 0, &e->wgen);   // resets the write bits before the storage is read
@@ -1269,6 +1279,61 @@ static void make_fresh(Tex *e) {
 // after it, during this replay) keeps its write-watch bit and is caught by the next submission's snapshot.
 static volatile int32_t n_rewrite_log;
 static uint64_t n_rewrite_up;      // GPU-owned textures uploaded again after a CPU rewrite (perf line in the cube flush)
+// mlbts-native: for a GPU-owned mirrored image, the levels the CPU rewrote take the storage again; 1 when it uploaded.
+static int cpu_rewrite_refresh(Tex *e) {
+    // mlbts-native: the CPU rewrote storage of an image that holds GPU content: the levels it rewrote take the
+    // storage again, the others keep what the GPU made. A GPU-owned image was never uploaded again, so new CPU
+    // data at the same storage kept the old content: MLB loads each created-player hairstyle's full-size layer
+    // into the same buffer and makes its smaller levels on the GPU (scaled copies) before its BC encoder
+    // compresses it, and every later hairstyle showed the first one's hair. A level counts as rewritten when a
+    // page of its storage was written after the image's GPU content (gpu_gen) or its last upload (wgen); the
+    // storage of the other levels may not hold their GPU content (gpu_dirty), so they are left as they are. Arrays
+    // and 3D images (levels interleaved with layers) are uploaded whole, only when every GPU write was written back.
+    if (!e->uploaded) return 0;
+    int wh = vk_watch_hit(e->pub.addr, e->t.L.size);
+    const nvn_texdesc *d = &e->t.d;
+    uint32_t base = e->gpu_gen > e->wgen ? e->gpu_gen : e->wgen, now = base, nw, levels = e->pub.levels;
+    uint32_t mask = 0;
+    int simple = e->pub.layers == 1 && d->target != NVN_TEXTURE_TARGET_3D && !nvn_tex_is_linear(d) && levels <= 32;
+    if (simple) {
+        for (uint32_t lv = 0; lv < levels; lv++) {
+            uint64_t off = nvn_tex_level_offset(d, lv), end = lv + 1 < levels ? nvn_tex_level_offset(d, lv + 1) : e->t.L.size;
+            if (end > e->t.L.size) end = e->t.L.size;
+            if (end <= off) continue;
+            // pages wholly inside the level: a page it shares with a neighbour (another level, other data) is no
+            // evidence; a level within one shared page is not checked
+            uint64_t lo = (e->pub.addr + off + 0xfff) & ~0xfffull, hi = (e->pub.addr + end) & ~0xfffull;
+            if (hi <= lo) continue;
+            n_checks++;
+            if (vk_mem_changed_snap(lo, hi - lo, base, submit_epoch, &nw) == 1) mask |= 1u << lv;
+            if (nw > now) now = nw;
+        }
+    } else {
+        for (Tex *p = nvn_hm_get(&by_addr, &e->key.addr); p; p = p->next_at)
+            if (p->gpu_dirty) return 0;   // GPU content that is not in the storage yet
+        uint64_t lo = (e->pub.addr + 0xfff) & ~0xfffull, hi = (e->pub.addr + e->t.L.size) & ~0xfffull;
+        if (hi <= lo) return 0;
+        n_checks++;
+        if (vk_mem_changed_snap(lo, hi - lo, base, submit_epoch, &now) == 1) mask = ~0u;
+    }
+    if (wh) rt_log("watch: binding of GPU-owned %#llx fmt %#x %ux%u (%u levels, gpu_dirty %u): levels the CPU rewrote "
+                   "since generation %u: %#x", (unsigned long long)e->pub.addr, (unsigned)d->format, e->pub.width,
+                   e->pub.height, levels, e->gpu_dirty, base, mask);
+    if (!mask) return 0;
+    uint32_t all = levels >= 32 ? ~0u : (1u << levels) - 1;
+    log_limited(&n_rewrite_log, "vk: texture %#llx fmt %#x %ux%u: the CPU rewrote levels %#x of %#x over GPU content; "
+                "uploaded again", (unsigned long long)e->pub.addr, (unsigned)d->format, e->pub.width, e->pub.height,
+                mask & all, all);
+    e->wgen = now;
+    if ((mask & all) == all) e->pub.gpu_owned = 0;   // every level is the CPU's again
+    up_lvmask = mask;
+    upload(e);
+    up_lvmask = ~0u;
+    e->cseq = ++content_writes;   // newer than any block image or array content over the storage
+    n_rewrite_up++;
+    return 1;
+}
+
 static void make_fresh_snap(Tex *e) {
     if (!e->pub.mirrored) {
         if (vk_watch_hit(e->pub.addr, e->t.L.size))
@@ -1289,46 +1354,7 @@ static void make_fresh_snap(Tex *e) {
         return;
     }
     if (e->pub.gpu_owned) {
-        // mlbts-native: the CPU rewrote the storage of an image whose GPU content the storage already holds (written
-        // back, or copied in from a block image that was): the image takes the storage again. A GPU-owned image was
-        // never uploaded again, so new CPU data at the same storage under the same descriptor kept the old GPU
-        // content: MLB's created-player hair and head textures (their BC7 entries were filled by the GPU encoder)
-        // kept the previous hairstyle when the next one loaded there. Only pages wholly inside the storage count (a
-        // neighbour's write is not a rewrite), and not while GPU content waits for its write-back (gpu_dirty).
-        int wh = vk_watch_hit(e->pub.addr, e->t.L.size);
-        if (e->gpu_dirty || !e->uploaded) {
-            if (wh) rt_log("watch: binding of GPU-owned %#llx fmt %#x %ux%u: not checked (%s)", (unsigned long long)e->pub.addr,
-                           (unsigned)e->t.d.format, e->pub.width, e->pub.height,
-                           e->gpu_dirty ? "its GPU content awaits a write-back" : "never uploaded");
-            return;
-        }
-        for (Tex *p = nvn_hm_get(&by_addr, &e->key.addr); p; p = p->next_at)
-            if (p->gpu_dirty) {   // another image's GPU content is not in the storage yet
-                if (wh) rt_log("watch: binding of GPU-owned %#llx fmt %#x %ux%u: not checked (the %ux%u fmt %#x image "
-                               "there awaits a write-back)", (unsigned long long)e->pub.addr, (unsigned)e->t.d.format,
-                               e->pub.width, e->pub.height, p->pub.width, p->pub.height, (unsigned)p->t.d.format);
-                return;
-            }
-        uint64_t lo = (e->pub.addr + 0xfff) & ~0xfffull, hi = (e->pub.addr + e->t.L.size) & ~0xfffull;
-        if (hi <= lo) {
-            if (wh) rt_log("watch: binding of GPU-owned %#llx: fills no page of its own, not checked",
-                           (unsigned long long)e->pub.addr);
-            return;
-        }
-        uint32_t base = e->gpu_gen > e->wgen ? e->gpu_gen : e->wgen, now;
-        n_checks++;
-        int ch = vk_mem_changed_snap(lo, hi - lo, base, submit_epoch, &now);
-        if (wh) rt_log("watch: binding of GPU-owned %#llx fmt %#x %ux%u: CPU rewrite since generation %u: %d (now %u)",
-                       (unsigned long long)e->pub.addr, (unsigned)e->t.d.format, e->pub.width, e->pub.height, base, ch, now);
-        if (ch != 1) return;
-        log_limited(&n_rewrite_log, "vk: texture %#llx fmt %#x %ux%u: the CPU rewrote the storage of GPU content; "
-                    "uploaded again", (unsigned long long)e->pub.addr, (unsigned)e->t.d.format, e->pub.width,
-                    e->pub.height);
-        e->pub.gpu_owned = 0;
-        vk_mem_changed(e->pub.addr, e->t.L.size, 0, &e->wgen);   // resets the write bits before the storage is read
-        upload(e);
-        e->cseq = ++content_writes;   // newer than any block image or array content over the storage
-        n_rewrite_up++;
+        cpu_rewrite_refresh(e);
         return;
     }
     uint32_t now;
