@@ -2282,12 +2282,82 @@ int vk_texture_read_image(const tex_t *t, const view_t *v, const NVNcopyRegion *
 // layer 0. A difference means the image missed CPU writes (an upload the write tracking did not ask for); equal bytes
 // with a sliced image on screen mean the storage itself holds them (the game's data, or its loading). Each address once
 // per capture; at most 8 MiB.
+// mlbts-native diagnosis (sliced menu images whose image matched the storage): how the zero bytes of a large texture's
+// storage lie. A load that stopped part way leaves the storage's tail (block-linear: the last rows, and the right part of
+// the last band) zero; dark image content leaves zero blocks spread out. The texture is saved as a PNG with the capture
+// (vk_watch_note_tex: shot-2<frame>-*.png) and its storage checked again 2 and 10 s later: whether the game filled it in.
+typedef struct { tex_t t; uint64_t hash, zero, f0; uint32_t n_up; int stage; } VerifyLater;
+static VerifyLater vlater[16];
+static int nvlater;
+static uint64_t storage_hash(const uint8_t *p, uint64_t n, uint64_t *zero) {
+    uint64_t h = 1469598103934665603ull, z = 0, w;
+    uint64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        memcpy(&w, p + i, 8);
+        z += w == 0 ? 8 : 0;
+        h = (h ^ w) * 1099511628211ull;
+    }
+    for (; i < n; i++) z += p[i] == 0, h = (h ^ p[i]) * 1099511628211ull;
+    *zero = z;
+    return h;
+}
+static void verify_layout(const tex_t *t, const Tex *e) {
+    const uint8_t *p = t->mem;
+    uint64_t n = t->L.size, tail = 0, zpages = 0, runs = 0, first = UINT64_MAX;
+    while (tail < n && !p[n - 1 - tail]) tail++;
+    int prev = 0;
+    for (uint64_t o = 0; o < n; o += 4096) {
+        uint64_t m = n - o < 4096 ? n - o : 4096, k = 0;
+        while (k < m && !p[o + k]) k++;
+        int z = k == m;
+        if (z) {
+            zpages++;
+            if (!prev) runs++;
+            if (first == UINT64_MAX) first = o;
+        }
+        prev = z;
+    }
+    void vk_watch_note_tex(const tex_t *t);   // vk_capture.c: saved with the capture
+    vk_watch_note_tex(t);
+    rt_log("verify:   storage of %#llx (%llu bytes): %llu all-zero 4 KiB pages in %llu runs, the first at offset %#llx; "
+           "trailing zero bytes %llu (%.1f%%); saved with the capture as one of shot-2<frame>-*.png",
+           (unsigned long long)(uintptr_t)t->mem, (unsigned long long)n, (unsigned long long)zpages,
+           (unsigned long long)runs, (unsigned long long)(first == UINT64_MAX ? 0 : first), (unsigned long long)tail,
+           n ? 100.0 * (double)tail / (double)n : 0.0);
+    if (nvlater < 16) {
+        VerifyLater *v = &vlater[nvlater++];
+        v->t = *t, v->hash = storage_hash(p, n, &v->zero), v->f0 = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+        v->n_up = e->n_up, v->stage = 0;
+    }
+}
+// Replay, every frame (vk_exec.c): the storages verify_layout noted, 2 and 10 s after the capture.
+void vk_texture_verify_frame(uint64_t frame) {
+    for (int i = 0; i < nvlater; i++) {
+        VerifyLater *v = &vlater[i];
+        uint64_t due = v->f0 + (v->stage ? 600 : 120);
+        if (v->stage > 1 || frame < due) continue;
+        uint64_t zero, h = storage_hash(v->t.mem, v->t.L.size, &zero);
+        lock();
+        TexKey k;
+        make_key(&v->t, &k);
+        Tex *e = nvn_hm_get(&by_key, &k);
+        uint32_t up = e ? e->n_up : 0;
+        unlock();
+        rt_log("verify: %s s after the capture, texture %#llx fmt %#x %ux%u: storage %s (zero bytes %llu, at the capture "
+               "%llu); uploads %u (at the capture %u)%s", v->stage ? "10" : "2",
+               (unsigned long long)(uintptr_t)v->t.mem, (unsigned)v->t.d.format, v->t.d.width, v->t.d.height,
+               h != v->hash ? "CHANGED" : "unchanged", (unsigned long long)zero, (unsigned long long)v->zero, up, v->n_up,
+               e ? "" : "; no entry now");
+        v->stage++;
+    }
+}
+
 void vk_texture_verify(const tex_t *t) {
     static uint64_t seen[512];
     static int nseen;
     static long seen_frame = -1;
     long fr = (long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
-    if (fr != seen_frame && fr != seen_frame + 1) nseen = 0;
+    if (fr != seen_frame && fr != seen_frame + 1) nseen = 0, nvlater = 0;   // a new capture
     seen_frame = fr;
     if (!t || !t->mem) return;
     uint64_t addr = (uint64_t)(uintptr_t)t->mem;
@@ -2334,6 +2404,7 @@ void vk_texture_verify(const tex_t *t) {
             rt_log("verify: texture %#llx fmt %#x %ux%u matches its storage (%llu of %llu bytes non-zero, uploads %u)",
                    (unsigned long long)addr, (unsigned)t->d.format, t->d.width, t->d.height, (unsigned long long)nzs,
                    (unsigned long long)(g.wb * g.hb), e->n_up);
+        if (t->d.width >= 256 && t->d.height >= 256) verify_layout(t, e);
     }
     free(a), free(b);
     unlock();

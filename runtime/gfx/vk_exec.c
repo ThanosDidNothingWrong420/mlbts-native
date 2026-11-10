@@ -68,8 +68,10 @@ void vk_exec_frame_written(const tex_t *t) {
 void vk_capture_targets(const tex_t *const *ts, int n, uint64_t frame);   // vk_capture.c
 void vk_watch_frame(uint64_t frame);   // vk_capture.c
 void vk_watch_queries_report(void);   // vk_exec_draw.c
+void vk_texture_verify_frame(uint64_t frame);   // vk_texture.c (mlbts-native diagnosis)
 void vk_exec_frame_log(const tex_t *p, uint64_t frame) {
     vk_watch_frame(frame);
+    vk_texture_verify_frame(frame);
     vk_watch_queries_report();
     VkExecFrame *f = &vk_exec_frame;
     long cap = vk_drawlog_frame();
@@ -78,6 +80,8 @@ void vk_exec_frame_log(const tex_t *p, uint64_t frame) {
         for (int i = 0; i < nfw; i++) ts[i] = fw[i].t;
         vk_capture_targets(ts, nfw, frame);
         vk_drawq_report();
+        void vk_watch_capture(uint64_t frame);   // vk_capture.c: also without draw queries (mlbts-native)
+        vk_watch_capture(frame);
     }
     if (!(rt_trace & RT_TRACE_GFX)) {   // mlbts-native: the summary of the drawlog frame too, counted from the one before
         long want = vk_drawlog_frame();

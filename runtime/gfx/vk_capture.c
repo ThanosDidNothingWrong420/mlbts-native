@@ -202,6 +202,9 @@ void vk_watch_note_tex(const tex_t *t) {
 }
 void vk_capture_targets(const tex_t *const *ts, int n, uint64_t frame);
 void vk_watch_capture(uint64_t frame) {
+    static uint64_t done_at;   // mlbts-native: once per capture (vk_drawq_report and vk_exec_frame_log both call it)
+    if (done_at && frame - done_at < 3) return;
+    done_at = frame;
     const tex_t *p[24];
     for (int i = 0; i < nwt; i++) {
         p[i] = &wt[i];
