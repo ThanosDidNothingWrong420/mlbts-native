@@ -4145,8 +4145,11 @@ static void op_draw_idx_ind(VkExec *ex, const p_draw_idx_ind *d) {
 
 // ---- dispatch and uniform buffer updates
 
+int vk_texture_cube_pending(void);   // vk_texture.c (mlbts-native)
+void vk_texture_cube_flush(void);
 static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     if (d->x <= 0 || d->y <= 0 || d->z <= 0) return;
+    if (!ex->in_pass && vk_texture_cube_pending()) vk_texture_cube_flush();   // after the write that queued them
     ex->prog = ex->prog_cs;   // mlbts-native: the compute stage's program (vk_exec.h stage_prog)
     if (!ex->prog) return warn_once(W_PROGRAM, "a dispatch without a bound program is skipped");
     uint32_t csh = 0;

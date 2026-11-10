@@ -673,12 +673,26 @@ static uint64_t pace(uint64_t *target, uint64_t now, uint64_t period) {
     return 0;
 }
 
+// mlbts-native: the high-resolution timer to 1 ms before the deadline, then yields (as vk_backend.c wait_until); the
+// millisecond Sleep woke up to a millisecond or more late. MLB_TRACE=perf: how late the wake-ups were, per 600.
 static void sleep_until(uint64_t deadline) {
+    static uint64_t n, late_sum, late_max;
     for (;;) {
         uint64_t now = kern_now_ns();
-        if (now >= deadline) return;
+        if (now >= deadline) {
+            if (rt_trace & RT_TRACE_PERF) {
+                uint64_t late = now - deadline;
+                late_sum += late, late_max = late > late_max ? late : late_max;
+                if (++n % 600 == 0) {
+                    rt_log("perf: window acquire waits woke %.3f ms late on average, %.3f ms at most (last 600)",
+                           late_sum / 1e6 / 600, late_max / 1e6);
+                    late_sum = late_max = 0;
+                }
+            }
+            return;
+        }
         uint64_t d = deadline - now;
-        if (d >= 2000000) plat_sleep_ms((uint32_t)(d / 1000000 - 1));
+        if (d >= 1500000) plat_wait_ns(d - 1000000);
         else plat_yield();
     }
 }

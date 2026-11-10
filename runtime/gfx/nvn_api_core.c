@@ -483,6 +483,17 @@ static _Thread_local uint64_t sw_fence, sw_t0, sw_calls, sw_done0, sw_last0;
 static PlatMutex sww_lock = PLAT_MUTEX_INIT;
 static uint64_t sww_frame0, sww_n, sww_ns, sww_max, sww_max_fence, sww_max_calls;
 static volatile int64_t sww_calls, sww_calls0;   // every nvnSyncWait call
+// diagnosis: calls by result (0 never fenced, 1 already signalled, 2 waited and satisfied, 3 timed out) and the guest
+// return addresses (lr) of the never-fenced ones, a small racy table (counts are approximate)
+static volatile int64_t swk[4], swk0[4];
+static struct { uint64_t lr, n; } sw_lr[32];
+static void sw_lr_note(uint64_t lr) {
+    unsigned i = (unsigned)((lr >> 2) * 0x9E3779B1u >> 27);
+    for (int k = 0; k < 32; k++, i = (i + 1) & 31) {
+        if (sw_lr[i].lr == lr) { sw_lr[i].n++; return; }
+        if (!sw_lr[i].lr) { sw_lr[i].lr = lr, sw_lr[i].n = 1; return; }
+    }
+}
 static char sww_story[400];
 static void sync_wait_window(uint64_t now, uint64_t d, uint64_t calls) {
     if (!(rt_trace & RT_TRACE_PERF)) return;
@@ -500,6 +511,27 @@ static void sync_wait_window(uint64_t now, uint64_t d, uint64_t calls) {
         if (sww_frame0) {
             double nf = (double)(fr - sww_frame0);
             int64_t calls = __atomic_load_n(&sww_calls, __ATOMIC_RELAXED);
+            {   // the result kinds and the busiest never-fenced call sites
+                char sites[300];
+                int o = 0;
+                for (int r = 0; r < 3; r++) {
+                    int best = -1;
+                    for (int k = 0; k < 32; k++)
+                        if (sw_lr[k].lr && (best < 0 || sw_lr[k].n > sw_lr[best].n)) best = k;
+                    if (best < 0) break;
+                    char nm[64];
+                    rt_guest_name(sw_lr[best].lr, nm, sizeof nm);
+                    o += snprintf(sites + o, sizeof sites - o, "%s%s x%llu", r ? ", " : "", nm, (unsigned long long)sw_lr[best].n);
+                    sw_lr[best].n = 0;
+                }
+                if (!o) snprintf(sites, sizeof sites, "-");
+                int64_t k[4];
+                for (int i = 0; i < 4; i++) k[i] = __atomic_load_n(&swk[i], __ATOMIC_RELAXED) - swk0[i], swk0[i] += k[i];
+                memset(sw_lr, 0, sizeof sw_lr);
+                rt_log("perf: frame %llu: nvnSyncWait per frame: never fenced %.0f, already signalled %.0f, waited %.1f, "
+                       "timed out %.1f; never-fenced polls from %s", (unsigned long long)fr, k[0] / nf, k[1] / nf, k[2] / nf,
+                       k[3] / nf, sites);
+            }
             rt_log("perf: frame %llu: game GPU waits per frame %.1f, %.2f ms; longest %.2f ms (fence %llu, %llu calls): %s; "
                    "nvnSyncWait calls per frame %.0f", (unsigned long long)fr, sww_n / nf, sww_ns / 1e6 / nf, sww_max / 1e6,
                    (unsigned long long)sww_max_fence, (unsigned long long)sww_max_calls, sww_n ? sww_story : "-",
@@ -512,6 +544,10 @@ static void sync_wait_window(uint64_t now, uint64_t d, uint64_t calls) {
     (void)now;
 }
 static void sync_wait_note(const sync_t *s, int done) {
+    if ((s != sw_s || s->fence != sw_fence) && done) {   // done at its first call: nothing to time, no clock read
+        sync_wait_window(0, 0, 1);
+        return;
+    }
     uint64_t now = kern_now_ns();
     if (s != sw_s || s->fence != sw_fence) {
         sw_s = s, sw_fence = s->fence, sw_t0 = now, sw_calls = 0;
@@ -537,9 +573,15 @@ NVN_API(nvnSyncWait) {
     const sync_t *s = arg_p(c, 0);
     uint64_t timeout = arg_x(c, 1);
     __atomic_add_fetch(&sww_calls, 1, __ATOMIC_RELAXED);
-    if (!s->fenced) { ret_x(c, NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED); return; }
+    if (!s->fenced) {
+        __atomic_add_fetch(&swk[0], 1, __ATOMIC_RELAXED);
+        if (rt_trace & RT_TRACE_PERF) sw_lr_note(c->x[30]);
+        ret_x(c, NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED);
+        return;
+    }
     const GfxBackend *b = gfx_backend();
     if (b->fence_done() >= s->fence) {
+        __atomic_add_fetch(&swk[1], 1, __ATOMIC_RELAXED);
         sync_wait_note(s, 1);
         b->cpu_synced(s->fence);
         ret_x(c, NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED);
@@ -551,6 +593,7 @@ NVN_API(nvnSyncWait) {
         NVN_BLOCKING();
         ok = b->fence_wait(s->fence, timeout);
     }
+    __atomic_add_fetch(&swk[ok ? 2 : 3], 1, __ATOMIC_RELAXED);
     if (ok) sync_wait_note(s, 1), b->cpu_synced(s->fence);
     ret_x(c, ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED);
 }
@@ -572,7 +615,12 @@ NVN_API(nvnEventInitialize) {
 // void nvnEventFinalize(NVNevent *e)
 NVN_API(nvnEventFinalize) { ((ev_t *)arg_p(c, 0))->magic = 0; }
 // uint32_t nvnEventGetValue(const NVNevent *e)
-NVN_API(nvnEventGetValue) { ret_x(c, *((const ev_t *)arg_p(c, 0))->val); }
+// mlbts-native: the back end first applies the event signals the GPU has reached (vk_exec_xfer.c gfx_event_poll)
+__attribute__((weak)) void gfx_event_poll(void) {}
+NVN_API(nvnEventGetValue) {
+    gfx_event_poll();
+    ret_x(c, *((const ev_t *)arg_p(c, 0))->val);
+}
 // void nvnEventSignal(NVNevent *e, NVNeventSignalMode mode, uint32_t value)
 NVN_API(nvnEventSignal) {
     const ev_t *e = arg_p(c, 0);

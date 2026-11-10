@@ -290,11 +290,129 @@ static void oq_report(VkExec *ex, uint64_t addr) {
     if (!oq_keep) oq_counting = 0;
 }
 
+// mlbts-native: an event signal takes effect where it is in the command stream. NVN writes the event when the GPU gets
+// there; the replay wrote it when the whole submission completed (vk_completion_add), and MLB's main thread spins on
+// nvnEventGetValue for such an event (f_70005a1310: 400,000-670,000 nvnSyncWait and GetValue calls a frame in the draft
+// cutscene), so it waited for the submission's end, the completion thread and the replay queue: 45-55 fps with the
+// GPU at 15-17 ms. Now, after a full barrier at the signal's place, the GPU writes the signal's sequence number into a
+// host-visible buffer, and nvnEventGetValue (gfx_event_poll) applies every signal the GPU has reached, in order. The
+// completion callback stays as the backstop; each signal is applied once (an ADD event must not count twice).
+// MLB_EVENT_GPU=0: at completion only, as before.
+#define EV_N 1024
+typedef struct { volatile uint32_t *val; uint32_t mode, value, seq; volatile int32_t done; } EvRec;
+static EvRec ev_rec[EV_N];
+static uint32_t ev_next = 1, ev_lo = 1;   // the next sequence number (replay thread); the lowest not known applied (poll)
+static volatile uint32_t ev_pub = 1;       // sequence numbers below it are recorded
+static volatile int32_t ev_pending;
+static VkBuffer ev_buf;
+static VmaAllocation ev_alloc;
+static volatile uint32_t *ev_map;
+static int ev_state;                       // 0 not tried, 1 on, -1 off
+static PlatMutex ev_lock = PLAT_MUTEX_INIT;
+static uint64_t ev_n_gpu, ev_n_poll, ev_n_cb, ev_n_fallback;
+
+static void ev_apply(EvRec *r) {
+    if (__atomic_exchange_n(&r->done, 1, __ATOMIC_ACQ_REL)) return;
+    if (r->mode == NVN_EVENT_SIGNAL_MODE_ADD) __atomic_fetch_add(r->val, r->value, __ATOMIC_RELEASE);
+    else __atomic_store_n(r->val, r->value, __ATOMIC_RELEASE);
+    __atomic_sub_fetch(&ev_pending, 1, __ATOMIC_RELEASE);
+}
+static void ev_cb(void *arg) {   // the submission completed: every signal in it has been reached
+    uint64_t k = (uint64_t)(uintptr_t)arg;
+    uint32_t s = (uint32_t)k;
+    plat_mutex_lock(&ev_lock);
+    // earlier signals first (one per submission order); the poll may have applied them already. Bounded by sequence
+    // order: when the poll already moved ev_lo past s, the loop must not run on to signals the GPU has not reached
+    // (an unbounded i != s + 1 applied every recorded signal early, the game reused memory the GPU still read, and
+    // the device was lost in the draft cutscene).
+    uint32_t pub = __atomic_load_n(&ev_pub, __ATOMIC_ACQUIRE);
+    for (uint32_t i = ev_lo; (int32_t)(s - i) >= 0 && i != pub; i++) {
+        EvRec *r = &ev_rec[i % EV_N];
+        if (r->seq == i && !r->done) ev_apply(r), ev_n_cb++;
+    }
+    while (ev_lo != __atomic_load_n(&ev_pub, __ATOMIC_ACQUIRE) &&
+           (ev_rec[ev_lo % EV_N].seq != ev_lo || ev_rec[ev_lo % EV_N].done))
+        ev_lo++;
+    plat_mutex_unlock(&ev_lock);
+}
+void gfx_event_poll(void) {
+    if (!__atomic_load_n(&ev_pending, __ATOMIC_ACQUIRE)) return;
+    plat_mutex_lock(&ev_lock);
+    uint32_t pub = __atomic_load_n(&ev_pub, __ATOMIC_ACQUIRE);
+    for (uint32_t i = ev_lo; i != pub; i++) {
+        EvRec *r = &ev_rec[i % EV_N];
+        if (r->seq != i) {   // its slot was reused, which only happens once it was applied
+            if (i == ev_lo) ev_lo++;
+            continue;
+        }
+        if (!r->done) {
+            if (__atomic_load_n(&ev_map[i % EV_N], __ATOMIC_ACQUIRE) != i) break;   // the GPU is not there yet
+            ev_apply(r), ev_n_poll++;
+        }
+        if (i == ev_lo) ev_lo++;
+    }
+    plat_mutex_unlock(&ev_lock);
+}
+static int ev_init(void) {
+    if (ev_state) return ev_state > 0;
+    // Off by default: with it on the draft cutscene lost the device twice (GPU page faults, a 3-4 s hang) at its start.
+    // MLB_EVENT_GPU=1 turns it on for testing.
+    const char *e = cfg_get("MLB_EVENT_GPU");
+    ev_state = -1;
+    if (e && strcmp(e, "0")) {
+        VkCtx *c = vk_ctx();
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = EV_N * 4,
+                                 .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                      .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
+                                      .requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+        VmaAllocationInfo info;
+        if (vmaCreateBuffer(c->vma, &bi, &ai, &ev_buf, &ev_alloc, &info) == VK_SUCCESS && info.pMappedData) {
+            ev_map = info.pMappedData;
+            memset((void *)ev_map, 0, EV_N * 4);
+            ev_state = 1;
+        }
+    }
+    rt_log("vk: event signals %s", ev_state > 0 ? "take effect where the GPU reaches them (MLB_EVENT_GPU=1, experimental)"
+                                                : "take effect when their submission completes (MLB_EVENT_GPU=1: where the GPU reaches them)");
+    return ev_state > 0;
+}
+
 static void signal_event(VkExec *ex, const p_signal_event *p) {
-    EventWrite *e = malloc(sizeof *e);
-    if (!e) rt_fatal("vk: out of memory");
-    *e = (EventWrite){p->val, p->mode, p->value};
-    vk_completion_add(ex->fence, event_cb, e);
+    uint32_t s = ev_next;
+    EvRec *r = &ev_rec[s % EV_N];
+    if (!ev_init() || (r->seq && !r->done)) {   // off, or the slot's previous signal still pending: at completion
+        EventWrite *e = malloc(sizeof *e);
+        if (!e) rt_fatal("vk: out of memory");
+        *e = (EventWrite){p->val, p->mode, p->value};
+        vk_completion_add(ex->fence, event_cb, e);
+        if (ev_state > 0) ev_n_fallback++;
+        return;
+    }
+    ev_next = s + 1 ? s + 1 : 1;
+    plat_mutex_lock(&ev_lock);
+    *r = (EvRec){p->val, p->mode, p->value, s, 0};
+    plat_mutex_unlock(&ev_lock);
+    __atomic_add_fetch(&ev_pending, 1, __ATOMIC_RELEASE);
+    vk_exec_barrier(ex);   // ends the pass; the work before the signal is done before the write below
+    vkCmdFillBuffer(ex->cb, ev_buf, (VkDeviceSize)(s % EV_N) * 4, 4, s);
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+                           .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
+                           .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(ex->cb, &di);
+    ex->recorded += 2;
+    __atomic_store_n(&ev_pub, ev_next, __ATOMIC_RELEASE);
+    vk_completion_add(ex->fence, ev_cb, (void *)(uintptr_t)s);
+    ev_n_gpu++;
+    static uint64_t last_frame;
+    uint64_t fr = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    if ((rt_trace & RT_TRACE_PERF) && fr >= last_frame + 600) {
+        rt_log("perf: frame %llu: event signals %llu: applied by the poll %llu, by completion %llu; at completion only "
+               "(slot busy) %llu", (unsigned long long)fr, (unsigned long long)ev_n_gpu, (unsigned long long)ev_n_poll,
+               (unsigned long long)ev_n_cb, (unsigned long long)ev_n_fallback);
+        ev_n_gpu = ev_n_poll = ev_n_cb = ev_n_fallback = 0, last_frame = fr;
+    }
 }
 
 static void report_counter(VkExec *ex, const p_report_counter *p) {

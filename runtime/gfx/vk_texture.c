@@ -629,8 +629,10 @@ static void dropped_check(const TexKey *k) {
     dropped[i].hash = 0;
 }
 
+static void cube_unqueue(const Tex *e);   // mlbts-native, below
 static void destroy_tex(Tex *e) {
     own_remove(e);
+    cube_unqueue(e);
     tex_gen_bump(e->key.addr);
     nvn_hm_del(&by_key, &e->key);
     Tex *head = nvn_hm_get(&by_addr, &e->key.addr);
@@ -1532,6 +1534,7 @@ static int wb_wanted(const Tex *e) { return e->t.L.size <= wb_limit || e->run < 
 
 static void gpu_wrote(Tex *e);
 static int cube_behind(const Tex *src);   // mlbts-native, below
+static void cube_queue(const Tex *src);   // mlbts-native, below
 void vk_texture_gpu_written(const tex_t *t) {
     if (!t || !t->mem) return;
     if (vk_watch_hit((uint64_t)(uintptr_t)t->mem, t->L.size))
@@ -1550,7 +1553,7 @@ static void gpu_wrote(Tex *e) {
     e->pub.gpu_owned = 1;
     e->wseq = e->cseq = ++content_writes;
     if (cube_behind(e)) {
-        tex_gen_bump(e->pub.addr);   // the cube's slot resolves again (cube_refresh)
+        cube_queue(e);   // the cubes over its storage copy the new content at the next pass or dispatch
         if (cube_log())
             rt_log("vk: array %#llx fmt %#x %ux%u written by the GPU (write %llu): a cube over its storage is behind",
                    (unsigned long long)e->pub.addr, (unsigned)e->t.d.format, e->pub.width, e->pub.height,
@@ -1669,7 +1672,7 @@ static int cube_log(void) { return plat_inc32(&n_cube_log) <= 600; }
 static int cube_behind(const Tex *src) {   // src (not a cube) wrote content a live cube at its storage lacks
     if (is_cube(src)) return 0;
     for (Tex *p = nvn_hm_get(&by_addr, &src->key.addr); p; p = p->next_at)
-        if (p != src && !p->released && is_cube(p) && p->cseq < src->wseq) return 1;
+        if (p != src && is_cube(p) && p->cseq < src->wseq) return 1;
     return 0;
 }
 static void cube_refresh(Tex *e) {
@@ -1695,6 +1698,53 @@ static void cube_refresh(Tex *e) {
         rt_log("vk: cube %#llx fmt %#x %ux%u took newer content from the %ux%u array over its storage (%u levels)",
                (unsigned long long)e->pub.addr, (unsigned)e->t.d.format, e->pub.width, e->pub.height, src->pub.width,
                src->pub.height, lv);
+}
+
+// Cubes behind an array write, live or released (MLB finalizes and recreates its texture objects, and a slot falls back
+// to its released cube, which the resolution never refreshed: after a game the RTTS room kept the stadium's
+// environment and irradiance, chrome-looking lockers and dark players). gpu_wrote queues them; the replay copies at the
+// next pass or dispatch (vk_texture_cube_flush), after the write and before any sampling, into the cube's own image,
+// so no binding needs resolving again. Before, every such write bumped the global generations, and arrays the game
+// rewrites every frame emptied every binding cache every frame.
+#define CUBE_PEND 64
+static Tex *cube_pend[CUBE_PEND];
+static int n_cube_pend;
+static uint64_t n_cube_copies, n_cube_dropped;
+static void cube_queue(const Tex *src) {
+    if (is_cube(src)) return;
+    for (Tex *p = nvn_hm_get(&by_addr, &src->key.addr); p; p = p->next_at) {
+        if (p == src || !is_cube(p) || p->cseq >= src->wseq) continue;
+        int have = 0;
+        for (int i = 0; i < n_cube_pend; i++) have |= cube_pend[i] == p;
+        if (have) continue;
+        if (n_cube_pend < CUBE_PEND) cube_pend[n_cube_pend++] = p;
+        else n_cube_dropped++;
+    }
+}
+static void cube_unqueue(const Tex *e) {   // destroy_tex
+    for (int i = 0; i < n_cube_pend; i++)
+        if (cube_pend[i] == e) cube_pend[i--] = cube_pend[--n_cube_pend];
+}
+int vk_texture_cube_pending(void) { return __atomic_load_n(&n_cube_pend, __ATOMIC_RELAXED) != 0; }
+void vk_texture_cube_flush(void) {
+    lock();
+    Tex *v[CUBE_PEND];
+    int n = n_cube_pend;
+    memcpy(v, cube_pend, sizeof *v * (size_t)n);
+    n_cube_pend = 0;
+    for (int i = 0; i < n; i++) {
+        uint64_t c0 = v[i]->cseq;
+        cube_refresh(v[i]);
+        if (v[i]->cseq != c0) n_cube_copies++;
+    }
+    static uint64_t last_frame;
+    uint64_t fr = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    if ((rt_trace & RT_TRACE_PERF) && fr >= last_frame + 600) {
+        rt_log("perf: frame %llu: lighting cubes refreshed from their arrays %llu times in 600 frames%s",
+               (unsigned long long)fr, (unsigned long long)n_cube_copies, n_cube_dropped ? " (queue overflowed)" : "");
+        n_cube_copies = n_cube_dropped = 0, last_frame = fr;
+    }
+    unlock();
 }
 
 // The entry slot s resolves to, and the view and has_view a caller gets with it (the slot's, with the descriptor's

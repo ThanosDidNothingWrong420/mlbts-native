@@ -621,8 +621,11 @@ static void barrier_to(VkExec *ex, const VkImage *want, const VkImageAspectFlags
 
 void vk_exec_barrier(VkExec *ex) { barrier_to(ex, NULL, NULL, 0); }
 
+int vk_texture_cube_pending(void);   // vk_texture.c (mlbts-native)
+void vk_texture_cube_flush(void);
 void vk_exec_pass_begin(VkExec *ex) {
     if (ex->in_pass) return;
+    if (vk_texture_cube_pending()) vk_texture_cube_flush();   // lighting cubes take their arrays' new content
     resolve_rt(ex);
     vk_contact_pass_begin(ex);
     vk_dlaa_pass(ex);   // DLAA runs before the bloom chain's first pass (vk_dlaa.c)
