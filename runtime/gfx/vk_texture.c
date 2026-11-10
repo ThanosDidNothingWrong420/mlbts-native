@@ -1859,9 +1859,21 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
         int want_cube = k.d.target == NVN_TEXTURE_TARGET_CUBEMAP || k.d.target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY;
         Tex *own = e, *any = NULL;
         e = NULL;
+        // mlbts-native: and only an entry with the levels the slot can select. MLB's GPU BC encoder writes each mip
+        // level of a BC7 texture through a view of one level of an R32G32B32A32_UINT block image (64x32, 7 levels for
+        // a 256x128 hair texture), whose descriptor the game finalizes right away; the slot followed a live 1x1, one-
+        // level image of that format at the same storage, the views of levels 1 and up could not be made (placeholder
+        // bindings), and those levels kept the first hairstyle's blocks: every later style showed the old hair at the
+        // distances that sample them. The face encoder's 128x8 two-level image did the same.
+        uint32_t need = k.d.levels ? k.d.levels : 1;
+        if (s->has_view && s->v.set_levels) {
+            uint32_t vl = (uint32_t)s->v.base_level + (s->v.nlevels ? s->v.nlevels : 1);
+            if (vl > need) need = vl;
+        }
         for (Tex *p = nvn_hm_get(&by_addr, &k.addr); p; p = p->next_at) {
             if (p->released || linear_format(p->key.d.format) != linear_format(k.d.format)) continue;
             if (want_cube != is_cube(p)) continue;
+            if (p->pub.levels < need) continue;
             if (!any) any = p;
             if (same_but_swizzle(&p->key, &k)) { e = p; break; }
         }
