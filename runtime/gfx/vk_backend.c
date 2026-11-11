@@ -47,6 +47,31 @@ static void wait_until(uint64_t at) {
     while (kern_now_ns() < at) plat_yield();
 }
 
+// mlbts-native: from the game's present call to the blit on the queue (the replay of the frame's work, then the blit),
+// a maximum that decays by 1/64 of its excess each present, capped at 50 ms; the pacer leads by it (nvn_api_obj.c pace).
+static volatile uint64_t g_lag_ns;
+uint64_t gfx_present_lag_ns(void) { return __atomic_load_n(&g_lag_ns, __ATOMIC_RELAXED); }
+
+// mlbts-native diagnosis (MLB_TRACE=perf), every 60 presents: how even the host presents were and why.
+static struct { uint64_t n, sum, sumsq, mn, mx, on_slot, late, lag_sum; } ps;
+static void present_stats(uint64_t interval, uint64_t ready, uint64_t at, uint64_t t1, uint64_t d) {
+    if (interval) {
+        ps.n++, ps.sum += interval, ps.sumsq += (interval / 1000) * (interval / 1000);
+        if (!ps.mn || interval < ps.mn) ps.mn = interval;
+        if (interval > ps.mx) ps.mx = interval;
+    }
+    if (at && ready > at) ps.late++;   // the blit was ready after the slot: the present followed the replay
+    else if (at && t1 - at < 200000) ps.on_slot++;
+    ps.lag_sum += d;
+    if (ps.n < 60) return;
+    double avg = (double)ps.sum / ps.n, var = (double)ps.sumsq / ps.n - (avg / 1000) * (avg / 1000);
+    rt_log("perf: presents (last %llu): interval avg %.2f ms, min %.2f, max %.2f, std dev %.2f ms; on their slot %llu, after "
+           "it (the replay was later) %llu; game present to blit avg %.2f ms, its decaying max %.2f ms",
+           (unsigned long long)ps.n, avg / 1e6, ps.mn / 1e6, ps.mx / 1e6, var > 0 ? __builtin_sqrt(var) / 1e3 : 0.0,
+           (unsigned long long)ps.on_slot, (unsigned long long)ps.late, ps.lag_sum / 1e6 / ps.n, gfx_present_lag_ns() / 1e6);
+    memset(&ps, 0, sizeof ps);
+}
+
 static void present_main(void *arg) {
     (void)arg;
     uint64_t last = 0, last_queued = 0;
@@ -69,9 +94,16 @@ static void present_main(void *arg) {
         plat_cond_broadcast(&pcv);
         plat_mutex_unlock(&pl);
         uint64_t t0 = kern_now_ns();
+        {   // the pacer's lead (gfx_present_lag_ns)
+            uint64_t d = t0 > j.queued && j.queued ? t0 - j.queued : 0, m = g_lag_ns;
+            if (d > 50000000ull) d = 50000000ull;
+            __atomic_store_n(&g_lag_ns, d > m ? d : m - (m - d) / 64, __ATOMIC_RELAXED);
+        }
         wait_until(j.at);
         uint64_t t1 = kern_now_ns();
         vk_present_flip();
+        if (rt_trace & RT_TRACE_PERF)
+            present_stats(last ? t1 - last : 0, t0, j.at, t1, t0 > j.queued && j.queued ? t0 - j.queued : 0);
         // TOTK_TRACE=present: one line per present: the host present's interval, the interval of the game's present
         // calls (when the host present went out before back-edge pacing), the wait and how far past its target it went
         if (rt_trace & RT_TRACE_PRESENT)

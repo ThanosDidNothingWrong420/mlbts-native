@@ -665,12 +665,40 @@ static uint64_t present_period(const win_t *o) {
 // MacNativeGames nvn_pace.h: the present slot is the previous slot plus one period. Early: wait for the slot. Late by
 // less than a period: present at once and keep the phase. Behind by a period or more: restart from now, no catch-up
 // burst. Returns the ns to wait.
+//
+// mlbts-native: the slot leads the game's present by the replay's recent lag. A frame goes to the display at its slot or
+// when the replay thread has recorded it and the present thread submitted its blit, whichever is later (vk_backend.c
+// present_main), and MLB paces itself with a sleep each frame on its own 60 Hz phase. The pacer kept whatever phase it
+// had after its last restart (a camera cut, a load), so the same batting scene ran with even presents in one pitch,
+// every frame waiting for its slot, and in the next with the game's presents just past their slots: each frame went out
+// when its replay ended, and the display intervals followed the game's sleep and the replay's 4-8 ms of varying work.
+// Now a slot is never earlier than the game's present plus the replay lag the back end measured (gfx_present_lag_ns, a
+// decaying maximum) and 0.5 ms; a phase further ahead than a quarter period is drawn in by period/512 a frame, so the
+// added latency stays near that lag. MLB_PACE_LEAD=0: the phase is kept as before.
+__attribute__((weak)) uint64_t gfx_present_lag_ns(void) { return 0; }
 static uint64_t pace(uint64_t *target, uint64_t now, uint64_t period) {
-    if (!period || !*target) { *target = now; return 0; }
-    uint64_t next = *target + period;
-    if (now <= next) { *target = next; return next - now; }
-    *target = now - next < period ? next : now;
-    return 0;
+    static int lead = -1;
+    if (lead < 0) {
+        const char *e = cfg_get("MLB_PACE_LEAD");
+        lead = !e || strcmp(e, "0");
+        rt_log("gfx: present slots %s (MLB_PACE_LEAD)", lead ? "lead the game's present by the replay lag" : "keep their phase");
+    }
+    if (!lead) {
+        if (!period || !*target) { *target = now; return 0; }
+        uint64_t next = *target + period;
+        if (now <= next) { *target = next; return next - now; }
+        *target = now - next < period ? next : now;
+        return 0;
+    }
+    if (!period) { *target = now; return 0; }
+    uint64_t lag = gfx_present_lag_ns();
+    if (lag > period) lag = period;
+    uint64_t earliest = now + lag + 500000ull;
+    uint64_t next = *target ? *target + period : earliest;
+    if (next < earliest) next = earliest;                         // late, or too close for the replay: later, once
+    else if (next - earliest > period / 4) next -= period / 512;  // well ahead: drawn in slowly (0.03 ms a frame)
+    *target = next;
+    return next - now;
 }
 
 // mlbts-native: the high-resolution timer to 1 ms before the deadline, then yields (as vk_backend.c wait_until); the
