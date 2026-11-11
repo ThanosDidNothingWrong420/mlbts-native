@@ -61,6 +61,10 @@ typedef struct PoolRec {
     VmaAllocation malloc_;
     uint32_t acc_sub;                  // replay: the last submission that synced the mirror (mirror_sync)
     uint32_t wb_sub;                   // replay: the last submission that wrote mirror bytes back to guest memory
+    volatile uint8_t wb_direct;        // mlbts-native: a GPU write into the pool while mirrored that bypassed the mirror,
+                                       // or one before its mirror in the submission that created it (gpu_wrote,
+                                       // mirror_create): its GPU writes always count as new for the mirror (mirror_holds)
+    uint32_t direct_sub;               // replay: the last submission with a GPU write into it while it had no mirror
     uint32_t mgen;                     // gen_lock: every page write stamped up to this generation is in the mirror
                                        // (or in a copy queued before its next use)
     FlushRange fl[FLUSH_RANGES + 1];   // flush_lock: nvnMemoryPoolFlushMappedRange pages not copied yet (flush_add)
@@ -624,6 +628,16 @@ int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact) {
 #define GEN_CHUNKS (RT_ADDRESS_LIMIT >> GEN_CHUNK_SHIFT)
 #define GEN_PER_CHUNK (1u << (GEN_CHUNK_SHIFT - GEN_PAGE_SHIFT))
 static uint32_t *gen_chunk[GEN_CHUNKS];
+// mlbts-native: the same generations without the GPU writes a VRAM mirror already holds (vk_gpu_written), for the
+// mirror sync and the write-back's page ages. A GPU write into a mirrored pool lands in the mirror first and goes back
+// to guest memory at the end of its submission (vk_mem_mirror_end); its completion stamped the pages like a CPU write,
+// so the next submission copied them up into the mirror again. In MLB's end-of-game handshake (twelve skinned players
+// close up) that was 15.6 MiB uploaded a frame for 13.4 MiB merged and 2.7 MiB copied back: the GPU's own results made
+// the round trip every frame, inside the frame the game waits for (f_70005a1310 waits for the previous frame's GPU work
+// before it records the next). Every other stamp goes into both tables, so a CPU write is never hidden behind a later
+// GPU stamp of the same page.
+static uint32_t *mgen_chunk[GEN_CHUNKS];
+static volatile int64_t m_held_bytes;    // GPU-written page bytes stamped in gen_chunk only (mirror_log)
 static uint32_t gen_now;                 // last generation handed out
 static PlatMutex gen_lock = PLAT_MUTEX_INIT;
 static uint64_t gen_pages[1024];
@@ -678,20 +692,32 @@ static uint32_t *gen_slot(uint64_t page_addr, int create) {
     if (ci >= GEN_CHUNKS) return NULL;
     if (!gen_chunk[ci]) {
         if (!create) return NULL;
-        gen_chunk[ci] = calloc(GEN_PER_CHUNK, sizeof(uint32_t));
-        if (!gen_chunk[ci]) rt_fatal("vk: out of memory for page generations");
+        if (!mgen_chunk[ci]) mgen_chunk[ci] = calloc(GEN_PER_CHUNK, sizeof(uint32_t));   // first: readers test gen_chunk
+        uint32_t *g = calloc(GEN_PER_CHUNK, sizeof(uint32_t));
+        if (!g || !mgen_chunk[ci]) rt_fatal("vk: out of memory for page generations");
+        __atomic_store_n(&gen_chunk[ci], g, __ATOMIC_RELEASE);
     }
     return &gen_chunk[ci][(page_addr >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)];
 }
 
-// gen_lock held exclusively; g is the newest generation handed out.
-static void stamp_page(uint64_t a, uint32_t g) {
+// The page's slot in mgen_chunk, NULL while its chunk was never stamped (allocated with gen_chunk's).
+static uint32_t *mgen_slot(uint64_t page_addr) {
+    uint64_t ci = page_addr >> GEN_CHUNK_SHIFT;
+    if (ci >= GEN_CHUNKS || !mgen_chunk[ci]) return NULL;
+    return &mgen_chunk[ci][(page_addr >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)];
+}
+
+// gen_lock held exclusively; g is the newest generation handed out. held: a GPU write the page's mirror already holds
+// (vk_gpu_written), stamped in gen_chunk only.
+static void stamp_page_as(uint64_t a, uint32_t g, int held) {
     uint32_t *s = gen_slot(a, 1);
     if (!s) return;
     *s = g;
+    if (!held) *mgen_slot(a) = g;
     reg_max[a >> REG_SHIFT] = g;
     reg_last[a >> REG_SHIFT] = ww_ep;
 }
+static void stamp_page(uint64_t a, uint32_t g) { stamp_page_as(a, g, 0); }
 
 static void stamp_range(uint64_t lo, uint64_t hi, uint32_t g) {
     for (uint64_t a = lo; a < hi; a += 1ull << GEN_PAGE_SHIFT) stamp_page(a, g);
@@ -1025,7 +1051,41 @@ void vk_mem_gpu_pending(uint64_t addr, uint64_t size) {
     plat_mutex_unlock(&shadow_lock);
 }
 
+// mlbts-native: [addr, addr+size) lies in a pool mirrored now whose GPU writes all went through the mirror (wb_direct
+// clear), so the mirror holds what the GPU wrote and vk_mem_mirror_end copied or merged it back into guest memory.
+// A pool mirrored only after the write recorded holds it too: the mirror's first copy runs after it in queue order.
+// Pool lock shared held.
+static int mirror_holds(uint64_t addr, uint64_t size) {
+    const pidx_ent *e = pidx_find(&pool_index, addr, size);
+    const PoolRec *r = e ? e->buf : NULL;
+    return r && r->kind == POOL_IMPORT && r->mstate == MS_ON && !r->smap && !__atomic_load_n(&r->wb_direct, __ATOMIC_RELAXED) &&
+           addr >= r->import_lo && addr + size <= r->import_hi;
+}
+
 void vk_gpu_written(uint64_t addr, uint64_t size) {
+    static int held_on = -1;   // MLB_MIRROR_HELD=0: every GPU write is copied up again, as before (A/B)
+    if (held_on < 0) {
+        const char *e = cfg_get("MLB_MIRROR_HELD");
+        held_on = !e || strcmp(e, "0");
+        rt_log("mem: GPU writes a VRAM mirror holds are %s (MLB_MIRROR_HELD)", held_on ? "not copied up again" : "copied up again");
+    }
+    if (held_on && !shadow_on && vk_mirror_on && size && !nvn_gpu_only(addr)) {
+        int held;
+        plat_mutex_lock_shared(&pool_lock);
+        held = mirror_holds(addr, size);
+        if (held) {   // vk_guest_written for textures and the rest; the mirror's table keeps its older generation
+            if (vk_watch_hit(addr, size))
+                rt_log("watch: GPU wrote %#llx+%#llx (held by its mirror)", (unsigned long long)addr, (unsigned long long)size);
+            uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
+            plat_mutex_lock(&gen_lock);
+            uint32_t g = ++gen_now;
+            for (uint64_t a = lo; a < hi; a += 1ull << GEN_PAGE_SHIFT) stamp_page_as(a, g, 1);
+            plat_mutex_unlock(&gen_lock);
+            plat_add64(&m_held_bytes, (int64_t)(hi - lo));
+        }
+        plat_mutex_unlock_shared(&pool_lock);
+        if (held) return;
+    }
     if (shadow_on && size) {
         plat_mutex_lock_shared(&pool_lock);
         const pidx_ent *e = pidx_find(&pool_index, addr, size);
@@ -1230,6 +1290,7 @@ typedef struct {
     uint64_t age_bytes[4];                                             // merged page bytes by CPU write age (q_age)
     uint64_t merge_union, merge_ranges, snap_joined;                   // distinct bytes and ranges of the merges; joins
     uint64_t page_bytes, flush_n, flush_bytes, flush_calls, flush_sum;   // what mirror_sync queues, by source
+    uint64_t held_skip;                                                  // mlbts-native: pages not copied up again
 } MirrorAcc;
 static MirrorAcc mrep;                 // replay: this submission
 static MirrorAcc macc;                 // mirror_stat_lock: since the last summary
@@ -1352,6 +1413,9 @@ static void refuse(PoolRec *r, int why, const char *what) {
 static void mirror_create(PoolRec *r) {
     VkCtx *c = vk_ctx();
     uint64_t n = r->import_hi - r->import_lo;
+    // mlbts-native: the first copy runs in the prologue of the part being recorded, which may come before a GPU write
+    // recorded into the imported buffer earlier in the same part: such a pool keeps copying its GPU writes up again.
+    if (r->direct_sub && r->direct_sub == msub) __atomic_store_n(&r->wb_direct, 1, __ATOMIC_RELAXED);
     r->mstate = MS_REFUSED;
     __atomic_add_fetch(&mirror_gen, 1, __ATOMIC_RELEASE);
     if (r->kind != POOL_IMPORT || !r->buf || !n) return;
@@ -1463,11 +1527,15 @@ static void mirror_sync(PoolRec *r) {
         uint64_t a = k << SNAP_SHIFT, b = a + (1ull << SNAP_SHIFT);
         if (a < lo) a = lo;
         if (b > hi) b = hi;
-        const uint32_t *ch = gen_chunk[a >> GEN_CHUNK_SHIFT];   // a 2 MiB region lies in one chunk
+        const uint32_t *ch = mgen_chunk[a >> GEN_CHUNK_SHIFT];   // a 2 MiB region lies in one chunk
+        const uint32_t *all = gen_chunk[a >> GEN_CHUNK_SHIFT];
         if (!ch) continue;
-        for (uint64_t x = a; x < b; x += 1ull << GEN_PAGE_SHIFT)
-            if (ch[(x >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)] > since)
+        for (uint64_t x = a; x < b; x += 1ull << GEN_PAGE_SHIFT) {
+            uint64_t k = (x >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1);
+            if (ch[k] > since)
                 range_add(&pend, &npend, &cpend, r, x - lo, 1ull << GEN_PAGE_SHIFT), mrep.page_bytes += 1ull << GEN_PAGE_SHIFT;
+            else if (all[k] > since) mrep.held_skip += 1ull << GEN_PAGE_SHIFT;   // only a GPU write the mirror holds
+        }
     }
     r->mgen = gen_now;
     if (excl) plat_mutex_unlock(&gen_lock);
@@ -1848,7 +1916,8 @@ static void gpu_writes(const PoolRec *r, uint64_t off, uint64_t size) {
 // write-watch bit is clear now. Pages written more recently are merged as before. quiet_broken counts merged runs
 // that overlap a page plain-copied within the last 4 submissions (the CPU wrote it right after), and the summary
 // splits the merged bytes by how recently the CPU wrote them. MLB_WB_QUIET=0: everything merges; MLB_WB_QUIET_SUBS:
-// the history in submissions (default 4).
+// the history in submissions (default 4). A lost CPU write would show as a glitch in what that buffer feeds (a
+// particle, a vertex), and quiet_broken counts the runs where the CPU wrote a plain-copied page right after.
 #define QUIET_RING 512
 static uint32_t sub_gen[64];   // replay: gen_now when submission msub & 63 began
 static struct { const PoolRec *r; uint64_t off, size; uint32_t sub; } quiet_ring[QUIET_RING];
@@ -1858,8 +1927,11 @@ static uint64_t q_age[4];      // replay: merged page bytes by the age of the CP
 static int quiet_on(void) {
     if (quiet_cfg < 0) {
         const char *e = cfg_get("MLB_WB_QUIET");
-        quiet_cfg = e && strcmp(e, "0");   // off unless MLB_WB_QUIET=1: the draft cutscene had none (every page
-                                            // the GPU wrote, the CPU wrote within a submission), and it costs replay time
+        // mlbts-native: on unless MLB_WB_QUIET=0. It once found no quiet page (the GPU's own write-backs counted as CPU
+        // writes) and cost replay time (each repeat of a range split again); with both fixed, MLB's menu merged
+        // 0.001 MiB a frame instead of 8 MiB, its write-back took 0.5 ms of GPU time instead of 4.3, the GPU frame went
+        // from 11.9 to 4.3 ms, and no plain-copied page was written by the CPU right after.
+        quiet_cfg = !e || strcmp(e, "0");
         const char *ns = cfg_get("MLB_WB_QUIET_SUBS");   // cfg_get: cfg_int needs a row in the settings table
         int n = ns ? atoi(ns) : 0;
         if (n > 0 && n < 60) quiet_subs = n;
@@ -1868,15 +1940,8 @@ static int quiet_on(void) {
     }
     return quiet_cfg && msub > 64;
 }
-// The submissions since the CPU's last observed write to the page (0: during the current one); 63 for none in 60.
-static int page_age(uint64_t a) {
-    uint32_t *sl = gen_slot(a, 0);
-    uint32_t g = sl ? __atomic_load_n(sl, __ATOMIC_RELAXED) : 0;
-    if (!g) return 63;
-    for (int k = 0; k < 60; k++)
-        if ((int32_t)(g - sub_gen[(msub - k) & 63]) > 0) return k;
-    return 63;
-}
+// Page ages come from mgen_chunk (mlbts-native): with gen_chunk, the GPU's own write-backs made every page it wrote look
+// 0-1 submissions old, so no page was ever quiet ("the draft cutscene had none").
 static void quiet_note(const PoolRec *r, uint64_t off, uint64_t size) {
     quiet_ring[quiet_at].r = r, quiet_ring[quiet_at].off = off, quiet_ring[quiet_at].size = size;
     quiet_ring[quiet_at].sub = msub;
@@ -1903,24 +1968,46 @@ static void quiet_run(PoolRec *r, uint64_t off, uint64_t size, int quiet) {
         range_add(&wbl, &nwbl, &cwbl, r, off, size);
     }
 }
+// mlbts-native: ranges already split in this submission. The same written ranges come back with every dispatch that
+// binds them: in MLB's menu 5,500 splits a frame covered 250 MiB for 7 MiB of distinct memory, and splitting each again
+// (a write-watch query and an age per page) doubled the replay's time (8 to 17.5 ms a frame, 45 fps). A repeat adds
+// nothing: its quiet runs are in the copy list and its merged runs in the snapshot list (snap_add takes an identical
+// range once too).
+#define QSEEN_N 4096
+static struct { const PoolRec *r; uint64_t off, size; uint32_t sub; } qseen[QSEEN_N];
+static int quiet_seen(const PoolRec *r, uint64_t off, uint64_t size) {   // 1: split before in this submission; else noted
+    uint64_t h = ((uintptr_t)r >> 4) * 0x9E3779B97F4A7C15ull ^ off * 0xC2B2AE3D27D4EB4Full ^ size;
+    for (unsigned k = 0, i = (unsigned)(h >> 52) & (QSEEN_N - 1); k < 8; k++, i = (i + 1) & (QSEEN_N - 1)) {
+        if (qseen[i].sub == msub && qseen[i].r == r && qseen[i].off == off && qseen[i].size == size) return 1;
+        if (qseen[i].sub != msub) {
+            qseen[i].r = r, qseen[i].off = off, qseen[i].size = size, qseen[i].sub = msub;
+            return 0;
+        }
+    }
+    return 0;   // a full neighbourhood: split it again
+}
 // Splits a shader-written range into runs of quiet pages (plain copies) and merged runs. 0: merge the whole range.
 static int quiet_split(PoolRec *r, uint64_t off, uint64_t size) {
     if (!quiet_on()) return 0;
+    if (quiet_seen(r, off, size)) return 1;
     const uint64_t PM = (1ull << GEN_PAGE_SHIFT) - 1;
     uint64_t a0 = r->import_lo + off, a1 = a0 + size;
     static uint64_t wp[1100];
     uint64_t nw = mem_written_peek(a0, size, wp, 1100);
     if (nw == UINT64_MAX || nw > 1100) return 0;   // not watched, or more written pages than the list holds
-    uint64_t run0 = off;
+    // page_age as comparisons: a page is older than k submissions when its last stamp is not after sub_gen of msub - k
+    uint32_t lim = sub_gen[(msub - (uint32_t)quiet_subs) & 63], g1 = sub_gen[(msub - 1) & 63], g4 = sub_gen[(msub - 4) & 63];
+    uint64_t run0 = off, wi = 0;   // wp: the written pages in ascending order
     int run_q = -1;
     for (uint64_t a = a0; a < a1;) {
         uint64_t pe = (a | PM) + 1;
         if (pe > a1) pe = a1;
-        int age = page_age(a & ~PM), set = 0;
-        for (uint64_t i = 0; i < nw; i++)
-            if ((wp[i] & ~PM) == (a & ~PM)) { set = 1; break; }
-        int q = !set && age > quiet_subs;
-        if (!q) q_age[set ? 3 : age <= 1 ? 0 : age <= 4 ? 1 : 2] += pe - a;
+        uint32_t *sl = mgen_slot(a & ~PM);
+        uint32_t g = sl ? __atomic_load_n(sl, __ATOMIC_RELAXED) : 0;
+        while (wi < nw && (wp[wi] & ~PM) < (a & ~PM)) wi++;
+        int set = wi < nw && (wp[wi] & ~PM) == (a & ~PM);
+        int q = !set && (int32_t)(g - lim) <= 0;
+        if (!q) q_age[set ? 3 : (int32_t)(g - g1) > 0 ? 0 : (int32_t)(g - g4) > 0 ? 1 : 2] += pe - a;
         uint64_t o = a - r->import_lo;
         if (run_q >= 0 && q != run_q) quiet_run(r, run0, o - run0, run_q), run0 = o;
         run_q = q;
@@ -1933,6 +2020,12 @@ static int quiet_split(PoolRec *r, uint64_t off, uint64_t size) {
 static void gpu_wrote(const VkMemSpan *sp, uint64_t size, int shader) {
     PoolRec *r = sp->pool;
     if (r && size) gpu_writes(r, sp->offset, size);
+    if (r && size && r->mstate == MS_ON && sp->buffer != r->mbuf && !r->wb_direct) {   // mirror_holds: never again
+        __atomic_store_n(&r->wb_direct, 1, __ATOMIC_RELAXED);
+        rt_log("mem: pool %#llx+%#llx: a GPU write bypassed its mirror; its GPU writes are copied up again from now on",
+               (unsigned long long)r->lo, (unsigned long long)r->size);
+    }
+    if (r && size && r->mstate != MS_ON) r->direct_sub = msub;   // mirror_create: a mirror made later in this submission
     if (!r || r->mstate != MS_ON || sp->buffer != r->mbuf || !size) return;
     // A binding to the end of its pool (no size) can span hundreds of MiB: those stay copies.
     if (shader && !(sp->offset & 3) && !(size & 3) && size <= MERGE_MAX && merging()) {
@@ -2101,7 +2194,7 @@ static uint64_t ver_off;
 
 // The CPU wrote the page since the mirror's sync that mgen records: stamped later, or its write-watch bit is set.
 static int page_dirty(uint64_t a, uint32_t mgen) {
-    uint32_t *s = gen_slot(a, 0);
+    uint32_t *s = mgen_slot(a);   // mlbts-native: a GPU write the mirror holds is compared, not skipped
     if (s && __atomic_load_n(s, __ATOMIC_RELAXED) > mgen) return 1;
     uint64_t p[1];
     return mem_written_peek(a, 1ull << GEN_PAGE_SHIFT, p, 1) != 0;   // UINT64_MAX (not watched) counts as written
@@ -2282,9 +2375,11 @@ static void mirror_log(uint64_t frame) {
            a.age_bytes[3] / f / M, fc / f, fb / f / M,
            a.presnap_queries / f, a.presnap_bytes / f / M, a.sync_queries / f, a.prologues / f, qpc_ms(a.presnap_t + a.sync_t) / f,
            qpc_ms(a.presnap_t) / f, qpc_ms(a.sync_t) / f, ver);
+    int64_t held = plat_xchg64(&m_held_bytes, 0);
     rt_log("mem: mirror frame %llu: upload sources per frame, overlaps counted twice: written pages %.3f MiB; flush ranges "
-           "%.2f, %.3f MiB, from %.1f flushes of %.3f MiB", (unsigned long long)frame, a.page_bytes / f / M, a.flush_n / f,
-           a.flush_bytes / f / M, a.flush_calls / f, a.flush_sum / f / M);
+           "%.2f, %.3f MiB, from %.1f flushes of %.3f MiB; GPU-written pages the mirror holds %.3f MiB, not copied up "
+           "again %.3f MiB", (unsigned long long)frame, a.page_bytes / f / M, a.flush_n / f,
+           a.flush_bytes / f / M, a.flush_calls / f, a.flush_sum / f / M, held / f / M, a.held_skip / f / M);
 }
 
 // With TOTK_TRACE=perf every 600 frames: what holds device-local memory, to see what grows over a long session.
@@ -2759,6 +2854,6 @@ void vk_mem_shutdown(void) {
     nphys = 0;
     plat_mutex_unlock(&pool_lock);
     plat_mutex_lock(&gen_lock);
-    for (uint64_t i = 0; i < GEN_CHUNKS; i++) free(gen_chunk[i]), gen_chunk[i] = NULL;
+    for (uint64_t i = 0; i < GEN_CHUNKS; i++) free(gen_chunk[i]), gen_chunk[i] = NULL, free(mgen_chunk[i]), mgen_chunk[i] = NULL;
     plat_mutex_unlock(&gen_lock);
 }
