@@ -49,7 +49,8 @@ enum { M_FREE, M_SAVE, M_TEMP, M_CACHE, M_SAVE_RO, M_ROM };   // M_SAVE: the wor
                                                               // committed save; M_ROM: the RomFS (mlbts-native)
 
 typedef struct { int kind; char name[32]; char root[1024]; } Mount;
-typedef struct { PlatFile *h; int mode, save; } File;   // h NULL = free; save: on a save-data mount
+// mlbts-native: trace (MLB_TRACE=fs only): the guest path, and reads and bytes read so far, logged at times and on close
+typedef struct { PlatFile *h; int mode, save; char *trace; uint64_t reads, bytes; } File;   // h NULL = free; save: on a save-data mount
 typedef struct { char *name; int kind; uint64_t size; } Listed;
 typedef struct { Listed *e; int n, next, mode, used; } Dir;   // the directory's entries at open; used 0 = free
 
@@ -695,23 +696,33 @@ static uint32_t host_path_kind(const char *path, char *out, size_t cap, int *kin
     plat_mutex_unlock_shared(&lock);
     if (k == M_FREE) return FS_R_PATH_NOT_FOUND;
     if (kind) *kind = k;
-    // mlbts-native: repeated separators collapse to one, as nn::fs's path normalisation does (MLB opens
-    // "FS_Rom:/NSW//LIVECONTENT"); other empty, "." or ".." components are still refused.
+    // mlbts-native: the path is normalised as nn::fs's PathNormalizer does: repeated separators collapse to one (MLB
+    // opens "FS_Rom:/NSW//LIVECONTENT"), "." is dropped and ".." takes back the component before it; a ".." above the
+    // mount's root is refused. MLB reaches shared data this way: "FS_Rom:/NSW/../CROSS/STADIUMS/AUDIO/LAD/
+    // AUDIOEMITTER.BIN" (the stadium's sound emitters: crowd, organ, PA) and "FS_Rom:/NSW/STADIUMS/LAD/../COMMON/
+    // SCOREBOARD/PITCHCLOCK.NSW". Refusing them left the ballpark without its ambient sound.
     char rest[PATH_CAP];
     size_t rn = 0;
-    for (const char *q = colon + 1; *q; q++) {
-        if (*q == '/' && rn && rest[rn - 1] == '/') continue;
-        if (rn + 1 >= sizeof rest) return FS_R_INVALID_PATH;
-        rest[rn++] = *q;
-    }
-    rest[rn] = 0;
-    for (const char *q = rest + 1; *q;) {
+    for (const char *q = colon + 1; *q;) {
+        while (*q == '/') q++;
+        if (!*q) break;
         const char *e = strchr(q, '/');
         size_t len = e ? (size_t)(e - q) : strlen(q);
-        if (!e && !len) break;
-        if (!component_ok(q, len)) return FS_R_INVALID_PATH;
-        q = e ? e + 1 : q + len;
+        if (len == 1 && q[0] == '.') {
+        } else if (len == 2 && q[0] == '.' && q[1] == '.') {
+            if (!rn) return FS_R_INVALID_PATH;
+            while (rest[rn - 1] != '/') rn--;
+            rn--;
+        } else {
+            if (!component_ok(q, len) || rn + 1 + len >= sizeof rest) return FS_R_INVALID_PATH;
+            rest[rn++] = '/';
+            memcpy(rest + rn, q, len);
+            rn += len;
+        }
+        q += len;
     }
+    if (!rn) rest[rn++] = '/';
+    rest[rn] = 0;
     if (snprintf(out, cap, "%s%s", root, rest) >= (int)cap) return FS_R_INVALID_PATH;
     size_t L = strlen(out);
     while (L > strlen(root) && out[L - 1] == '/') out[--L] = 0;
@@ -915,7 +926,7 @@ static uint32_t open_file(uint64_t *out, const char *path, int mode) {
     plat_mutex_lock(&lock);
     for (int i = 0; i < NFILES; i++)
         if (!files[i].h) {
-            files[i] = (File){f, mode, save_writer};
+            files[i] = (File){f, mode, save_writer, (rt_trace & RT_TRACE_FS) && path ? _strdup(path) : NULL, 0, 0};
             *out = FILE_BASE + (uint64_t)i;
             plat_mutex_unlock(&lock);
             if (save_writer) {
@@ -931,7 +942,8 @@ static uint32_t open_file(uint64_t *out, const char *path, int mode) {
 static uint32_t read_file(uint64_t *out, uint64_t h, int64_t offset, void *buffer, uint64_t size) {
     PlatFile *f;
     int mode;
-    if (!out || offset < 0 || (!buffer && size) || !file_of(h, &f, &mode)) return FS_R_INVALID_ARGUMENT;
+    File *file;
+    if (!out || offset < 0 || (!buffer && size) || !(file = file_of(h, &f, &mode))) return FS_R_INVALID_ARGUMENT;
     if (!(mode & FS_OPEN_READ)) return FS_R_OPEN_MODE;
     uint64_t done = 0;
     while (done < size) {
@@ -942,6 +954,14 @@ static uint32_t read_file(uint64_t *out, uint64_t h, int64_t offset, void *buffe
         done += (uint64_t)n;
     }
     *out = done;
+    if (file->trace) {   // the first reads of each file, then every 64th
+        uint64_t k = __atomic_add_fetch(&file->reads, 1, __ATOMIC_RELAXED);
+        uint64_t b = __atomic_add_fetch(&file->bytes, done, __ATOMIC_RELAXED);
+        if (k <= 3 || k % 64 == 0)
+            rt_log("fs read #%llu of %s: %#llx bytes at %#llx (got %#llx; %.1f MiB so far)", (unsigned long long)k,
+                   file->trace, (unsigned long long)size, (unsigned long long)offset, (unsigned long long)done,
+                   b / 1048576.0);
+    }
     return 0;
 }
 
@@ -1002,9 +1022,15 @@ static void close_file(uint64_t h) {
     plat_mutex_lock(&lock);
     PlatFile *f = files[h - FILE_BASE].h;
     int save = files[h - FILE_BASE].save;
+    File closed = files[h - FILE_BASE];
     files[h - FILE_BASE] = (File){0};
     plat_mutex_unlock(&lock);
     plat_file_close(f);
+    if (closed.trace) {
+        rt_log("fs close %s: %llu reads, %.2f MiB", closed.trace, (unsigned long long)closed.reads,
+               closed.bytes / 1048576.0);
+        free(closed.trace);
+    }
     if (save) {
         save_touched();
         plat_dec32(&save_writers);
@@ -1255,12 +1281,57 @@ static uint32_t directory_entry_count(int64_t *out, uint64_t h) {
 // and ApplicationId are 8-byte structs passed in one register; Uid, ReadOption and WriteOption by reference.
 #define I32(i) ((int32_t)arg_x(c, i))
 #define I64(i) ((int64_t)arg_x(c, i))
-static void ov_open_file(Cpu *c) { ret_x(c, open_file(arg_p(c, 0), arg_p(c, 1), I32(2))); }
+// mlbts-native: MLB_FS_STACK=<text> (environment, with MLB_TRACE=fs): the game's call stack at each open, read and
+// close of a file whose path contains <text>, on one line (frame records through x29). Followed why the audio engine
+// read one header of each song and closed it again.
+static void fs_stack(Cpu *c, const char *what, const char *path) {
+    static const char *want;
+    static int init;
+    if (!init) want = getenv("MLB_FS_STACK"), init = 1;
+    if (!want || !*want || !path || !strstr(path, want)) return;
+    char line[1600], d[96];
+    size_t n = (size_t)snprintf(line, sizeof line, "fs stack %s %s: %s", what, path, ldr_describe(c->x[30], d, sizeof d));
+    uint64_t fp = c->x[29];
+    for (int k = 0; k < 12 && fp && !(fp & 7) && plat_mem_readable(fp, 16) && n < sizeof line - 100; k++) {
+        uint64_t next = LD64(fp), lr = LD64(fp + 8);
+        n += (size_t)snprintf(line + n, sizeof line - n, " < %s", ldr_describe(lr, d, sizeof d));
+        if (next <= fp || next - fp > (64u << 20)) break;
+        fp = next;
+    }
+    rt_log("%s", line);
+}
+static const char *traced_path(uint64_t h) {
+    File *f = file_of(h, NULL, NULL);
+    return f ? f->trace : NULL;
+}
+
+// mlbts-native: under MLB_TRACE=fs a failed open is logged with its result too (missing streamed audio was traced so)
+static void ov_open_file(Cpu *c) {
+    const char *path = arg_p(c, 1);
+    if (rt_trace & RT_TRACE_FS) fs_stack(c, "open", path);
+    uint32_t r = open_file(arg_p(c, 0), path, I32(2));
+    if (r && (rt_trace & RT_TRACE_FS)) rt_log("fs open failed %#x: %s", r, path ? path : "(null)");
+    ret_x(c, r);
+}
 static void ov_file_size(Cpu *c) { ret_x(c, file_size(arg_p(c, 0), arg_x(c, 1))); }
-static void ov_close_file(Cpu *c) { close_file(arg_x(c, 0)); }
-static void ov_entry_type(Cpu *c) { ret_x(c, entry_type(arg_p(c, 0), arg_p(c, 1))); }
-static void ov_read_file(Cpu *c) { ret_x(c, read_file(arg_p(c, 0), arg_x(c, 1), I64(2), arg_p(c, 3), arg_x(c, 4))); }
-static void ov_read_options(Cpu *c) { ret_x(c, read_file(arg_p(c, 0), arg_x(c, 1), I64(2), arg_p(c, 3), arg_x(c, 4))); }
+static void ov_close_file(Cpu *c) {
+    if (rt_trace & RT_TRACE_FS) fs_stack(c, "close", traced_path(arg_x(c, 0)));
+    close_file(arg_x(c, 0));
+}
+static void ov_entry_type(Cpu *c) {
+    const char *path = arg_p(c, 1);
+    uint32_t r = entry_type(arg_p(c, 0), path);
+    if (rt_trace & RT_TRACE_FS) rt_log("fs entry type %#x: %s", r, path ? path : "(null)");
+    ret_x(c, r);
+}
+static void ov_read_file(Cpu *c) {
+    if (rt_trace & RT_TRACE_FS) fs_stack(c, "read", traced_path(arg_x(c, 1)));
+    ret_x(c, read_file(arg_p(c, 0), arg_x(c, 1), I64(2), arg_p(c, 3), arg_x(c, 4)));
+}
+static void ov_read_options(Cpu *c) {
+    if (rt_trace & RT_TRACE_FS) fs_stack(c, "read", traced_path(arg_x(c, 1)));
+    ret_x(c, read_file(arg_p(c, 0), arg_x(c, 1), I64(2), arg_p(c, 3), arg_x(c, 4)));
+}
 static void ov_read_exact(Cpu *c) { ret_x(c, read_exact(arg_x(c, 0), I64(1), arg_p(c, 2), arg_x(c, 3))); }
 static void ov_write_file(Cpu *c) { ret_x(c, write_file(arg_x(c, 0), I64(1), arg_p(c, 2), arg_x(c, 3), arg_p(c, 4))); }
 static void ov_set_file_size(Cpu *c) { ret_x(c, set_file_size(arg_x(c, 0), I64(1))); }
@@ -1887,3 +1958,193 @@ int probe_fs(void) {
     printf("probe-fs: passed (%llu RomFS files)\n", (unsigned long long)files);
     return 0;
 }
+
+// ---- mlbts-native: the game's C stdio FILE calls on the host mounts
+//
+// MLB's audio stream library (Scream snd_stream: crowd, music, organ, commentary) opens its stream files with the C
+// library's fopen ("FS_Rom:/NSW/AUDIO/MUSIC.SKX", "r"), not nn::fs. fopen and the other FILE functions are the SDK's
+// own libc, which reaches files through the SDK's internal nn::fs: the overrides above only replace the game's imports,
+// so the SDK never learned of these mounts and every fopen returned NULL. The streams were parsed (through nn::fs),
+// then failed to open for reading and were retried forever: no streamed sound in the whole game.
+//
+// The FILE functions the game imports are observed here. fopen for reading on a host mount gets a host FILE (a slot
+// in hfiles: its address is the handle the game keeps); every FILE function takes those and passes any other FILE
+// (stdout, a write) to the SDK unchanged.
+typedef struct {
+    uint64_t h;       // fs handle; 0 = free slot
+    int64_t pos;
+    int eof, err, ungot;   // ungot: the character ungetc pushed back, or -1
+} HostFile;
+#define NHFILES 128
+static HostFile hfiles[NHFILES];
+static PlatMutex hf_lock = PLAT_MUTEX_INIT;
+
+static HostFile *hf_of(uint64_t f) {
+    uint64_t base = (uint64_t)(uintptr_t)hfiles;
+    if (f < base || f >= base + sizeof hfiles || (f - base) % sizeof(HostFile)) return NULL;
+    HostFile *h = (HostFile *)(uintptr_t)f;
+    return h->h ? h : NULL;
+}
+
+// fopen semantics for a read-only open: the HostFile, NULL with *mine = 0 when the SDK should handle it.
+static HostFile *hf_open(const char *path, const char *mode, int *mine) {
+    *mine = 0;
+    if (!path || !mode || mode[0] != 'r' || strchr(mode, '+')) return NULL;   // writes stay the SDK's
+    char p[PATH_CAP];
+    int kind = M_FREE;
+    if (host_path_kind(path, p, sizeof p, &kind) == FS_R_PATH_NOT_FOUND && kind == M_FREE) return NULL;   // no such mount
+    *mine = 1;
+    uint64_t h = 0;
+    if (open_file(&h, path, FS_OPEN_READ)) return NULL;
+    plat_mutex_lock(&hf_lock);
+    for (int i = 0; i < NHFILES; i++)
+        if (!hfiles[i].h) {
+            hfiles[i] = (HostFile){h, 0, 0, 0, -1};
+            plat_mutex_unlock(&hf_lock);
+            return &hfiles[i];
+        }
+    plat_mutex_unlock(&hf_lock);
+    close_file(h);
+    rt_log("fs: fopen: all %d host FILE slots are in use (%s)", NHFILES, path);
+    return NULL;
+}
+
+static uint64_t hf_read(HostFile *f, uint8_t *dst, uint64_t n) {
+    uint64_t done = 0;
+    if (n && f->ungot >= 0) dst[done++] = (uint8_t)f->ungot, f->ungot = -1, f->pos++;
+    if (done < n) {
+        uint64_t got = 0;
+        if (read_file(&got, f->h, f->pos, dst + done, n - done)) f->err = 1;
+        f->pos += (int64_t)got;
+        done += got;
+    }
+    if (done < n && !f->err) f->eof = 1;
+    return done;
+}
+
+static int hf_getc(HostFile *f) {
+    uint8_t b;
+    return hf_read(f, &b, 1) == 1 ? b : -1;
+}
+
+static int hf_seek(HostFile *f, int64_t off, int whence) {
+    int64_t base = 0, size = 0;
+    if (whence == 1) base = f->pos;
+    else if (whence == 2) {
+        if (file_size(&size, f->h)) return -1;
+        base = size;
+    } else if (whence != 0) return -1;
+    if (base + off < 0) return -1;
+    f->pos = base + off;
+    f->eof = 0;
+    f->ungot = -1;
+    return 0;
+}
+
+static int hf_close(HostFile *f) {
+    uint64_t h = f->h;
+    plat_mutex_lock(&hf_lock);
+    *f = (HostFile){0};
+    plat_mutex_unlock(&hf_lock);
+    close_file(h);
+    return 0;
+}
+
+static void obs_fopen(Cpu *c) {
+    const char *path = (const char *)(uintptr_t)c->x[0], *mode = (const char *)(uintptr_t)c->x[1];
+    int mine;
+    HostFile *f = hf_open(path, mode, &mine);
+    if (!mine) {
+        c->x[0] = rt_original(c);
+        return;
+    }
+    if (rt_trace & RT_TRACE_FS) rt_log("fs fopen \"%s\" \"%s\": %s", path, mode, f ? "host FILE" : "failed");
+    c->x[0] = (uint64_t)(uintptr_t)f;
+}
+static void obs_freopen(Cpu *c) {   // freopen(path, mode, FILE)
+    HostFile *old = hf_of(c->x[2]);
+    if (!old) {
+        c->x[0] = rt_original(c);
+        return;
+    }
+    hf_close(old);
+    int mine;
+    HostFile *f = hf_open((const char *)(uintptr_t)c->x[0], (const char *)(uintptr_t)c->x[1], &mine);
+    c->x[0] = (uint64_t)(uintptr_t)f;
+}
+// Each function below: the FILE argument's register, then what it does with a host FILE.
+#define HF_ARG(reg)                                \
+    HostFile *f = hf_of(c->x[reg]);                \
+    if (!f) {                                      \
+        c->x[0] = rt_original(c);                  \
+        return;                                    \
+    }
+static void obs_fclose(Cpu *c) { HF_ARG(0) c->x[0] = (uint64_t)(int64_t)hf_close(f); }
+static void obs_fread(Cpu *c) {   // fread(ptr, size, n, FILE)
+    HF_ARG(3)
+    uint64_t size = c->x[1], n = c->x[2];
+    if (!size || !n) {
+        c->x[0] = 0;
+        return;
+    }
+    c->x[0] = hf_read(f, (uint8_t *)(uintptr_t)c->x[0], size * n) / size;
+}
+static void obs_fseek(Cpu *c) { HF_ARG(0) c->x[0] = (uint64_t)(int64_t)hf_seek(f, (int64_t)c->x[1], (int)c->x[2]); }
+static void obs_ftell(Cpu *c) { HF_ARG(0) c->x[0] = (uint64_t)f->pos; }   // ungetc already stepped pos back
+static void obs_feof(Cpu *c) { HF_ARG(0) c->x[0] = (uint64_t)(f->eof && f->ungot < 0); }
+static void obs_ferror(Cpu *c) { HF_ARG(0) c->x[0] = (uint64_t)f->err; }
+static void obs_clearerr(Cpu *c) { HF_ARG(0) f->eof = f->err = 0; }
+static void obs_fgetc(Cpu *c) { HF_ARG(0) c->x[0] = (uint64_t)(int64_t)hf_getc(f); }
+static void obs_ungetc(Cpu *c) {   // ungetc(ch, FILE)
+    HF_ARG(1)
+    int ch = (int)c->x[0];
+    if (ch < 0 || f->ungot >= 0 || f->pos == 0) {
+        c->x[0] = (uint64_t)(int64_t)-1;
+        return;
+    }
+    f->ungot = ch & 0xff;
+    f->pos--;
+    f->eof = 0;
+    c->x[0] = (uint64_t)(ch & 0xff);
+}
+static void obs_fgets(Cpu *c) {   // fgets(buf, n, FILE)
+    HF_ARG(2)
+    char *buf = (char *)(uintptr_t)c->x[0];
+    int n = (int)c->x[1], k = 0;
+    while (k < n - 1) {
+        int ch = hf_getc(f);
+        if (ch < 0) break;
+        buf[k++] = (char)ch;
+        if (ch == '\n') break;
+    }
+    if (n > 0) buf[k] = 0;
+    c->x[0] = k ? c->x[0] : 0;
+}
+static void obs_fflush(Cpu *c) { HF_ARG(0) c->x[0] = 0; }
+static void obs_setvbuf(Cpu *c) { HF_ARG(0) c->x[0] = 0; }
+// Writes to a read-only host FILE fail as a read-only stream does.
+static void obs_fwrite(Cpu *c) { HF_ARG(3) f->err = 1, c->x[0] = 0; }
+static void obs_fputc(Cpu *c) { HF_ARG(1) f->err = 1, c->x[0] = (uint64_t)(int64_t)-1; }
+static void obs_fputs(Cpu *c) { HF_ARG(1) f->err = 1, c->x[0] = (uint64_t)(int64_t)-1; }
+static void obs_fprintf(Cpu *c) { HF_ARG(0) f->err = 1, c->x[0] = (uint64_t)(int64_t)-1; }
+HOST_OBSERVER("fopen", obs_fopen);
+HOST_OBSERVER("freopen", obs_freopen);
+HOST_OBSERVER("fclose", obs_fclose);
+HOST_OBSERVER("fread", obs_fread);
+HOST_OBSERVER("fseek", obs_fseek);
+HOST_OBSERVER("fseeko", obs_fseek);
+HOST_OBSERVER("ftell", obs_ftell);
+HOST_OBSERVER("ftello", obs_ftell);
+HOST_OBSERVER("feof", obs_feof);
+HOST_OBSERVER("ferror", obs_ferror);
+HOST_OBSERVER("clearerr", obs_clearerr);
+HOST_OBSERVER("fgetc", obs_fgetc);
+HOST_OBSERVER("getc", obs_fgetc);
+HOST_OBSERVER("ungetc", obs_ungetc);
+HOST_OBSERVER("fgets", obs_fgets);
+HOST_OBSERVER("fflush", obs_fflush);
+HOST_OBSERVER("setvbuf", obs_setvbuf);
+HOST_OBSERVER("fwrite", obs_fwrite);
+HOST_OBSERVER("fputc", obs_fputc);
+HOST_OBSERVER("fputs", obs_fputs);
+HOST_OBSERVER("fprintf", obs_fprintf);

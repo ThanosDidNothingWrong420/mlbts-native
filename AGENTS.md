@@ -89,6 +89,13 @@ replace-and-assert is reliable.
 - Knobs for the same machinery: `MLB_DRAWLOG=<frame>|game`, `MLB_SHOT=<frame>,...`, `MLB_DRAWTEX=<fs hash>,...`
   (save the textures of draws with those fragment shaders), `MLB_WATCH=<addr>,<size>;...` (log texture creations and
   GPU writes in a guest range), and `MLB_TRACE=svc,host,ipc,fs,gfx,perf,sched,audio,present,all`.
+- Following game code without symbols (slows the game while set; nothing when unset):
+  - `MLB_TRACE=fs` logs every open (and failed open), the first reads and every 64th of each file, and closes with
+    totals; with `MLB_FS_STACK=<path text>` also the game's call stack at each open, read and close of matching files.
+  - `MLB_FNTRACE=<addr>,...` logs calls of game functions (caller, x0; x0 shown as text when it points at a string),
+    `<lo>-<hi>` the first call of every function in a range; `MLB_FNTRACE_PEEK=<off>,...` logs a value behind x0
+    each time it changes (pointer chain, last read as 32 bits). The engine's print function `0x7001ad7bd0` shows its
+    messages this way. Function addresses are the `f_<addr>` names in `work/gen/main/*.c`.
 
 ## RenderDoc (the main graphics debugging tool)
 
@@ -132,6 +139,16 @@ replace-and-assert is reliable.
   GPU writes are written back to guest memory at fences.
 - Shaders: Maxwell shaders are translated by a .NET tool built from `tools/xlate` (Ryujinx's translator plus TotK's
   patches). Pipelines and shader caches live in `work/build/`.
+
+## Audio notes
+
+- MLB mixes everything in software (Sony's Scream engine) and sends one 5.1 PCM stream to `audout` (`audout.c`).
+  It also opens `audren` but never plays a voice on it.
+- Crowd, music, organ, PA and commentary are streams (`NSW/AUDIO/BANK_STREAMS`, `*.SKX`). Scream parses their headers
+  through `nn::fs` but opens them for playback with the C library's `fopen`. The SDK's own libc cannot see the port's
+  mounts, so `fs_host.c` serves the game's FILE calls (`fopen`, `fread`, `fseek`, ...) on host mounts.
+- Guest paths may contain `..` (`FS_Rom:/NSW/../CROSS/STADIUMS/AUDIO/<team>/AUDIOEMITTER.BIN`); `fs_host.c`
+  normalises them as nn::fs does.
 
 ## Reference projects
 

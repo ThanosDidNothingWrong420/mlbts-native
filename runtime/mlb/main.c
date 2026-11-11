@@ -119,8 +119,116 @@ static RtConfig cfg;
 const RtConfig *rt_config(void) { return &cfg; }
 
 // ---- runtime services the generated code calls (cpu.h)
+// MLB_FNTRACE=<guest addr>,... (diagnostic): logs the first calls of these game functions, then every 1000th, with the
+// caller and x0. Every generated function checks g_fnprof on entry (FN_ENTER), so it stays 0 unless this is set: the
+// game runs measurably slower while it is on. Used to follow the audio engine's stream threads (Scream snd_stream).
 volatile int g_fnprof = 0;
-void fnprof_hit(uint64_t addr, uint64_t lr, uint64_t x0) { (void)addr, (void)lr, (void)x0; }
+static uint64_t fn_addr[16];
+static uint64_t fn_hits[16];
+static int fn_n;
+static uint64_t fn_lo, fn_hi;
+// MLB_FNTRACE_PEEK=<off>,...: also a 32-bit value behind x0 (x0 + off, read as a pointer for every offset but the last)
+static uint64_t fn_peek[4];
+static int fn_npeek;
+static int fn_peek_value(uint64_t x0, uint32_t *out) {
+    uint64_t p = x0;
+    for (int i = 0; i < fn_npeek; i++) {
+        uint64_t a = p + fn_peek[i];
+        if (!plat_mem_readable(a, 8)) return 0;
+        if (i == fn_npeek - 1) {
+            *out = *(const uint32_t *)(uintptr_t)a;
+            return 1;
+        }
+        p = *(const uint64_t *)(uintptr_t)a;
+    }
+    return 0;
+}   // MLB_FNTRACE=<lo>-<hi>: the first call of every function in [lo, hi)
+void fnprof_hit(uint64_t addr, uint64_t lr, uint64_t x0) {
+    if (addr >= fn_lo && addr < fn_hi) {
+        static uint64_t first[65536];
+        for (unsigned j = 0, h = (unsigned)((addr * 0x9e3779b97f4a7c15ull) >> 48); j < 65536; j++, h = (h + 1) & 65535) {
+            uint64_t v = __atomic_load_n(&first[h], __ATOMIC_RELAXED);
+            if (v == addr) return;
+            if (!v) {
+                if (!__atomic_compare_exchange_n(&first[h], &v, addr, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return;
+                char from[128];
+                rt_log("fntrace: first call of %#llx from %s, x0 %#llx", (unsigned long long)addr,
+                       ldr_describe(lr, from, sizeof from), (unsigned long long)x0);
+                return;
+            }
+        }
+        return;
+    }
+    for (int i = 0; i < fn_n; i++) {
+        if (fn_addr[i] != addr) continue;
+        uint64_t k = __atomic_add_fetch(&fn_hits[i], 1, __ATOMIC_RELAXED);
+        uint32_t peek = 0;
+        int peeked = fn_npeek && fn_peek_value(x0, &peek);
+        if (peeked) {   // the value behind x0 changed since this function's last call with this x0
+            static uint64_t last_x0[64];
+            static uint32_t last_v[64];
+            unsigned h = (unsigned)((x0 * 0x9e3779b97f4a7c15ull) >> 58);
+            if (last_x0[h] != x0 || last_v[h] != peek) {
+                last_x0[h] = x0, last_v[h] = peek;
+                rt_log("fntrace: %#llx call %llu, x0 %#llx: peek %u (%#x)", (unsigned long long)addr,
+                       (unsigned long long)k, (unsigned long long)x0, peek, peek);
+            }
+            return;
+        }
+        // a call with an x0 not seen before is logged too (each distinct message of a print function, once)
+        static uint64_t seen[4096];
+        uint64_t key = (addr * 0x9e3779b97f4a7c15ull) ^ x0 ^ (x0 >> 29), fresh = 0;
+        for (unsigned j = 0, h = (unsigned)(key >> 52); j < 4096; j++, h = (h + 1) & 4095) {
+            uint64_t v = __atomic_load_n(&seen[h], __ATOMIC_RELAXED);
+            if (v == key) break;
+            if (!v) {
+                fresh = __atomic_compare_exchange_n(&seen[h], &v, key, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+                break;
+            }
+        }
+        if (k <= 8 || k % 1000 == 0 || fresh) {
+            char from[128];
+            // x0 into main's read-only data (0x7001c22000 + 0x539000, docs/recon-report.md): a message, shown as text
+            int text = x0 >= 0x7001c22000ull && x0 < 0x700215b000ull;
+            rt_log("fntrace: %#llx call %llu from %s, x0 %#llx%s%.160s%s", (unsigned long long)addr, (unsigned long long)k,
+                   ldr_describe(lr, from, sizeof from), (unsigned long long)x0, text ? " \"" : "",
+                   text ? (const char *)(uintptr_t)x0 : "", text ? "\"" : "");
+        }
+        return;
+    }
+}
+
+static void parse_fntrace(void) {
+    const char *pk = getenv("MLB_FNTRACE_PEEK");
+    for (const char *p = pk; p && *p && fn_npeek < 4;) {
+        char *end;
+        fn_peek[fn_npeek] = strtoull(p, &end, 16);
+        if (end == p) break;
+        fn_npeek++;
+        p = end + (*end == ',');
+    }
+    const char *e = cfg_get("TOTK_FNTRACE");
+    if (!e || !*e) return;
+    for (const char *p = e; *p && fn_n < 16;) {
+        char *end;
+        uint64_t a = strtoull(p, &end, 16);
+        if (end == p) break;
+        if (*end == '-') {
+            const char *q = end + 1;
+            fn_lo = a, fn_hi = strtoull(q, &end, 16);
+            if (end == q) break;
+            p = end + (*end == ',');
+            continue;
+        }
+        fn_addr[fn_n++] = a;
+        p = end + (*end == ',');
+    }
+    if (fn_n || fn_hi > fn_lo) {
+        rt_log("MLB_FNTRACE: following %d game functions and the range %#llx-%#llx (the game runs slower)", fn_n,
+               (unsigned long long)fn_lo, (unsigned long long)fn_hi);
+        g_fnprof = 1;
+    }
+}
 
 void rt_brk(Cpu *c, uint32_t imm, uint64_t pc) {
     char at[128], lr[128];
@@ -245,6 +353,7 @@ int main(int argc, char **argv) {
     // with it the game draws the next frame while the previous one waits for its turn. MLB_FRAME_QUEUE=0: as before.
     if (!cfg_get("MLB_FRAME_QUEUE")) cfg_set("FRAME_QUEUE", "1");
     parse_trace();
+    parse_fntrace();
     cfg = (RtConfig){.exefs = cfg_get("MLB_EXEFS") ? cfg_get("MLB_EXEFS") : rt_default_exefs,
                      .romfs = cfg_get("MLB_ROMFS") ? cfg_get("MLB_ROMFS") : rt_default_romfs,
                      .profile = cfg_get("MLB_PROFILE") ? cfg_get("MLB_PROFILE") : rt_default_profile,
