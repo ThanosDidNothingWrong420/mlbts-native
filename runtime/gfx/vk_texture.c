@@ -1810,10 +1810,15 @@ static void cube_refresh(Tex *e) {
     Tex *src = NULL;
     uint32_t lv = 0, l;
     int cube = is_cube(e);
-    // a cube copies from a live array; a block view also from a released source, which keeps its image (MLB finalizes
-    // the encoder's storage-image descriptor right after the dispatch)
+    // the newest write at the storage, from a live or a released source: a released entry keeps its image. MLB
+    // finalizes the storage-image descriptors it writes its lighting arrays through right after the dispatch, as it
+    // does the BC encoder's. A cube took only a live array's content before, so at a scene change, when the game
+    // re-captures the stadium into its 128x128 environment arrays (R11G11B10F, 7 levels), the cubes over them stayed
+    // black: the logs showed "a cube ... is behind" on every rewrite and "refreshed 0 times in 600 frames" for 10000
+    // frames. The probe relight (compute 0e0c2eb9) then lit the probes from a black environment, and the players and
+    // the stadium switched between warm and flat grey lighting from one camera cut to the next.
     for (Tex *p = nvn_hm_get(&by_addr, &e->key.addr); p; p = p->next_at)
-        if (p != e && (cube ? !p->released && !is_cube(p) : follows(e, p)) && p->pub.gpu_owned && p->wseq > e->cseq &&
+        if (p != e && (cube ? !is_cube(p) : follows(e, p)) && p->pub.gpu_owned && p->wseq > e->cseq &&
             (!src || p->wseq > src->wseq) && (l = alias_compatible(e, p)))
             src = p, lv = l;
     if (!src) return;
