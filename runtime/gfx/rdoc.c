@@ -77,14 +77,24 @@ void rdoc_after_present(uint64_t frame) {
         char name[960];
         snprintf(name, sizeof name, "%s_frame%llu", base, (unsigned long long)frame);
         api->SetCaptureFilePathTemplate(name);
+        vk_queue_lock();   // RenderDoc submits its own work here too (see EndFrameCapture below)
         api->StartFrameCapture(NULL, NULL);
+        vk_queue_unlock();
         capturing = 1, presents_in = 0, start_submits = subs, start_frame = frame;
         return;
     }
     presents_in++;
     // At least one present with game work behind it; 30 presents without any (a stall) end it as it is.
     if (subs == start_submits && presents_in < 30) return;
+    // Under the queue lock, which every port submission and present takes. RenderDoc 1.43's EndFrameCapture
+    // (vk_core.cpp) switches back to background capturing first, then waits for the device, reads back the backbuffer
+    // and writes the file for seconds, submitting on gfx_queue itself. Unlocked, the present thread's next
+    // vkQueuePresentKHR took RenderDoc's overlay path (HandlePresent: DoPipelineBarrier, a submit) on the same queue at
+    // the same time: two threads on one VkQueue, and nvoglv64.dll crashed writing 0x4000000001 (a capture in a match,
+    // 1.95 GB written). The present thread now waits until the capture is saved.
+    vk_queue_lock();
     uint32_t ok = api->EndFrameCapture(NULL, NULL);
+    vk_queue_unlock();
     capturing = 0;
     char path[1024] = "";
     uint32_t len = sizeof path;
