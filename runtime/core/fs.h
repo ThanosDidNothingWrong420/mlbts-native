@@ -39,5 +39,11 @@ void fs_host_set_profile(const char *dir);                 // profile directory;
                                                            // (default rt_config()->profile)
 int fs_save_busy(void);                                    // a save is being written: a save file open for writing,
                                                            // or save data changed in the last 3 s and not committed
+// mlbts-native: --import-save. The committed save becomes a copy of the files in src (another emulator's save folder);
+// the save it replaces goes to out->backup. 0 on success, else -1 with out->why (fs_host.c).
+// stuck: it failed halfway and why says where each copy is.
+typedef struct { int files, stuck; uint64_t bytes; char backup[1100], why[1400]; } FsImport;
+int fs_save_import(const char *src, FsImport *out);
+int save_import_main(const char *arg);                     // --import-save [ryujinx | folder] (save_import.c); exit code
 void fs_save_flush(void);                                  // wait for a save Commit still running in the background;
                                                            // every exit path calls it before the process ends

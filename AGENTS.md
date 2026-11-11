@@ -159,6 +159,7 @@ title IDs and module layout differ.
    and runtime/gfx. Read it first for anything in those trees.
 2. **Astral Chain PC Recomp**, https://github.com/captainj-sparrow/astral-chain-pc-recomp: `audout:u` came from it.
 3. **Power Moon Recomp**, https://gitlab.com/zzzarathustra-dev/power-moon-recomp.
+4. **Savage Wind Recomp**, https://github.com/Revivedx/SavageWindRecomp.
 
 Ask before running code from a reference repo, except TotK's lifter, which the user approved as a coverage oracle.
 Ryujinx runs 1.0.15 for the user and can be used as a correctness oracle.

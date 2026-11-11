@@ -19,6 +19,8 @@
 //   <profile>/temp/                    emptied at start
 //   <profile>/cache/<index>/           cache storage
 //   <profile>/save-size                the save data size and journal size after ExtendSaveData (two s64)
+//   <profile>/save-before-import/<time>/  mlbts-native: the committed save an --import-save replaced (fs_save_import)
+//   <profile>/profile.lock             mlbts-native: held open while a game runs on this profile
 //   <romfs>/                           the game's RomFS, extracted by tools/romfs_dump.py --extract-all; MountRom
 //                                      mounts it read-only once <romfs>.complete says the extraction finished
 //
@@ -222,6 +224,9 @@ static int remove_tree_retry(const char *path) {
 #define COPY_CHUNK (1u << 20)
 
 static char tx_root[1100], backup_root[1100], new_root[1100], old_root[1100];
+static char import_root[1100];   // mlbts-native: <profile>/save-tx/import, fs_save_import's staging copy
+static int profile_lock_busy;    // mlbts-native: another process holds <profile>/profile.lock (a running game)
+static PlatFile *profile_lock;   // mlbts-native: this process's hold on it; the probe lets go to delete its profile
 static char ready_root[1100];   // the newest finished commit not swapped in, empty when none
 static unsigned ready_seq;      // the highest ready-<n> this run made or found
 static PlatMutex tx_lock = PLAT_MUTEX_INIT;   // taken before lock, never inside it
@@ -475,6 +480,18 @@ static void save_recover(void) {
     const char *did = "nothing to recover";
     ready_scan();
     int has_save = exists(save_root);
+    // mlbts-native: an --import-save that stopped (fs_save_import). Between its two moves save/<uid> is absent and
+    // nothing else is in save-tx: the finished copy goes in. Any other time it is an unfinished copy: deleted.
+    if (exists(import_root)) {
+        if (!has_save && !*ready_root && !exists(new_root) && !exists(old_root)) {
+            if (move_dir(import_root, save_root, MOVE_TRIES)) rt_fatal("fs: cannot complete an interrupted save import");
+            did = "completed an interrupted save import";
+            has_save = 1;
+        } else {
+            if (remove_tree(import_root)) rt_fatal("fs: cannot delete an unfinished save import");
+            did = "deleted an unfinished save import";
+        }
+    }
     if (exists(new_root) && !has_save && !*ready_root) {
         if (move_dir(new_root, save_root, MOVE_TRIES)) rt_fatal("fs: cannot complete an interrupted save commit");
         did = "completed an interrupted commit";
@@ -572,6 +589,94 @@ static void save_wait_commit(void) {
 
 void fs_save_flush(void) { save_wait_commit(); }
 
+// mlbts-native: --import-save (save_import.c). The committed save becomes a copy of the save data files in src as
+// another host keeps them. A Switch save is the same files on every host: MLB lists the save's folders and reads them
+// by name (CARR<id>/SAVEINFO, SAVE_000, ...), and a Ryujinx save loaded unchanged into its Road to the Show career.
+// The save it replaces moves whole to <profile>/save-before-import/<UTC time>, which no Commit prunes. Steps: (1) copy
+// src to save-tx/import, every file flushed; (2) move save/<uid> to that backup; (3) move import to save/<uid>. A
+// crash before (2) leaves the old save, one between (2) and (3) is finished by save_recover. Refused while another
+// process holds the profile lock (a running game) or a finished commit still waits in save-tx. Runs before boot: no
+// save is mounted. 0 on success; else -1, with the reason in out->why and the save as it was.
+static void ready(void);
+static void profile_lock_take(void);
+int fs_save_import(const char *src, FsImport *out) {
+    *out = (FsImport){0};
+    profile_lock_take();   // before ready(): its save_recover would delete a running game's working copy
+    if (profile_lock_busy) {
+        snprintf(out->why, sizeof out->why, "the game is running on this profile: close it first");
+        return -1;
+    }
+    ready();
+    if (*ready_root) {
+        snprintf(out->why, sizeof out->why, "the last save commit still waits in %s (a file of the save is open in "
+                 "another program): close that program and try again", ready_root);
+        return -1;
+    }
+    if (plat_fs_kind(src) != PLAT_FS_DIR) {
+        snprintf(out->why, sizeof out->why, "%s is not a folder", src);
+        return -1;
+    }
+    plat_mutex_lock(&tx_lock);
+    int linked = 0, r = -1;
+    if (remove_tree(import_root) || copy_tree(src, import_root, NULL, 1, &out->files, &linked, &out->bytes)) {
+        snprintf(out->why, sizeof out->why, "copying %s failed", src);
+        remove_tree(import_root);
+        goto done;
+    }
+    if (!out->files) {
+        snprintf(out->why, sizeof out->why, "%s holds no files", src);
+        remove_tree(import_root);
+        goto done;
+    }
+    Listing l;
+    int has_old = !list_dir(save_root, &l) && l.n > 0;
+    listing_free(l.e, l.n);
+    if (has_old) {
+        char dir[PATH_CAP], name[48];
+        uint64_t ns = plat_unix_time_ns();
+        struct tm t;
+        plat_gmtime((int64_t)(ns / 1000000000u), &t);
+        snprintf(name, sizeof name, "%04d%02d%02d-%02d%02d%02d-%03u", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+                 t.tm_hour, t.tm_min, t.tm_sec, (unsigned)(ns / 1000000u % 1000u));
+        snprintf(dir, sizeof dir, "%s/save-before-import", profile);
+        make_dirs(dir);
+        snprintf(out->backup, sizeof out->backup, "%s/%s", dir, name);
+        if (move_dir(save_root, out->backup, MOVE_TRIES)) {
+            char busy[512];
+            plat_fs_busy_reason(save_root, busy, sizeof busy);
+            snprintf(out->why, sizeof out->why, "the current save cannot be moved aside (%s)",
+                     *busy ? busy : "a file in it is open in another program");
+            *out->backup = 0;
+            remove_tree(import_root);
+            goto done;
+        }
+    } else if (remove_tree(save_root)) {   // the empty folder of a profile that has no save yet
+        snprintf(out->why, sizeof out->why, "cannot replace the empty save folder %s", save_root);
+        remove_tree(import_root);
+        goto done;
+    }
+    if (move_dir(import_root, save_root, MOVE_TRIES)) {
+        size_t n = (size_t)snprintf(out->why, sizeof out->why, "cannot move the imported copy into %s", save_root);
+        if (has_old && move_dir(out->backup, save_root, MOVE_TRIES)) {   // the old save could not go back either
+            snprintf(out->why + n, sizeof out->why - n, "; the old save is in %s, the import in %s (the next start "
+                     "puts the import in place)", out->backup, import_root);
+            out->stuck = 1;
+        } else {
+            if (!has_old) make_dirs(save_root);
+            remove_tree(import_root);
+        }
+        *out->backup = 0;
+        goto done;
+    }
+    r = 0;
+    rt_log("fs: save imported from %s: %d files, %.1f MiB%s%s", src, out->files, out->bytes / 1048576.0,
+           *out->backup ? "; the previous save is in " : "", out->backup);
+done:
+    plat_mutex_unlock(&tx_lock);
+    if (r) rt_log("fs: save import failed: %s", out->why);
+    return r;
+}
+
 static uint32_t commit_run(void) {
     plat_mutex_lock(&tx_lock);
     uint32_t r = save_commit_locked();
@@ -607,6 +712,25 @@ static uint32_t save_commit(void) {
 }
 
 // ---- storage roots
+// mlbts-native: the profile lock, held until the process ends: --import-save must not replace the save under a
+// running game, nor run save_recover, which deletes that game's working copy. A second game on the same profile still
+// starts, as before, and logs it. Taken once, by storage_init or first by fs_save_import.
+static void profile_lock_take(void) {
+    static int taken;
+    if (taken++) return;
+    if (!*profile)
+        need(snprintf(profile, sizeof profile, "%s", rt_config()->profile) < (int)sizeof profile, "profile path");
+    make_dirs(profile);
+    char p[PATH_CAP];
+    snprintf(p, sizeof p, "%s/profile.lock", profile);
+    int err = 0;
+    if (!(profile_lock = plat_fs_lock(p, &err))) {
+        profile_lock_busy = err == PLAT_FS_BUSY;
+        rt_log(profile_lock_busy ? "fs: another mlb.exe is running on this profile (%s is held)"
+                                 : "fs: cannot make the profile lock %s; nothing is locked", p);
+    }
+}
+
 static void storage_init(void *param) {
     (void)param;
     if (!*profile)
@@ -614,6 +738,7 @@ static void storage_init(void *param) {
     uint64_t uid[2];
     char p[PATH_CAP];
     make_dirs(profile);
+    profile_lock_take();
     account_uid(uid);
     snprintf(p, sizeof p, "%s/save", profile);
     make_dirs(p);
@@ -626,6 +751,7 @@ static void storage_init(void *param) {
     make_dirs(backup_root);
     snprintf(new_root, sizeof new_root, "%s/new", tx_root);
     snprintf(old_root, sizeof old_root, "%s/old", tx_root);
+    snprintf(import_root, sizeof import_root, "%s/import", tx_root);
     save_recover();   // before save_root is created: an absent save_root means a commit to complete
     make_dirs(save_root);
     snprintf(p, sizeof p, "%s/temp", profile);
@@ -1923,6 +2049,7 @@ static void probe_storage(void) {
     CHECK(RES(S_DELETE_CACHE, 3) == 0, "DeleteCacheStorage");
     CALL(S_UNMOUNT, U("save"));
 
+    if (profile_lock) plat_file_close(profile_lock), profile_lock = NULL;
     int removed = !remove_tree(dir) && !exists(dir);
     CHECK(removed, "the temporary profile was not deleted");
     printf("storage: save create/write/commit/reopen, directories, rename/delete, temporary and cache storage in a "

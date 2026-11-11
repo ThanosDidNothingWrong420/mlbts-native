@@ -1256,6 +1256,8 @@ PlatFile *plat_fs_open(const char *path, int write, int *err) {
 
 PlatFile *plat_fs_create(const char *path, int *err) { return fs_open(path, GENERIC_WRITE, 0, CREATE_NEW, err); }
 
+PlatFile *plat_fs_lock(const char *path, int *err) { return fs_open(path, GENERIC_READ | GENERIC_WRITE, 0, OPEN_ALWAYS, err); }
+
 int64_t plat_file_pwrite(PlatFile *f, const void *buf, uint32_t n, uint64_t off) {
     static __thread HANDLE ev;
     if (!ev && !(ev = CreateEventW(NULL, TRUE, FALSE, NULL))) return -1;

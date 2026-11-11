@@ -329,7 +329,8 @@ static void crash_handler(const PlatCrash *x) {
 }
 
 static int usage(const char *argv0) {
-    fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--boot | --probe-fs]\n", argv0);
+    fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--boot | --probe-fs | --import-save "
+            "[ryujinx | FOLDER]]\n", argv0);
     return 2;
 }
 
@@ -358,7 +359,8 @@ int main(int argc, char **argv) {
                      .romfs = cfg_get("MLB_ROMFS") ? cfg_get("MLB_ROMFS") : rt_default_romfs,
                      .profile = cfg_get("MLB_PROFILE") ? cfg_get("MLB_PROFILE") : rt_default_profile,
                      .gpu = cfg_value("MLB_GPU")};
-    int probe = 0;
+    int probe = 0, import = 0;
+    const char *import_from = NULL;
     for (int i = 1; i < argc; i++) {
         const char **path = !strcmp(argv[i], "--exefs") ? &cfg.exefs : !strcmp(argv[i], "--romfs") ? &cfg.romfs
                           : !strcmp(argv[i], "--profile") ? &cfg.profile : NULL;
@@ -369,10 +371,15 @@ int main(int argc, char **argv) {
             cfg.boot = 1;
         } else if (!strcmp(argv[i], "--probe-fs")) {   // fs_host.c: the nn::fs overrides on the RomFS and in a
             probe = 1;                                 // temporary profile; no guest code runs
+        } else if (!strcmp(argv[i], "--import-save")) {   // save_import.c: another host's save of the game (Ryujinx's
+            import = 1;                                    // by default) becomes the profile's save; no guest code runs
+            if (i + 1 < argc && strncmp(argv[i + 1], "--", 2)) import_from = argv[++i];
         } else {
             return usage(argv[0]);
         }
     }
+    // --import-save reports on the console only: opening the log would replace mlb.log, a running game's too
+    if (import) return save_import_main(import_from);
     log_open();
     if (probe) return probe_fs();
     // mlbts-native, for now (the batting frame rate): the sampling profiler, with every thread's call chains for each

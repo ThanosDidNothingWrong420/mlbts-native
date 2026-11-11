@@ -347,6 +347,9 @@ int plat_fs_list(const char *dir, int (*cb)(const char *name, int kind, uint64_t
 // An existing file for reading and, with write, writing; *err (may be NULL) gets the reason on failure.
 PlatFile *plat_fs_open(const char *path, int write, int *err);
 PlatFile *plat_fs_create(const char *path, int *err);     // a new file for writing; PLAT_FS_EXISTS when there
+// mlbts-native: a lock file, made when missing and held open with no sharing until plat_file_close or the process
+// ends however it ends; PLAT_FS_BUSY in *err while another process holds it.
+PlatFile *plat_fs_lock(const char *path, int *err);
 int64_t plat_file_pwrite(PlatFile *f, const void *buf, uint32_t n, uint64_t off);   // bytes written, -1 on error
 int plat_file_set_size(PlatFile *f, uint64_t size);       // PLAT_FS_*
 int plat_file_fsync(PlatFile *f);                         // the file's data to the disk; 1 on success

@@ -53,7 +53,9 @@ that another title couldn't replace.
   - MLB's extra overloads are added: `GetFreeSpaceSize`, `ExtendSaveData`/`GetSaveDataSize` (sizes kept in
     `<profile>/save-size`), `MountCacheStorage(name)`, `DeleteDirectory`, `GetDirectoryEntryCount`,
     `QueryMountRomCacheSize(size_t *, int)`, `EnableGlobalFileDataCache`;
-  - the probe checks the RomFS mount against `romfs_list.tsv`.
+  - the probe checks the RomFS mount against `romfs_list.tsv`;
+  - `<profile>/profile.lock` is held while a game runs, and `fs_save_import` replaces the committed save with another
+    host's copy (see "Importing a save from Ryujinx"); `save_recover` finishes an import stopped between its two moves.
 
 ## Building and running
 
@@ -75,6 +77,29 @@ refuses to start without that marker:
 RomFS entries, 64 sampled files read whole through each `ReadFile` overload and compared with an independent read, a
 RomFS listing, refused RomFS writes, and TotK's save-transaction and storage checks in a temporary profile (including
 a crash at each step of a Commit). Status: 108 of 108 checks pass.
+
+### Importing a save from Ryujinx
+
+A Switch save is the same files on every host, so a Ryujinx save needs no conversion: MLB lists its save folders
+(`CARR<n>/`, `PLYA<n>/`, `SETT<n>/`, each with `SAVEINFO` and `SAVE_000`) and reads them by name, whatever the
+account. Verified: a Ryujinx 1.0.15 save, copied unchanged into a profile with another account id, loaded its
+settings and its Road to the Show career. Close the game, then:
+
+```bash
+work/build/mlb.exe --import-save
+```
+
+With no argument (or `ryujinx`) it reads Ryujinx's save index in `%APPDATA%\Ryujinx` (`imkvdb.arc`, which maps the
+title and user to a save folder number) and takes `bis\user\save\<number>\0`; with several Ryujinx users it takes the
+save written last and names the others. A folder argument can be a Ryujinx data folder (a portable Ryujinx's
+`portable`), a Ryujinx save folder `bis\user\save\<number>`, or any folder holding the save's files (yuzu and its
+forks: `nand\user\save\0000000000000000\<user>\0100AA7024094000`). `--profile DIR` picks the profile as usual.
+
+The current save moves whole to `<profile>/save-before-import/<UTC time>/`, which is never pruned: to go back, close
+the game and put that folder's contents in `<profile>/save/<uid>/`. The import is refused while a game runs on the
+profile (`profile.lock`), and it reports on the console only (it does not replace `mlb.log`). Code:
+`runtime/core/save_import.c` (finding the source) and `fs_save_import` in `fs_host.c` (copy, flushed; old save aside;
+copy in).
 
 Generation takes about 50 s. A clean build takes about 2.5 min with 10 parallel jobs; after that, runtime-only
 changes relink in seconds. Settings come from the environment: `MLB_TRACE=svc,host,ipc,fs,sched,all`,
