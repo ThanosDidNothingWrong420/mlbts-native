@@ -25,8 +25,9 @@ static const CfgMeta metas[] = {
     {"TIMEZONE", "local", "local|utc", RESTART},   // time.c: the host time zone, or UTC
     {"SPIN", "1", "0|1", RESTART},   // kernel.c spin-wait gates (TotK reads it without a row)
     {"NICKNAME", "Player", NULL, RESTART},   // account.c GetNickname (up to 32 bytes of UTF-8)
-    {"PAD_MAP", "label", "label|position", LIVE},   // hid.c: XInput face buttons by label or by place
-    {"RUMBLE", "1", "0|1", LIVE},   // hid.c: vibration on the XInput pad
+    {"PAD_MAP", "label", "label|position", LIVE},   // hid.c: controller face buttons by label or by place
+    {"RUMBLE", "1", "0|1", LIVE},   // hid.c: vibration on the controllers
+    {"PAD_DRIVER", "sdl", "sdl|xinput", RESTART},   // hid.c: SDL3 (Xbox and PlayStation pads) or XInput (Xbox only)
     {"GPU", "vulkan", "vulkan|null", RESTART},   // main.c: the graphics back end (gfx_null.c chooses by it)
     {"AA", "fxaa", "off|fxaa", LIVE},   // vk_aa.c: antialiasing of the 3D scene before the game lays its HUD over it
     {"AA_STRENGTH", "75", "0..100", LIVE},   // vk_aa.c: how much FXAA softens thin, sub-pixel detail

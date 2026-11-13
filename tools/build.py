@@ -117,6 +117,15 @@ def main():
     gen_srcs = sorted(p for name in linked for p in (gen / name).glob('*.c'))
     if not (DEPS / 'lib' / 'vulkan-1.lib').is_file():
         raise SystemExit(f'{DEPS} is missing the Vulkan headers and import library: run tools/fetch_deps.py')
+    if not (DEPS / 'include' / 'SDL3' / 'SDL.h').is_file() or not (DEPS / 'bin' / 'SDL3.dll').is_file():
+        raise SystemExit(f'{DEPS} is missing SDL3 (controllers): run tools/fetch_deps.py')
+    # runtime/mlb/hid.c loads SDL3.dll from mlb.exe's folder at run time. A running game holds it: keep the old copy then.
+    sdl_src, sdl_dst = DEPS / 'bin' / 'SDL3.dll', out / 'SDL3.dll'
+    if not sdl_dst.is_file() or sdl_dst.read_bytes() != sdl_src.read_bytes():
+        try:
+            shutil.copyfile(sdl_src, sdl_dst)
+        except OSError as e:
+            print(f'warning: {sdl_dst} not updated ({e})')
     inc_rt = ['-I', 'runtime/mlb', '-I', 'runtime/core', '-I', 'runtime/gfx', '-I', rel(gen), '-I', rel(DEPS / 'include'),
               '-I', rel(DEPS / 'include' / 'vma'), '-I', 'runtime/third_party/imgui']
     inc_gen = ['-I', 'runtime/core', '-I', rel(gen)]

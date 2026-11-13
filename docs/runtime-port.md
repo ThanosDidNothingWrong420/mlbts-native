@@ -114,8 +114,9 @@ The toolchain is LLVM clang 23 (`x86_64-pc-windows-msvc`) with lld and Ninja fro
 .venv/Scripts/python -I tools/build_xlate.py
 ```
 
-The first fetches the pinned Vulkan headers and VMA into `work/deps` and generates `vulkan-1.lib` from the driver's
-loader. The second builds the shader translator `work/xlate/totk_xlate.exe` with .NET 10 NativeAOT; it needs VS 2022's
+The first fetches the pinned Vulkan headers, VMA and SDL 3.4.18 (headers and `SDL3.dll`, for controllers) into
+`work/deps` and generates `vulkan-1.lib` from the driver's loader. `tools/build.py` copies `SDL3.dll` next to
+`mlb.exe`. The second builds the shader translator `work/xlate/totk_xlate.exe` with .NET 10 NativeAOT; it needs VS 2022's
 linker. `tools/shader_smoke.py` translates a sample of MLB's FXB shaders offline: 66 of 66 translate.
 
 ## Boot progress (1.0.15)
@@ -168,8 +169,10 @@ linker. `tools/shader_smoke.py` translates a sample of MLB's FXB shaders offline
     with the local Uid, and its nickname comes from `MLB_NICKNAME` (default `Player`). The network service account
     reads as unavailable; its other online calls stop with a named fatal, so no SDK code ever sees a host-made user
     handle. ✔
-16. **Input** by symbol override (`runtime/mlb/hid.c`): one full-key controller as player 1, fed by XInput and the
-    keyboard (map in the file header; `MLB_PAD_MAP`, `MLB_RUMBLE`). ✔
+16. **Input** by symbol override (`runtime/mlb/hid.c`): one full-key controller as player 1, fed by every connected
+    gamepad through SDL3 (Xbox and PlayStation pads: DualSense, DualSense Edge, DualShock 4; merged) and the keyboard
+    (map in the file header; `MLB_PAD_MAP`, `MLB_RUMBLE`). `MLB_PAD_DRIVER=xinput`, or no `SDL3.dll` beside the exe,
+    falls back to XInput (Xbox pads only). ✔
 17. More offline services: `ssl`, `csrng` (host random bytes), `ngc:u` (no word list, nothing flagged), `friend:u`
     (an empty notification queue whose event never fires), `nim:eca`, `nsd:u` (environment `lp1`, `ResolveEx`), and
     `pctl`'s free-communication commands (permitted). The SDK's own `nn::account` user lists are overridden too

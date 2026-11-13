@@ -4,14 +4,22 @@
 //
 // The console is docked (am.c), so the controller is a full-key controller as player 1 (NpadId No1, style bit 0); the
 // handheld id and the Joy-Con styles read as disconnected. Its state is merged from:
-//   - an XInput gamepad (xinput1_4.dll, loaded at run time; Xbox and compatible pads). MLB_PAD_MAP=label (default)
-//     maps by label: Xbox A is Switch A (confirm), B is B; =position maps by place, as on the console: Xbox B (east) is
-//     Switch A. Triggers past half way are ZL/ZR.
+//   - every connected gamepad, through SDL3 (SDL3.dll next to mlb.exe, loaded at run time; tools/fetch_deps.py):
+//     Xbox pads (SDL's XInput driver), PlayStation pads (DualSense, DualSense Edge, DualShock 4, DualShock 3; SDL's
+//     HID drivers, USB or Bluetooth), Switch Pro and other pads SDL knows. Their buttons are ORed and each stick takes
+//     the pad pushed furthest, so an Xbox and a PlayStation pad can be connected at once. As in TotK, Astral Chain and
+//     Power Moon Recomp, which read their controllers through SDL3 too. MLB_PAD_DRIVER=xinput, or no SDL3.dll, reads
+//     the first XInput pad instead (xinput1_4.dll; Xbox and compatible pads only).
+//     MLB_PAD_MAP=label (default) maps the face buttons by label: Xbox A / PlayStation cross is Switch A (confirm),
+//     B / circle is B, X / square is X, Y / triangle is Y (a Nintendo-labelled pad's A is A). =position maps by place,
+//     as on the console: the east button (Xbox B, circle) is Switch A. Triggers past half way are ZL/ZR; View / Share /
+//     Create and the PlayStation touchpad click are -, Menu / Options are +. The guide button (Xbox, PS) opens the
+//     settings menu.
 //   - the keyboard, while a window of this process is in the foreground (GetAsyncKeyState):
 //       left stick W A S D, right stick I J K L, d-pad arrow keys, A Enter or Space, B Escape or Backspace, X R, Y F,
 //       L Q, R E, ZL 1, ZR 3, + Tab, - M, left stick click C, right stick click V.
-// Vibration plays on the XInput pad's motors (MLB_RUMBLE=0: off): the low band's amplitude on the left motor, the high
-// band's on the right, times MLB_RUMBLE_STRENGTH percent. The XInput sticks get a radial dead zone
+// Vibration plays on every pad's motors (MLB_RUMBLE=0: off): the low band's amplitude on the left (heavy) motor, the
+// high band's on the right, times MLB_RUMBLE_STRENGTH percent. The sticks get a radial dead zone
 // (MLB_LSTICK_DEADZONE / MLB_RSTICK_DEADZONE, else MLB_STICK_DEADZONE, percent; the settings menu's Controls tab).
 // Nothing here allocates guest memory or calls back into the guest.
 #define WIN32_LEAN_AND_MEAN
@@ -20,6 +28,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <string.h>
+#include <SDL3/SDL.h>   // types and constants only: the functions come from SDL3.dll (sdl_load)
 
 #include "cfg.h"
 #include "host.h"
@@ -156,25 +165,232 @@ static uint64_t pad_bits(const XPad *p) {
     return b;
 }
 
+// ---- SDL3, loaded at run time from mlb.exe's folder. Every SDL call is made under sdl_lock: the game's npad reads,
+// the settings menu (render thread) and vibration come from different threads.
+#define SDL_FNS(X)                                                                                                     \
+    X(SDL_SetHint) X(SDL_Init) X(SDL_GetError) X(SDL_GetVersion) X(SDL_SetEventEnabled) X(SDL_free)                  \
+    X(SDL_GetGamepads) X(SDL_OpenGamepad) X(SDL_CloseGamepad) X(SDL_GamepadConnected) X(SDL_UpdateGamepads)          \
+    X(SDL_GetGamepadButton) X(SDL_GetGamepadAxis) X(SDL_GetGamepadButtonLabel) X(SDL_GetGamepadName)                 \
+    X(SDL_GetGamepadType) X(SDL_GetGamepadProperties) X(SDL_GetBooleanProperty) X(SDL_RumbleGamepad)
+#define SDL_PTR(f) static __typeof__(f) *p_##f;
+SDL_FNS(SDL_PTR)
+#undef SDL_PTR
+
+#define SCAN_NS 1000000000ull   // a new controller is looked for once a second
+#define UPDATE_NS 2000000ull    // SDL reads the controllers at most every 2 ms (the console samples every 5)
+enum { MAX_PADS = 4 };
+typedef struct {
+    SDL_Gamepad *g;
+    SDL_JoystickID id;
+    int face_label[4];   // the Switch button of the south, east, west, north button by its label, -1 unknown
+} SdlPad;
+static PlatMutex sdl_lock = PLAT_MUTEX_INIT;
+static PlatOnce sdl_once = PLAT_ONCE_INIT;
+static int sdl_ok;   // SDL3 loaded and its gamepad subsystem up: the pads come from SDL, not XInput
+static SdlPad pads[MAX_PADS];
+static int npads;
+static uint64_t next_scan, last_update;
+
+static const char *pad_family(SDL_GamepadType t) {
+    switch (t) {
+    case SDL_GAMEPAD_TYPE_XBOX360: case SDL_GAMEPAD_TYPE_XBOXONE: return "Xbox";
+    case SDL_GAMEPAD_TYPE_PS3: return "PlayStation 3";
+    case SDL_GAMEPAD_TYPE_PS4: return "PlayStation 4";
+    case SDL_GAMEPAD_TYPE_PS5: return "PlayStation 5";
+    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO: case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR: return "Nintendo";
+    default: return "generic";
+    }
+}
+
+static void sdl_load(void *arg) {
+    (void)arg;
+    if (!strcmp(cfg_value("MLB_PAD_DRIVER"), "xinput")) {
+        rt_log("hid: MLB_PAD_DRIVER=xinput: Xbox pads through XInput only");
+        return;
+    }
+    wchar_t path[MAX_PATH + 16];
+    DWORD n = GetModuleFileNameW(NULL, path, MAX_PATH);
+    while (n && path[n - 1] != L'\\' && path[n - 1] != L'/') n--;
+    if (!n || n >= MAX_PATH) return;
+    wcscpy(path + n, L"SDL3.dll");   // this folder only: no other SDL3.dll on the search path gets loaded
+    HMODULE m = LoadLibraryExW(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!m) {
+        rt_log("hid: no SDL3.dll next to mlb.exe (tools/build.py copies it): Xbox pads through XInput only, no "
+               "PlayStation pads");
+        return;
+    }
+    int all = 1;
+#define SDL_GET(f) all &= (p_##f = (__typeof__(f) *)(void *)GetProcAddress(m, #f)) != NULL;
+    SDL_FNS(SDL_GET)
+#undef SDL_GET
+    if (!all) {
+        rt_log("hid: SDL3.dll lacks a function this port needs: XInput only");
+        return;
+    }
+    // No SDL window: the pads count whichever window is in front, as XInput did (the keyboard keeps its focus check).
+    p_SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    if (!p_SDL_Init(SDL_INIT_GAMEPAD)) {
+        rt_log("hid: SDL gamepad init failed (%s): XInput only", p_SDL_GetError());
+        return;
+    }
+    // Nothing drains SDL's event queue: the per-input events stay off (the state still updates).
+    static const SDL_EventType quiet[] = {
+        SDL_EVENT_JOYSTICK_AXIS_MOTION, SDL_EVENT_JOYSTICK_BALL_MOTION, SDL_EVENT_JOYSTICK_HAT_MOTION,
+        SDL_EVENT_JOYSTICK_BUTTON_DOWN, SDL_EVENT_JOYSTICK_BUTTON_UP, SDL_EVENT_JOYSTICK_BATTERY_UPDATED,
+        SDL_EVENT_JOYSTICK_UPDATE_COMPLETE, SDL_EVENT_GAMEPAD_AXIS_MOTION, SDL_EVENT_GAMEPAD_BUTTON_DOWN,
+        SDL_EVENT_GAMEPAD_BUTTON_UP, SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN, SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION,
+        SDL_EVENT_GAMEPAD_TOUCHPAD_UP, SDL_EVENT_GAMEPAD_SENSOR_UPDATE, SDL_EVENT_GAMEPAD_UPDATE_COMPLETE,
+    };
+    for (size_t i = 0; i < sizeof quiet / sizeof *quiet; i++) p_SDL_SetEventEnabled(quiet[i], false);
+    int v = p_SDL_GetVersion();
+    rt_log("hid: SDL %d.%d.%d: Xbox and PlayStation controllers; keyboard while the game window has focus",
+           SDL_VERSIONNUM_MAJOR(v), SDL_VERSIONNUM_MINOR(v), SDL_VERSIONNUM_MICRO(v));
+    sdl_ok = 1;
+}
+
+static int switch_of_label(SDL_GamepadButtonLabel l) {
+    switch (l) {
+    case SDL_GAMEPAD_BUTTON_LABEL_A: case SDL_GAMEPAD_BUTTON_LABEL_CROSS: return B_A;
+    case SDL_GAMEPAD_BUTTON_LABEL_B: case SDL_GAMEPAD_BUTTON_LABEL_CIRCLE: return B_B;
+    case SDL_GAMEPAD_BUTTON_LABEL_X: case SDL_GAMEPAD_BUTTON_LABEL_SQUARE: return B_X;
+    case SDL_GAMEPAD_BUTTON_LABEL_Y: case SDL_GAMEPAD_BUTTON_LABEL_TRIANGLE: return B_Y;
+    default: return -1;
+    }
+}
+
+static const SDL_GamepadButton face_sdl[4] = {SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_EAST,
+                                              SDL_GAMEPAD_BUTTON_WEST, SDL_GAMEPAD_BUTTON_NORTH};
+
+// Under sdl_lock: drop the pads that went away; once a second open the ones that arrived. Logs each change.
+static void sdl_scan(void) {
+    for (int i = 0; i < npads;)
+        if (p_SDL_GamepadConnected(pads[i].g)) i++;
+        else {
+            rt_log("hid: controller %u disconnected", (unsigned)pads[i].id);
+            p_SDL_CloseGamepad(pads[i].g);
+            pads[i] = pads[--npads];
+        }
+    uint64_t now = plat_now_ns();
+    if (now < next_scan) return;
+    next_scan = now + SCAN_NS;
+    int n = 0;
+    SDL_JoystickID *ids = p_SDL_GetGamepads(&n);
+    for (int k = 0; ids && k < n && npads < MAX_PADS; k++) {
+        int have = 0;
+        for (int i = 0; i < npads; i++) have |= pads[i].id == ids[k];
+        if (have) continue;
+        SDL_Gamepad *g = p_SDL_OpenGamepad(ids[k]);
+        if (!g) continue;
+        SdlPad *p = &pads[npads++];
+        p->g = g, p->id = ids[k];
+        for (int f = 0; f < 4; f++) p->face_label[f] = switch_of_label(p_SDL_GetGamepadButtonLabel(g, face_sdl[f]));
+        int rumble = p_SDL_GetBooleanProperty(p_SDL_GetGamepadProperties(g), SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
+        const char *name = p_SDL_GetGamepadName(g);
+        rt_log("hid: controller %u \"%s\" connected (%s layout, %s)", (unsigned)p->id, name ? name : "?",
+               pad_family(p_SDL_GetGamepadType(g)), rumble ? "rumble" : "no rumble");
+    }
+    p_SDL_free(ids);
+}
+
+// Under sdl_lock: the Switch buttons of one SDL pad; its guide button (Xbox, PS) ORs into *guide.
+static uint64_t sdl_bits(const SdlPad *p, int label, int *guide) {
+    SDL_Gamepad *g = p->g;
+    uint64_t b = 0;
+    // South, east, west, north by position: Switch B, A, Y, X, where the console has them. By label: the letter or
+    // PlayStation symbol on the button; a pad without known labels as an Xbox pad (south A, east B, west X, north Y).
+    static const int pos[4] = {B_B, B_A, B_Y, B_X}, xbox[4] = {B_A, B_B, B_X, B_Y};
+    for (int f = 0; f < 4; f++)
+        if (p_SDL_GetGamepadButton(g, face_sdl[f]))
+            b |= BIT(!label ? pos[f] : p->face_label[f] >= 0 ? p->face_label[f] : xbox[f]);
+    static const struct { SDL_GamepadButton s; int bit; } other[] = {
+        {SDL_GAMEPAD_BUTTON_DPAD_UP, B_UP}, {SDL_GAMEPAD_BUTTON_DPAD_DOWN, B_DOWN},
+        {SDL_GAMEPAD_BUTTON_DPAD_LEFT, B_LEFT}, {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, B_RIGHT},
+        {SDL_GAMEPAD_BUTTON_START, B_PLUS}, {SDL_GAMEPAD_BUTTON_BACK, B_MINUS}, {SDL_GAMEPAD_BUTTON_TOUCHPAD, B_MINUS},
+        {SDL_GAMEPAD_BUTTON_LEFT_STICK, B_LSTICK}, {SDL_GAMEPAD_BUTTON_RIGHT_STICK, B_RSTICK},
+        {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, B_L}, {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, B_R},
+    };
+    for (size_t i = 0; i < sizeof other / sizeof *other; i++)
+        if (p_SDL_GetGamepadButton(g, other[i].s)) b |= BIT(other[i].bit);
+    if (p_SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 16384) b |= BIT(B_ZL);
+    if (p_SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16384) b |= BIT(B_ZR);
+    *guide |= p_SDL_GetGamepadButton(g, SDL_GAMEPAD_BUTTON_GUIDE);
+    return b;
+}
+
+// ---- every controller merged: buttons ORed, each stick from the pad pushed furthest (raw, before the dead zone)
+typedef struct { uint64_t buttons; int32_t lx, ly, rx, ry; int guide; } PadIn;
+
+static void take_stick(int32_t *x, int32_t *y, int32_t nx, int32_t ny) {
+    if ((int64_t)nx * nx + (int64_t)ny * ny > (int64_t)*x * *x + (int64_t)*y * *y) *x = nx, *y = ny;
+}
+
+// 1 when a controller is connected. SDL's y axes grow downwards, the Switch's upwards.
+static int pad_read(PadIn *in) {
+    memset(in, 0, sizeof *in);
+    plat_once(&sdl_once, sdl_load, NULL);
+    if (!sdl_ok) {
+        XPad p;
+        if (!xinput_read(&p)) return 0;
+        in->buttons = pad_bits(&p);
+        in->lx = clamp_stick(p.lx), in->ly = clamp_stick(p.ly), in->rx = clamp_stick(p.rx), in->ry = clamp_stick(p.ry);
+        return 1;
+    }
+    int label = strcmp(cfg_value("MLB_PAD_MAP"), "position") != 0;
+    plat_mutex_lock(&sdl_lock);
+    uint64_t now = plat_now_ns();
+    if (now - last_update >= UPDATE_NS) {   // the game reads the npad several times a frame: one update serves them
+        last_update = now;
+        p_SDL_UpdateGamepads();
+        sdl_scan();
+    }
+    for (int i = 0; i < npads; i++) {
+        SDL_Gamepad *g = pads[i].g;
+        in->buttons |= sdl_bits(&pads[i], label, &in->guide);
+        take_stick(&in->lx, &in->ly, clamp_stick(p_SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFTX)),
+                   clamp_stick(-(int32_t)p_SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFTY)));
+        take_stick(&in->rx, &in->ry, clamp_stick(p_SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHTX)),
+                   clamp_stick(-(int32_t)p_SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHTY)));
+    }
+    int have = npads > 0;
+    plat_mutex_unlock(&sdl_lock);
+    return have;
+}
+
+// Both motors of every controller, 0..65535 each.
+static void pad_rumble(uint16_t lo, uint16_t hi) {
+    plat_once(&sdl_once, sdl_load, NULL);
+    if (sdl_ok) {
+        plat_mutex_lock(&sdl_lock);
+        // SDL stops a rumble after its duration: the longest it takes, as XInput's motors run until told otherwise.
+        // The same values again only extend it (SDL sends no report then).
+        for (int i = 0; i < npads; i++) p_SDL_RumbleGamepad(pads[i].g, lo, hi, 0xFFFF);
+        plat_mutex_unlock(&sdl_lock);
+        return;
+    }
+    plat_once(&xinput_once, xinput_load, NULL);
+    if (x_set && pad_slot >= 0) {
+        XVibration xv = {lo, hi};
+        x_set((DWORD)pad_slot, &xv);
+    }
+}
+
 // mlbts-native: the in-game settings menu (ui/menu.cpp) reads the pad itself while it is open, in Switch button bits
 // (the same as the game's: A 0, B 1, X 2, Y 3, L 6, R 7, ZL 8, ZR 9, d-pad 12..15). 0 without a pad.
 int hid_menu_pad(uint64_t *buttons, int32_t *lx, int32_t *ly) {
-    XPad p;
-    *buttons = 0, *lx = *ly = 0;
-    if (!xinput_read(&p)) return 0;
-    *buttons = pad_bits(&p);
-    *lx = clamp_stick(p.lx), *ly = clamp_stick(p.ly);
-    return 1;
+    PadIn in;
+    int have = pad_read(&in);
+    *buttons = in.buttons, *lx = in.lx, *ly = in.ly;
+    return have;
 }
 
 // mlbts-native: the settings menu's dead zone rows show how far each stick is pushed now, before the dead zone (a
 // drifting stick's resting value). now[0] left, now[1] right, in percent of full travel; 0 without a pad.
 int hid_stick_percent(double now[2]) {
-    XPad p;
+    PadIn in;
     now[0] = now[1] = 0;
-    if (!xinput_read(&p)) return 0;
-    double lx = p.lx / (double)STICK_MAX, ly = p.ly / (double)STICK_MAX, rx = p.rx / (double)STICK_MAX,
-           ry = p.ry / (double)STICK_MAX;
+    if (!pad_read(&in)) return 0;
+    double lx = in.lx / (double)STICK_MAX, ly = in.ly / (double)STICK_MAX, rx = in.rx / (double)STICK_MAX,
+           ry = in.ry / (double)STICK_MAX;
     now[0] = fmin(sqrt(lx * lx + ly * ly), 1) * 100;
     now[1] = fmin(sqrt(rx * rx + ry * ry), 1) * 100;
     return 1;
@@ -184,11 +400,12 @@ int hid_stick_percent(double now[2]) {
 static void poll(NpadState *st) {
     uint64_t b = 0;
     int32_t lx = 0, ly = 0, rx = 0, ry = 0;
-    XPad p;
+    int guide = 0;
+    PadIn in;
     knobs();
-    if (xinput_read(&p)) {
-        b = pad_bits(&p);
-        lx = clamp_stick(p.lx), ly = clamp_stick(p.ly), rx = clamp_stick(p.rx), ry = clamp_stick(p.ry);
+    if (pad_read(&in)) {
+        b = in.buttons, guide = in.guide;
+        lx = in.lx, ly = in.ly, rx = in.rx, ry = in.ry;
         dead_zone(&lx, &ly, dz_l);
         dead_zone(&rx, &ry, dz_r);
     }
@@ -214,13 +431,14 @@ static void poll(NpadState *st) {
     if (ry >= STICK_DIR) b |= BIT(B_RS_UP);
     if (ry <= -STICK_DIR) b |= BIT(B_RS_DOWN);
     // mlbts-native: the in-game settings menu (ui/menu.cpp). Minus and Plus pressed together (Back and Start on an
-    // Xbox pad) open or close it; while it is open the game gets an idle controller. Buttons held when it closes stay
-    // hidden from the game until released: the B that closed the menu would otherwise also go "back" in the game.
+    // Xbox pad, Share / Create and Options on a PlayStation pad) or the guide button (Xbox, PS) open or close it; while
+    // it is open the game gets an idle controller. Buttons held when it closes stay hidden from the game until
+    // released: the B that closed the menu would otherwise also go "back" in the game.
     static uint64_t prev, hidden;
-    static int was_open;
+    static int was_open, prev_guide;
     const uint64_t combo = BIT(B_MINUS) | BIT(B_PLUS);
-    if ((b & combo) == combo && (prev & combo) != combo) menu_toggle();
-    prev = b;
+    if (((b & combo) == combo && (prev & combo) != combo) || (guide && !prev_guide)) menu_toggle();
+    prev = b, prev_guide = guide;
     int open = menu_is_open();
     if (open) hidden = ~0ull;
     else if (was_open) hidden = b;
@@ -370,11 +588,7 @@ static void ov_vib_send(Cpu *c) {
     plat_mutex_unlock(&lock);
     knobs();
     lo *= (float)rumble_gain, hi *= (float)rumble_gain;
-    plat_once(&xinput_once, xinput_load, NULL);
-    if (x_set && pad_slot >= 0) {
-        XVibration xv = {(uint16_t)(fminf(fmaxf(lo, 0), 1) * 65535), (uint16_t)(fminf(fmaxf(hi, 0), 1) * 65535)};
-        x_set((DWORD)pad_slot, &xv);
-    }
+    pad_rumble((uint16_t)(fminf(fmaxf(lo, 0), 1) * 65535), (uint16_t)(fminf(fmaxf(hi, 0), 1) * 65535));
 }
 
 HOST_OVERRIDE("_ZN2nn3hid14InitializeNpadEv", ov_initialize_npad);

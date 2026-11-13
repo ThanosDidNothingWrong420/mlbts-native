@@ -6,6 +6,9 @@
 - Vulkan Memory Allocator v3.4.0 (MIT): vk_mem_alloc.h -> <out>/include/vma/
 - vulkan-1.lib: an import library for the Vulkan loader the GPU driver installed (C:\\Windows\\System32\\vulkan-1.dll),
   made from the DLL's export table with llvm-readobj and llvm-dlltool. No loader is built or shipped.
+- SDL 3.4.18 (zlib), the upstream VC development release: include/SDL3 -> <out>/include/SDL3/, the x64 SDL3.dll ->
+  <out>/bin/ (tools/build.py copies it next to mlb.exe). runtime/mlb/hid.c loads it at run time for Xbox and
+  PlayStation controllers; no import library is linked.
 
 The same versions as TotK Recomp (THIRD_PARTY_NOTICES.md there). Downloads are checked against the SHA-256 recorded
 below on the first successful fetch: a mismatch stops.
@@ -19,6 +22,7 @@ import subprocess
 import sys
 import tarfile
 import urllib.request
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -26,6 +30,8 @@ LLVM = Path(r'C:\Program Files\LLVM\bin')
 HEADERS_URL = 'https://codeload.github.com/KhronosGroup/Vulkan-Headers/tar.gz/refs/tags/v1.4.363'
 VMA_URL = ('https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/v3.4.0/include/'
            'vk_mem_alloc.h')
+SDL_VERSION = '3.4.18'
+SDL_URL = f'https://github.com/libsdl-org/SDL/releases/download/release-{SDL_VERSION}/SDL3-devel-{SDL_VERSION}-VC.zip'
 PINS = ROOT / 'tools' / 'data' / 'deps.sha256.json'   # url -> sha256, written by the first fetch
 
 
@@ -68,6 +74,28 @@ def vma(out):
     print('VMA 3.4.0 ->', dst)
 
 
+def sdl3(out):
+    top = f'SDL3-{SDL_VERSION}/'
+    with zipfile.ZipFile(io.BytesIO(fetch(SDL_URL))) as zf:
+        for name in zf.namelist():
+            if name.endswith('/') or not name.startswith(top):
+                continue
+            rest = name[len(top):]
+            if rest.startswith('include/SDL3/'):
+                dst = out / rest
+            elif rest == 'lib/x64/SDL3.dll':
+                dst = out / 'bin' / 'SDL3.dll'
+            elif rest == 'LICENSE.txt':
+                dst = out / 'licenses' / 'SDL3.txt'
+            else:
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(zf.read(name))
+    if not (out / 'bin' / 'SDL3.dll').is_file():
+        raise SystemExit(f'{SDL_URL}: no lib/x64/SDL3.dll inside')
+    print(f'SDL {SDL_VERSION} ->', out / 'include' / 'SDL3', 'and', out / 'bin' / 'SDL3.dll')
+
+
 def import_lib(out):
     dll = Path(r'C:\Windows\System32\vulkan-1.dll')
     text = subprocess.run([str(LLVM / 'llvm-readobj.exe'), '--coff-exports', str(dll)], check=True,
@@ -90,6 +118,7 @@ def main():
     a.out.mkdir(parents=True, exist_ok=True)
     headers(a.out)
     vma(a.out)
+    sdl3(a.out)
     import_lib(a.out)
 
 

@@ -122,7 +122,7 @@ static void drain_events(ImGuiIO &io) {
     }
 }
 
-// ---- gamepad navigation: the Switch buttons of the XInput pad (hid.c, after MLB_PAD_MAP) to ImGui's gamepad keys.
+// ---- gamepad navigation: the Switch buttons of the controllers (hid.c, after MLB_PAD_MAP) to ImGui's gamepad keys.
 // A confirms, B goes back, L / R switch tabs.
 enum { P_A = 0, P_B = 1, P_X = 2, P_Y = 3, P_L = 6, P_R = 7, P_ZL = 8, P_ZR = 9, P_LEFT = 12, P_UP = 13, P_RIGHT = 14,
        P_DOWN = 15 };
@@ -588,9 +588,10 @@ static void tab_controls(float scale) {
     opt_begin("##controls", scale);
     static const char *const map[] = {"By label", "By position"};
     opt_choice("PAD_MAP", "Face buttons", map, 2,
-               "How an Xbox-style controller's A B X Y map to the Switch buttons.\n\nBy label: Xbox A is Switch A "
-               "(confirm), B is B. By position: the buttons work by where they sit, as on a Switch controller, so the "
-               "east button (Xbox B) confirms.");
+               "How the controller's face buttons map to the Switch buttons.\n\nBy label: Xbox A or PlayStation cross "
+               "is Switch A (confirm), B or circle is B, X or square is X, Y or triangle is Y. By position: the "
+               "buttons work by where they sit, as on a Switch controller, so the east button (Xbox B, circle) "
+               "confirms.");
     opt_toggle("RUMBLE", "Vibration", "Controller rumble when the game asks for it.");
     opt_slider("RUMBLE_STRENGTH", "Vibration strength", 0, 300,
                "How strongly the controller vibrates. 100 % is the strength the game asks for; above it, weak "
@@ -614,8 +615,10 @@ static void tab_controls(float scale) {
     opt_group("Keys");
     opt_text("Keyboard: left stick W A S D, right stick I J K L, d-pad arrow keys, A Enter or Space, B Esc or "
              "Backspace, X R, Y F, L Q, R E, ZL 1, ZR 3, + Tab, - M, stick clicks C and V.\n\n"
-             "This menu: F1, or Back and Start together on the controller. Esc or B closes it, Q / E or LB / RB switch "
-             "the tabs. F10 cycles the performance overlay, F11 switches fullscreen.");
+             "Controllers: Xbox and PlayStation pads (DualSense, DualShock 4), several at once. Share / Create or the "
+             "touchpad click is -, Options is +.\n\n"
+             "This menu: F1, the Xbox or PS button, or Back and Start (Create and Options) together on the "
+             "controller. Esc or B closes it, Q / E or LB / RB (L1 / R1) switch the tabs. F10 cycles the performance overlay, F11 switches fullscreen.");
     opt_end();
 }
 
