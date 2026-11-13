@@ -647,7 +647,11 @@ void vk_exec_pass_begin(VkExec *ex) {
         if (has_image(want, nwant, t->image)) continue;
         want[nwant] = t->image, wasp[nwant++] = i < 8 ? VK_IMAGE_ASPECT_COLOR_BIT : t->img->aspect;
     }
-    barrier_to(ex, want, wasp, nwant);   // passes, clears, copies and dispatches see each other's results
+    int vk_exec_light_restart(VkExec *ex, int nwant);   // vk_exec_draw.c (compute between draws)
+    void vk_exec_light_pass(VkExec *ex);
+    int narrow = vk_exec_light_restart(ex, nwant);   // after dispatches that went without the full barrier
+    if (!narrow) barrier_to(ex, want, wasp, nwant);   // passes, clears, copies and dispatches see each other's results
+    vk_exec_light_pass(ex);
     ex->fbl_mask = fbl;
     ex->fb_dirty = 0;
     ex->pass_serial++;
@@ -680,7 +684,8 @@ void vk_exec_pass_begin(VkExec *ex) {
                    (unsigned long long)(uintptr_t)(ex->pass_ncolor > 1 && ex->color[1].tex ? ex->color[1].tex->mem : NULL),
                    (unsigned long long)(uintptr_t)(ex->depth.tex ? ex->depth.tex->mem : NULL));
     }
-    VkPassMark *m = ex->mark = vk_pass_mark_begin(ex->cb, VK_MARK_PASS, ex->fence);
+    // perf: a restart after a dispatch without the full barrier stays untimed (a timestamp waits for the work before it)
+    VkPassMark *m = ex->mark = narrow ? NULL : vk_pass_mark_begin(ex->cb, VK_MARK_PASS, ex->fence);
     if (m) {
         m->step = ex->mark_passes++;
         m->w = ex->pass_w, m->h = ex->pass_h, m->d = ex->pass_layers;
@@ -950,6 +955,8 @@ static void op_report(void) {
                       opn[i] / nf, opn[i] ? opt[i] * tick_ns / 1e3 / opn[i] : 0.0);
     }
     rt_log("%s", line);
+    void vk_exec_light_report(double nf);   // vk_exec_draw.c
+    vk_exec_light_report(nf);
     memset(opn, 0, sizeof opn), memset(opt, 0, sizeof opt);
     fr0 = fr, tsc0 = tsc, ns0 = ns;
 }

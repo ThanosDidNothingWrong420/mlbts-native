@@ -938,6 +938,153 @@ static void count_use(int cls, int use, uint64_t n) {
     else RS.cnt_over = 1;
 }
 
+// ---- compute between draws (mlbts-native, the celebration frame rate)
+// MLB's celebrations on the field run, for each player, a few dispatches of one compute shader (44eefd63: strands or
+// cloth from the bones) and then one draw of its output, inside a 1440x810 pass: about 45 such switches a frame. A
+// dispatch cannot run inside a Vulkan pass, so each switch ended the pass, drained the GPU with a full barrier, ran the
+// dispatch and drained it again at the pass restart: about 6 ms of a 14 ms frame went to these waits (46 fps). The
+// game orders none of them with barriers of its own (154 a frame). Now such a dispatch skips the first drain when it
+// writes nothing the draws since the last full barrier read or write and reads nothing they write (their storage
+// writes, the passes' targets); the pass restart then waits only for the compute work (before the next draws and
+// dispatches) and the targets' earlier writes, when it renders to the same targets and nothing else was recorded since
+// the dispatches. The draws are noted by guest address: uniform, storage, vertex, index and indirect ranges, buffer
+// textures, the passes' targets; a draw with a storage image leaves no such dispatch until the next full barrier. A
+// dispatch with a storage image, a copy while binding, or one that shares memory with the draws keeps the full barrier.
+// Dispatches chained after such a dispatch are checked the same way. MLB_LIGHT_DISPATCH=0: full barriers, as before.
+#define LT_N 4096   // ranges the draws since the last full barrier read or write
+#define LT_W 256    // of those, the ones they write
+#define LT_B 96     // ranges of the last draw's descriptor build (a skipped build notes them again)
+#define LT_D 32     // ranges of the dispatch being bound
+typedef struct {
+    struct { VkImage image; VkFormat format; uint32_t level, base_layer, layers; } t[9];
+    uint32_t w, h, layers, ncolor;
+    VkFormat depth, stencil;
+} LtSig;
+static struct {
+    int cfg;                           // -1: not read yet
+    uint64_t fence;                    // the notes are since the full barrier at (fence, at)
+    int at;
+    uint32_t gen;                      // dedup stamp, new at each reset
+    int n, nw, over;                   // over: too many notes, no light dispatch until the next full barrier
+    uint64_t lo[LT_N], hi[LT_N], wlo[LT_W], whi[LT_W];
+    uint64_t ball[64], bw[64];         // 4096 MiB buckets (address >> 20, mod 4096) some note touches
+    struct { uint64_t a, e; uint32_t g, w; } dc[256];
+    int bdraw, bn, bover;              // a draw's descriptor build is running; its notes
+    uint64_t blo[LT_B], bhi[LT_B];
+    uint8_t bw8[LT_B];
+    int cand, cand_at, dbad, dn, dnt, chained, nchk;   // the dispatch being bound
+    uint64_t dlo[LT_D], dhi[LT_D], dtex[16];
+    uint8_t dw[LT_D];
+    int pending;                       // a dispatch since the last pass went without the full barrier
+    VkCommandBuffer pend_cb;
+    LtSig sig;                         // the pass it ended
+    uint64_t light, hit, other, chk, chk_full, narrow, narrow_no;
+} LT = {.cfg = -1, .at = -2};
+
+static int lt_on(void) {
+    if (LT.cfg < 0) {
+        const char *e = cfg_get("MLB_LIGHT_DISPATCH");
+        LT.cfg = !e || strcmp(e, "0");
+        rt_log("vk_exec: a dispatch between draws %s", LT.cfg ? "waits only for what it shares with them (MLB_LIGHT_DISPATCH=0: "
+                                                               "full barriers around it)" : "ends the pass with full barriers");
+    }
+    return LT.cfg;
+}
+
+static void lt_sync(const VkExec *ex) {   // a full barrier since the notes began: they start again
+    if (LT.at == ex->barrier_at && LT.fence == ex->fence) return;
+    LT.at = ex->barrier_at, LT.fence = ex->fence;
+    LT.n = LT.nw = LT.over = 0;
+    memset(LT.ball, 0, sizeof LT.ball), memset(LT.bw, 0, sizeof LT.bw);
+    LT.gen++;
+}
+
+static void lt_bits(uint64_t *bits, uint64_t a, uint64_t e) {
+    uint64_t m0 = a >> 20, m1 = (e - 1) >> 20;
+    if (m1 - m0 >= 4096) {
+        memset(bits, 0xff, 64 * sizeof *bits);
+        return;
+    }
+    for (uint64_t m = m0; m <= m1; m++) bits[(m & 4095) >> 6] |= 1ull << (m & 63);
+}
+
+static int lt_bits_hit(const uint64_t *bits, uint64_t a, uint64_t e) {
+    uint64_t m0 = a >> 20, m1 = (e - 1) >> 20;
+    if (m1 - m0 >= 4096) return 1;
+    for (uint64_t m = m0; m <= m1; m++)
+        if (bits[(m & 4095) >> 6] >> (m & 63) & 1) return 1;
+    return 0;
+}
+
+static void lt_add(uint64_t a, uint64_t n, int w) {
+    uint64_t e = a + n;
+    uint32_t h = (uint32_t)(((a >> 4) * 0x9e3779b97f4a7c15ull) >> 56);
+    if (LT.dc[h].g == LT.gen && LT.dc[h].a == a && LT.dc[h].e >= e && LT.dc[h].w >= (uint32_t)w) return;
+    if (LT.n == LT_N || (w && LT.nw == LT_W)) {
+        LT.over = 1;
+        return;
+    }
+    LT.lo[LT.n] = a, LT.hi[LT.n++] = e;
+    lt_bits(LT.ball, a, e);
+    if (w) LT.wlo[LT.nw] = a, LT.whi[LT.nw++] = e, lt_bits(LT.bw, a, e);
+    LT.dc[h].a = a, LT.dc[h].e = e, LT.dc[h].g = LT.gen, LT.dc[h].w = (uint32_t)w;
+}
+
+// A guest range a draw reads (vertex, index and indirect buffers)
+static inline void lt_draw(const VkExec *ex, uint64_t a, uint64_t n) {
+    if (LT.cfg != 1 || !a || !n) return;
+    lt_sync(ex);
+    lt_add(a, n, 0);
+}
+
+// A guest range bound by a draw's descriptor build or by the dispatch being bound (bind_range, texel_view)
+static void lt_bind(const VkExec *ex, uint64_t a, uint64_t n, int w) {
+    if (!a || !n) return;
+    if (LT.cand) {
+        if (LT.dn == LT_D) LT.dbad = 1;
+        else LT.dlo[LT.dn] = a, LT.dhi[LT.dn] = a + n, LT.dw[LT.dn++] = (uint8_t)(w != 0);
+        return;
+    }
+    if (LT.bn == LT_B) LT.bover = 1;
+    else LT.blo[LT.bn] = a, LT.bhi[LT.bn] = a + n, LT.bw8[LT.bn++] = (uint8_t)(w != 0);
+    lt_sync(ex);
+    lt_add(a, n, w != 0);
+}
+
+// An image binding (bind_resources): a storage image keeps the full barriers; the dispatch's sampled textures are
+// resolved to their guest ranges after the texture lock (lt_end).
+static void lt_image(const VkExec *ex, uint64_t h, int storage) {
+    if (LT.cand) {
+        if (storage) LT.dbad = 1;
+        else if (h && LT.dnt < 16) LT.dtex[LT.dnt++] = h;
+        else if (h) LT.dbad = 1;
+        return;
+    }
+    if (!storage) return;   // a draw's sampled image: a dispatch's buffer writes do not reach the Vulkan image
+    LT.bover = 1;
+    lt_sync(ex);
+    LT.over = 1;
+}
+
+static void lt_build_again(const VkExec *ex) {   // a draw whose descriptor build was skipped: the last build's notes
+    if (LT.cfg != 1) return;
+    lt_sync(ex);
+    if (LT.bover) LT.over = 1;
+    for (int i = 0; i < LT.bn; i++) lt_add(LT.blo[i], LT.bhi[i] - LT.blo[i], LT.bw8[i]);
+}
+
+static void lt_sig(const VkExec *ex, LtSig *s) {
+    memset(s, 0, sizeof *s);
+    for (int i = 0; i < 9; i++) {
+        const VkExecTarget *t = i < 8 ? &ex->color[i] : &ex->depth;
+        if (!t->image) continue;
+        s->t[i].image = t->image, s->t[i].format = t->format, s->t[i].level = t->level;
+        s->t[i].base_layer = t->base_layer, s->t[i].layers = t->layers;
+    }
+    s->w = ex->pass_w, s->h = ex->pass_h, s->layers = ex->pass_layers, s->ncolor = ex->pass_ncolor;
+    s->depth = ex->pass_depth, s->stencil = ex->pass_stencil;
+}
+
 // A buffer descriptor for [addr, addr+size) of guest memory: its backing (a pool's VRAM mirror when it has one) when
 // aligned, a copy in transient memory when the backing is host memory with an unaligned offset. 0 when neither works.
 // written: the shader stores into it (a mirror's range goes back to guest memory at the end of the submission).
@@ -948,6 +1095,7 @@ static int bind_range(VkExec *ex, uint64_t addr, uint64_t size, uint64_t align, 
     uint64_t n = size && size < sp.avail ? size : sp.avail;
     if (n > max) n = max;
     if (!n) return 0;
+    if (LT.bdraw | LT.cand) lt_bind(ex, addr, n, written);   // compute between draws
     if (!written && (use == VK_MUSE_UBO || use == VK_MUSE_SSBO) && ub_bind(ex, addr, n, align, out)) {
         count_use(VK_MCLS_SCRATCH, use, n);
         return 1;
@@ -1168,7 +1316,137 @@ static int dispatch_chain_on(void) {
 // A GPU copy recorded while binding, out of a pass: a dispatch recorded since the last barrier may still read the
 // copy's destination or write its source, so the copy waits for it.
 static void dispatch_copy_guard(VkExec *ex) {
-    if (disp_rec > ex->barrier_at && ex->cb == disp_cb && ex->fence == disp_fence) vk_exec_barrier(ex);
+    // LT.cand: the dispatch being bound may go without the full barrier (lt_begin), so the draws may still run
+    if (LT.cand || (disp_rec > ex->barrier_at && ex->cb == disp_cb && ex->fence == disp_fence)) vk_exec_barrier(ex);
+}
+
+// Compute between draws (LT above). A dispatch with a pass open: the pass ends here, and the dispatch is bound without
+// the full barrier when nothing else is recorded with the pass end; lt_end decides after the binding. 0: the caller
+// records the full barrier.
+static int lt_begin(VkExec *ex) {
+    if (!ex->in_pass || !lt_on()) return 0;
+    if (ex->nfbl || vk_dump_armed) {   // feedback-loop layouts go back to GENERAL in the full barrier
+        LT.other++;
+        return 0;
+    }
+    LtSig s;
+    lt_sig(ex, &s);
+    vk_exec_dispatch_run_close(ex);
+    ex->mark = NULL;   // perf: a timestamp waits for the work before it; this pass stays untimed
+    int r = ex->recorded;
+    vk_exec_pass_end(ex);
+    if (ex->recorded == r + 1) vk_exec_ub_flush(ex);
+    if (ex->recorded != r + 1) {   // copies after the pass (3D BC targets, queries, uniform updates of the pass)
+        LT.other++;
+        return 0;
+    }
+    LT.sig = s;
+    LT.cand = 1, LT.cand_at = ex->barrier_at, LT.dbad = LT.dn = LT.dnt = LT.chained = 0, LT.nchk = 0;
+    return 1;
+}
+
+// A dispatch chained after one that went without the full barrier: the same check
+static void lt_chain(VkExec *ex) {
+    if (!LT.pending || ex->cb != LT.pend_cb) return;
+    LT.cand = 1, LT.cand_at = ex->barrier_at, LT.dbad = LT.dn = LT.dnt = 0, LT.chained = 1;
+}
+
+int vk_texture_slot_desc(int id, tex_t *out);   // vk_texture.c
+static int lt_hit(uint64_t a, uint64_t e, int w) {
+    if (!lt_bits_hit(w ? LT.ball : LT.bw, a, e)) return 0;
+    const uint64_t *lo = w ? LT.lo : LT.wlo, *hi = w ? LT.hi : LT.whi;
+    for (int j = 0, n = w ? LT.n : LT.nw; j < n; j++)
+        if (a < hi[j] && lo[j] < e) return 1;
+    return 0;
+}
+
+// After the dispatch's binding (expect: ex->recorded with only the pipeline and descriptor binds since lt_begin)
+static void lt_end(VkExec *ex, int expect) {
+    LT.cand = 0;
+    lt_sync(ex);
+    int ok = !LT.dbad && !LT.over && ex->barrier_at == LT.cand_at && ex->recorded == expect, hit = 0;
+    // a long chain checks against every note: after 16, one full barrier ends the notes and the checks
+    if (ok && LT.chained && LT.n && ++LT.nchk > 16) ok = 0;
+    for (int i = 0; ok && i < LT.dn; i++) hit = lt_hit(LT.dlo[i], LT.dhi[i], LT.dw[i]), ok = !hit;
+    for (int i = 0; ok && i < LT.dnt; i++) {   // sampled textures against the targets and storage writes
+        tex_t t;
+        if (!vk_texture_slot_desc((int)(LT.dtex[i] & 0xfffff), &t) || !t.mem) continue;
+        uint64_t a = (uint64_t)(uintptr_t)t.mem;
+        hit = lt_hit(a, a + (t.L.size ? t.L.size : 1), 0), ok = !hit;
+    }
+    if (LT.chained) LT.chk++, LT.chk_full += !ok;
+    else if (ok) LT.light++;
+    else if (hit) LT.hit++;
+    else LT.other++;
+    if (ok) {
+        LT.pending = 1, LT.pend_cb = ex->cb;
+        return;
+    }
+    vk_exec_barrier(ex);
+}
+
+// vk_exec.c pass_begin, before its barrier: 1 when the pass restarts after dispatches that went without the full
+// barrier, on the targets of the pass they ended, with nothing else recorded since; then only a barrier from the
+// compute work (to the draws and later dispatches) and from the targets' earlier writes is recorded here.
+int vk_exec_light_restart(VkExec *ex, int nwant) {
+    int p = LT.pending;
+    LT.pending = 0;
+    if (!p) return 0;
+    LtSig s;
+    lt_sig(ex, &s);
+    if (nwant || ex->nfbl || ex->cb != LT.pend_cb || ex->cb != disp_cb || ex->fence != disp_fence ||
+        ex->recorded != disp_rec || memcmp(&s, &LT.sig, sizeof s)) {
+        LT.narrow_no++;
+        return 0;
+    }
+    vk_exec_dispatch_run_close(ex);
+    int r = ex->recorded;
+    vk_exec_ub_flush(ex);
+    if (ex->recorded != r) {   // uniform update copies: the full barrier after them
+        LT.narrow_no++;
+        return 0;
+    }
+    VkMemoryBarrier2 mb[2] = {
+        {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+         .srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT,
+         .dstStageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+         .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT},
+        {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+         .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                         VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+         .srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+         .dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                         VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+         .dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                          VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT}};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 2, .pMemoryBarriers = mb};
+    vkCmdPipelineBarrier2(ex->cb, &di);
+    ex->recorded++;
+    LT.narrow++;
+    return 1;
+}
+
+// vk_exec.c pass_begin, after its barrier: the pass's targets are written by its draws
+void vk_exec_light_pass(VkExec *ex) {
+    if (LT.cfg != 1) return;
+    lt_sync(ex);
+    for (int i = 0; i < 9; i++) {
+        const VkExecTarget *t = i < 8 ? &ex->color[i] : &ex->depth;
+        if (t->image && t->tex && t->tex->mem) lt_add((uint64_t)(uintptr_t)t->tex->mem, t->tex->L.size ? t->tex->L.size : 1, 1);
+    }
+}
+
+// vk_exec.c op_report (MLB_TRACE=perf), every 600 frames
+void vk_exec_light_report(double nf) {
+    static uint64_t p[7];
+    uint64_t c[7] = {LT.light, LT.hit, LT.other, LT.chk, LT.chk_full, LT.narrow, LT.narrow_no};
+    if (LT.cfg == 1 && c[0] + c[1] + c[2] != p[0] + p[1] + p[2])
+        rt_log("perf: compute between draws, per frame: %.1f dispatches without the full barrier, %.1f with it (%.1f sharing "
+               "memory with the draws, %.1f other); %.1f chained after them checked, %.1f of those with it; pass restarts "
+               "after them: %.1f with a narrow barrier, %.1f with the full one", (c[0] - p[0]) / nf,
+               (c[1] - p[1] + c[2] - p[2]) / nf, (c[1] - p[1]) / nf, (c[2] - p[2]) / nf, (c[3] - p[3]) / nf,
+               (c[4] - p[4]) / nf, (c[5] - p[5]) / nf, (c[6] - p[6]) / nf);
+    memcpy(p, c, sizeof p);
 }
 
 // That address as the bound block holds it at this point of the replay; 0 when the block is unbound or too short. The
@@ -1388,6 +1666,7 @@ static VkBufferView texel_view(VkExec *ex, uint64_t h, int written) {
         return Z.zview;
     }
     if (bytes > sp.avail) bytes = sp.avail / (uint64_t)bpb * (uint64_t)bpb;
+    if (LT.bdraw | LT.cand) lt_bind(ex, addr, bytes, written);   // compute between draws
     VK_MEM_USE(sp);
     VkBuffer vb = sp.buffer;
     VkDeviceSize vo = sp.offset;
@@ -1721,6 +2000,7 @@ static Twin *twin_update(VkExec *ex, const VkTexImage *img) {
     VkDependencyInfo d2 = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &m2};
     vkCmdPipelineBarrier2(ex->cb, &d2);
     ex->recorded += 5;
+    LT.dbad |= LT.cand;   // copies of the dispatch being bound: it keeps the full barrier
     return t;
 }
 
@@ -2097,6 +2377,7 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         if (same && was_valid && skip == 1) {
             for (int i = 0; i < RS.ncnt; i++) vk_mem_count(RS.cnt[i].cls, RS.cnt[i].use, RS.cnt[i].bytes);
             BS.bind_skip++;
+            lt_build_again(ex);
             ex->recorded++;
             return;
         }
@@ -2104,6 +2385,7 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         if (skip == 2) memcpy(RS.pcnt, RS.cnt, sizeof RS.cnt), RS.pncnt = RS.ncnt;
         RS.rec = 1, RS.ncnt = 0, RS.cnt_over = 0, RS.volatile_ = 0, RS.cmds = 0;
     }
+    if (gfx && lt_on()) LT.bdraw = 1, LT.bn = 0, LT.bover = 0;   // the draw's ranges are noted (compute between draws)
     uint32_t n_sets = info->n_sets ? info->n_sets : 1;
     uint32_t lo[2] = {0, 0}, hi[2] = {0, 0}, d0[2] = {0, 0};   // bindings [lo, hi) and first descriptor per set
     int need_w = 0;                                             // a set without a template: fill the write structs
@@ -2162,6 +2444,7 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
                     uint64_t h = 0;
                     if (img) h = slot >= 0 && slot < 32 ? ex->img[st][slot] : 0;
                     else h = res_tex_handle(ex, st, r, (int)k);   // mlbts-native: separate sampler words
+                    if (LT.bdraw | LT.cand) lt_image(ex, h, img);
                     tex_info(ex, r, h, img, r->separate, &o[k].image);
                     o[k].w[2] = (uint32_t)o[k].image.imageLayout;   // zero the tail padding
                 }
@@ -2263,6 +2546,7 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         }
         B.res_valid = valid;
     }
+    LT.bdraw = 0;
     ex->recorded++;
 }
 
@@ -2351,6 +2635,7 @@ static void bind_vertex_buffers(VkExec *ex) {
         const NVNbufferRange *r = &ex->vbuf[b];
         if (same_gen && (B.vres >> b & 1) && B.vin[b].address == r->address && B.vin[b].size == r->size) {
             vb[b] = B.vb[b], vo[b] = B.vo[b], vsz[b] = B.vsz[b], vcls[b] = B.vcls[b], vpool[b] = B.vpool[b];
+            lt_draw(ex, r->address, vsz[b]);
             continue;
         }
         VkMemSpan sp;
@@ -2358,6 +2643,7 @@ static void bind_vertex_buffers(VkExec *ex) {
         VK_MEM_USE(sp);
         uint64_t n = r->size && r->size < sp.avail ? r->size : sp.avail;
         vb[b] = sp.buffer, vo[b] = sp.offset, vsz[b] = n, vcls[b] = sp.cls, vpool[b] = sp.pool;
+        lt_draw(ex, r->address, n);
     }
     memcpy(B.vcls, vcls, sizeof vcls), memcpy(B.vpool, vpool, sizeof vpool);
     memcpy(B.vin, ex->vbuf, sizeof B.vin);
@@ -4208,6 +4494,7 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
     vk_exec_frame.draws++;
     draw_note(ex, "indexed", d->prim, d->count);
     uint64_t bytes = (uint64_t)d->count * isize[d->itype];
+    lt_draw(ex, d->ibuf, bytes);
     VkMemSpan sp;
     if (!vk_mem_resolve(d->ibuf, bytes, &sp)) return warn_once(W_INDEX, "index buffer %#llx is not backed: draws with it are skipped", (unsigned long long)d->ibuf);
     if (d->itype == NVN_INDEX_TYPE_UNSIGNED_BYTE) {   // no uint8 index type here: widen (host-readable backing only)
@@ -4252,6 +4539,8 @@ static void op_draw_idx_ind(VkExec *ex, const p_draw_idx_ind *d) {
     if (!prepare_draw(ex, d->prim, 0x7fffffff, restart_for(ex, d->prim, d->itype))) return;
     vk_exec_frame.draws++;
     draw_note(ex, "indirect-indexed", d->prim, -1);   // mlbts-native
+    lt_draw(ex, d->ind, sizeof(VkDrawIndexedIndirectCommand));
+    lt_draw(ex, d->ibuf, ib.avail < (64ull << 20) ? ib.avail : (64ull << 20));   // the count is on the GPU
     VK_MEM_USE(ip);
     VK_MEM_USE(ib);
     vkCmdBindIndexBuffer(ex->cb, ib.buffer, ib.offset, d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
@@ -4332,13 +4621,20 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
         vk_exec_ub_flush(ex);
         chained = ex->recorded == r;
     }
-    if (!chained) vk_exec_barrier(ex);   // ends the pass; earlier writes are visible to the shader
-    else n_chained++;
+    if (!chained) {
+        if (!lt_begin(ex)) vk_exec_barrier(ex);   // ends the pass; earlier writes are visible to the shader
+    } else {
+        n_chained++;
+        lt_chain(ex);
+    }
+    int lt_rec = ex->recorded;   // compute between draws: only the binds below may be recorded before lt_end
+    VkPipeline lt_pipe = B.pipe[1];
     bind_pipeline(ex, VK_PIPELINE_BIND_POINT_COMPUTE, p);
     c0_dim[0] = (uint32_t)d->x, c0_dim[1] = (uint32_t)d->y, c0_dim[2] = (uint32_t)d->z;
     twin_dispatch = 1;
     bind_resources(ex, info);
     twin_dispatch = 0;
+    if (LT.cand) lt_end(ex, lt_rec + (B.pipe[1] != lt_pipe) + 1);
     // mlbts-native diagnosis: the lighting-probe shaders (MLB_DISPATCH_DUMP, hex FNV hashes; default the RTTS room's
     // probe and cube generators) get the dump below whatever addresses they use, their first 8 dispatches each.
     static uint32_t dd_want[16];
@@ -4449,7 +4745,8 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
                 }
         }
     }
-    dispatch_run_mark(ex, cs, chained, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
+    // perf: no timing mark between draws without the full barrier (a timestamp would wait for the draws)
+    if (!LT.pending) dispatch_run_mark(ex, cs, chained, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     vkCmdDispatch(ex->cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     ex->recorded++;
     disp_cb = ex->cb, disp_fence = ex->fence, disp_rec = ex->recorded;
