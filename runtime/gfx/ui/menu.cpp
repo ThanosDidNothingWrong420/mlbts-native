@@ -391,7 +391,7 @@ static void tab_graphics(float scale) {
                "How much FSR sharpens after scaling up; 0 turns the sharpening off.", 5, "%.0f %%");
     opt_group("NVIDIA DLSS");
     static const char *const dlss[] = {"off", "dlaa", "quality", "balanced", "performance", "ultra_performance"};
-    static const char *const dlss_names[] = {"Off", "DLAA (1920 \xc3\x97 1080)", "Quality (1280 \xc3\x97 720)",
+    static const char *const dlss_names[] = {"Off", "DLAA (1920 \xc3\x97 1080)", "Quality (1440 \xc3\x97 810)",
                                              "Balanced (1114 \xc3\x97 626)", "Performance (960 \xc3\x97 540)",
                                              "Ultra Performance (640 \xc3\x97 360)"};
     opt_choice_list("DLSS", "DLSS", dlss, dlss_names, 6,
@@ -400,9 +400,9 @@ static void tab_graphics(float scale) {
                     "replaces the internal resolution, the upscaling and the antialiasing above. The HUD and menus are "
                     "not touched.\n\n"
                     "DLAA draws the scene at full 1080p and only smooths it: the best picture, and the most GPU time. "
-                    "Quality draws it at 1280 x 720, smaller than the game's own 1440 x 810, so it usually looks better "
-                    "and costs less than the game's own look. Balanced, Performance and Ultra Performance draw less "
-                    "for more frame rate.\n\n"
+                    "Quality draws it at the game's own 1440 x 810, as on the TV, and DLSS turns that into a sharp "
+                    "1080p picture in place of the game's plain stretch. Balanced, Performance and Ultra Performance "
+                    "draw less for more frame rate.\n\n"
                     "Needs nvngx_dlss.dll (NVIDIA's DLSS library) next to mlb.exe. Applies after a restart.",
                     -1, vk_dlaa_status());
     static const char *const preset[] = {"default", "k", "j", "m", "l", "e"};

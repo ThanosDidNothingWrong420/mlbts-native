@@ -156,7 +156,7 @@ Each step ends with a run, a log, and a commit; the boot progress in docs/runtim
   `shaders/dlss_mv.comp` reprojects depth through last frame's view-projection times the inverse of this frame's
   (double precision on the CPU); a turn of more than ~10 degrees or a 10 % field-of-view change counts as a camera cut
   and resets DLSS's history. Players and the ball get the camera's motion only. The mode sets the scene size through
-  `resolution.c` (DLAA 1920x1080, Quality 1280x720, Balanced 1114x626, Performance 960x540, Ultra Performance
-  640x360) when the driver has NGX and `nvngx_dlss.dll` (NVIDIA's, v310.9.1 as TotK's setup pins it, not in git) is
+  `resolution.c` (DLAA 1920x1080, Quality the game's own 1440x810: 75 %, not NVIDIA's 67 %; Balanced 1114x626,
+  Performance 960x540, Ultra Performance 640x360) when the driver has NGX and `nvngx_dlss.dll` (NVIDIA's, v310.9.1 as TotK's setup pins it, not in git) is
   next to `mlb.exe`; restart to change it. Test knobs: `MLB_DLSS_MVDEBUG=1` (vectors instead of the picture),
   `MLB_DLSS_MV=0`, `MLB_DLSS_JITTER=0`, `MLB_DLSS_TIMES=1` (GPU time every 600 frames).

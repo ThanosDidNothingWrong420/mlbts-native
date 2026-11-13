@@ -33,12 +33,13 @@
 static const uint32_t shipped[SCENE_LEVELS][2] = {{960, 540}, {1280, 720}, {1366, 768}, {1440, 810}, {1600, 900}};
 
 // MLB_DLSS (vk_dlaa.c): with DLSS on, the mode decides the scene's size in place of MLB_RENDER_SCALE, as a percentage
-// of the 1080p output per side: DLAA 100 (1920x1080), Quality 66.7 (1280x720), Balanced 58 (1114x626), Performance
-// 50 (960x540), Ultra Performance 33.3 (640x360); DLSS scales it up to 1080p. Only when DLSS can run: the driver has
+// of the 1080p output per side: DLAA 100 (1920x1080), Quality the game's own sizes (75, 1440x810: the table as
+// shipped; NVIDIA's own Quality ratio is 66.7, 1280x720, a softer start), Balanced 58 (1114x626), Performance 50
+// (960x540), Ultra Performance 33.3 (640x360); DLSS scales it up to 1080p. Only when DLSS can run: the driver has
 // NVIDIA's NGX core and nvngx_dlss.dll sits next to mlb.exe (a smaller scene without DLSS would only look worse).
 // 0: DLSS off or missing.
 static const char *dlss_pct(void) {
-    static const struct { const char *mode, *pct; } modes[] = {{"dlaa", "100"}, {"quality", "66.6667"},
+    static const struct { const char *mode, *pct; } modes[] = {{"dlaa", "100"}, {"quality", "game"},
                                                                {"balanced", "58"}, {"performance", "50"},
                                                                {"ultra_performance", "33.3333"}};
     const char *m = cfg_value("DLSS");
@@ -57,7 +58,8 @@ static const char *dlss_pct(void) {
         rt_log("res: MLB_DLSS=%s needs nvngx_dlss.dll next to mlb.exe, which is missing; MLB_RENDER_SCALE applies", m);
         return NULL;
     }
-    rt_log("res: MLB_DLSS=%s: the 3D scene at %s %% of 1080p (MLB_RENDER_SCALE is not used)", m, pct);
+    rt_log("res: MLB_DLSS=%s: the 3D scene at %s%s (MLB_RENDER_SCALE is not used)", m, pct,
+           strcmp(pct, "game") ? " % of 1080p" : "'s own size");
     return pct;
 }
 
