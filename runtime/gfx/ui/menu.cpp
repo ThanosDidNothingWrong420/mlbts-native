@@ -284,7 +284,7 @@ static bool g_modal;            // a confirmation is open: B and Esc close it, n
 
 // Every setting the pages show, for "Reset all settings" (cfg_reset) and "Restart now".
 static const char *const kMenuKeys[] = {
-    "RENDER_SCALE", "UPSCALER", "SHARPNESS", "AA", "AA_STRENGTH", "ANISO", "COLOR_PRESET", "COLOR_BRIGHTNESS", "COLOR_CONTRAST", "COLOR_SATURATION",
+    "RENDER_SCALE", "UPSCALER", "SHARPNESS", "DLSS", "DLSS_PRESET", "AA", "AA_STRENGTH", "ANISO", "COLOR_PRESET", "COLOR_BRIGHTNESS", "COLOR_CONTRAST", "COLOR_SATURATION",
     "COLOR_GAMMA", "FULLSCREEN", "WINDOW_SIZE", "VK_PRESENT", "ASPECT", "GPU_INDEX", "PERF_OVERLAY", "FRAME_QUEUE",
     "ASSUME_FOCUS", "VOLUME", "PAD_MAP", "RUMBLE", "RUMBLE_STRENGTH", "STICK_DEADZONE", "LSTICK_DEADZONE",
     "RSTICK_DEADZONE", "ASYNC_PREEMPT", "REPLAY_ASYNC", "PIPE_WAIT", "PIPE_SKIP", "LIB_PREBUILD",
@@ -315,8 +315,15 @@ static bool restart_pending(void) {
     return false;
 }
 
+// NVIDIA DLSS (vk_dlaa.c): what it does in this run, under its row; NULL when it was off at start. The rows DLSS
+// replaces while it runs say so.
+extern "C" const char *vk_dlaa_status(void);
+extern "C" int vk_dlaa_on(void);
+static bool dlss_in_use(void) { return vk_dlaa_on() != 0; }
+
 // What the antialiasing pass did lately (vk_aa_status), under its value.
 static const char *aa_note(void) {
+    if (dlss_in_use()) return "replaced by DLSS";
     switch (vk_aa_status()) {
     case 1: return "active";
     case 2: return "waiting for a 3D scene";
@@ -355,6 +362,7 @@ static void rows_color(void) {
 
 // "in use: ..." under the upscaler while FSR has nothing to do (the scene is as large as the picture or larger).
 static const char *upscaler_note(void) {
+    if (dlss_in_use()) return "replaced by DLSS";
     if (strcmp(cfg_value("UPSCALER"), "fsr") || !strcmp(cfg_value("RENDER_SCALE"), "game")) return nullptr;
     return "not used at this resolution";
 }
@@ -370,7 +378,8 @@ static void tab_graphics(float scale) {
                     "to 1080p, which makes it soft. 100 % draws it at full 1080p; 125 % and 150 % draw it larger and "
                     "shrink it, which also smooths edges (supersampling). The HUD and menus are always 1080p.\n\n"
                     "Costs GPU time and video memory: 150 % draws about four times the pixels of the game's size. "
-                    "200 % runs the game out of its own graphics memory and crashes, so it is not offered.");
+                    "200 % runs the game out of its own graphics memory and crashes, so it is not offered.",
+                    -1, dlss_in_use() ? "replaced by DLSS" : nullptr);
     static const char *const up[] = {"FSR 1", "Bilinear"};
     opt_choice("UPSCALER", "Upscaling", up, 2,
                "How the 3D scene is stretched to 1080p when the internal resolution is the game's.\n\n"
@@ -380,6 +389,34 @@ static void tab_graphics(float scale) {
                upscaler_note());
     opt_slider("SHARPNESS", "FSR sharpness", 0, 100,
                "How much FSR sharpens after scaling up; 0 turns the sharpening off.", 5, "%.0f %%");
+    opt_group("NVIDIA DLSS");
+    static const char *const dlss[] = {"off", "dlaa", "quality", "balanced", "performance", "ultra_performance"};
+    static const char *const dlss_names[] = {"Off", "DLAA (1920 \xc3\x97 1080)", "Quality (1280 \xc3\x97 720)",
+                                             "Balanced (1114 \xc3\x97 626)", "Performance (960 \xc3\x97 540)",
+                                             "Ultra Performance (640 \xc3\x97 360)"};
+    opt_choice_list("DLSS", "DLSS", dlss, dlss_names, 6,
+                    "NVIDIA DLSS on the 3D scene, for GeForce RTX graphics cards. It draws the scene at the size shown "
+                    "and uses AI to rebuild a sharp, smooth 1080p picture from it and from the frames before. It "
+                    "replaces the internal resolution, the upscaling and the antialiasing above. The HUD and menus are "
+                    "not touched.\n\n"
+                    "DLAA draws the scene at full 1080p and only smooths it: the best picture, and the most GPU time. "
+                    "Quality draws it at 1280 x 720, smaller than the game's own 1440 x 810, so it usually looks better "
+                    "and costs less than the game's own look. Balanced, Performance and Ultra Performance draw less "
+                    "for more frame rate.\n\n"
+                    "Needs nvngx_dlss.dll (NVIDIA's DLSS library) next to mlb.exe. Applies after a restart.",
+                    -1, vk_dlaa_status());
+    static const char *const preset[] = {"default", "k", "j", "m", "l", "e"};
+    static const char *const preset_names[] = {"Default", "K (transformer)", "J (transformer)",
+                                               "M (transformer 2)", "L (transformer 2)", "E (older CNN)"};
+    opt_choice_list("DLSS_PRESET", "DLSS model", preset, preset_names, 6,
+                    "Which of NVIDIA's DLSS models rebuilds the picture.\n\n"
+                    "Default follows NVIDIA's advice per mode: K for DLAA, Quality and Balanced, M for Performance, "
+                    "L for Ultra Performance. K is the transformer model: sharp and stable. J is its sibling, with a "
+                    "little less ghosting and a little more flicker. M and L are NVIDIA's newest models (DLSS 4.5), "
+                    "made for the low-resolution modes; they cost noticeably more on RTX 20 and 30 cards, which lack "
+                    "the FP8 maths they are built for. E is the older CNN model: the cheapest, softer and with more "
+                    "ghosting.\n\n"
+                    "Applies at once.");
     opt_group("Antialiasing");
     static const char *const aa[] = {"Off", "FXAA"};
     opt_choice("AA", "Antialiasing", aa, 2,

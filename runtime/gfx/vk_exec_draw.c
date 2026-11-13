@@ -2007,9 +2007,12 @@ static Twin *twin_update(VkExec *ex, const VkTexImage *img) {
 // The image descriptor of slot h; in a dispatch, a compare-sampled colour image the driver cannot compare is swapped
 // for its depth twin; in a pass larger than it, the scene's light target, once DLSS scaled it this frame, for DLSS's
 // output (vk_dlaa.c).
+// mlbts-native: aa_before_draw holds the swap for MLB's composite draw alone (fsr_swapped), where DLAA's picture is as
+// large as the scene it replaces: then the pass need not be larger.
+static int fsr_swapped;
 static void tex_info(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage, int separate, VkDescriptorImageInfo *out) {
     tex_info_lookup(ex, r, h, storage, separate, out);
-    if (h && !storage && vk_dlaa_swap_img && ex->in_pass && ex->pass_w > vk_dlaa_swap_img->width + 1 &&
+    if (h && !storage && vk_dlaa_swap_img && ex->in_pass && (fsr_swapped || ex->pass_w > vk_dlaa_swap_img->width + 1) &&
         vk_texture_by_id_locked((int)(h & 0xfffff), NULL, NULL) == vk_dlaa_swap_img)
         out->imageView = vk_dlaa_swap_view, out->imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     if (!twin_dispatch || storage || separate || !h || !(r->type & 0x400)) return;
@@ -2770,9 +2773,9 @@ static int aa_composite(VkExec *ex, const GfxShader *fs) {
     return yes;
 }
 
-static int fsr_swapped;   // aa_before_draw set vk_dlaa_swap_img for this draw; prepare_draw clears it after
+// fsr_swapped (above tex_info): aa_before_draw set vk_dlaa_swap_img for this draw; prepare_draw clears it after
 static void aa_before_draw(VkExec *ex, const GfxShader *fs) {
-    if (!fs || !(vk_aa_on() || vk_fsr_scene_on()) || !aa_composite(ex, fs)) return;
+    if (!fs || !(vk_aa_on() || vk_fsr_scene_on() || vk_dlaa_on()) || !aa_composite(ex, fs)) return;
     const GfxShaderRes *tr;
     if (gfx_shader_resources(fs, GFX_RES_TEX, &tr) < 1) return;
     uint64_t h = res_tex_handle(ex, NVN_STAGE_FS, &tr[0], 0);
@@ -2791,10 +2794,21 @@ static void aa_before_draw(VkExec *ex, const GfxShader *fs) {
     int reopen = ex->in_pass;
     uint32_t pw = ex->pass_w, ph = ex->pass_h;
     vk_exec_barrier(ex);   // ends the pass; the scene's writes are done before the copy
+    VkImageView up;
+    // DLSS (vk_dlaa.c, MLB_DLSS): its picture of the scene replaces it for this draw; FXAA and FSR then have nothing
+    // to do (DLSS antialiases and scales up itself)
+    if (vk_dlaa_scene(ex, im, pw, ph, &up)) {
+        vk_dlaa_swap_img = im;
+        vk_dlaa_swap_view = up;
+        fsr_swapped = 1;
+        memset(&B, 0, sizeof B);
+        ex->recorded++;
+        if (reopen) vk_exec_pass_begin(ex);
+        return;
+    }
     int recorded = vk_aa_on() && vk_aa_record(ex->cb, ex->fence, image, fmt, w, hh);
     // FSR (vk_fsr.c vk_fsr_scene): the scene scaled up to the composite's pass, sampled in its place by this draw
     // (tex_info swaps the view in passes larger than the scene)
-    VkImageView up;
     if (vk_fsr_scene(ex->cb, ex->fence, image, fmt, w, hh, pw, ph, &up)) {
         vk_dlaa_swap_img = im;
         vk_dlaa_swap_view = up;

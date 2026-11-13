@@ -119,21 +119,7 @@ void rt_write_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h)
 }
 int probe_census_dir(char *dir, size_t n) { (void)dir, (void)n; return 0; }
 
-// ---- DLAA, motion vectors (vk_dlaa.c, vk_mvprev.c, vk_mvsurvey.c)
-const VkTexImage *vk_dlaa_swap_img;
-VkImageView vk_dlaa_swap_view;
-int vk_dlaa_available(void) { return 0; }
-void vk_dlaa_init(void) {}
-void vk_dlaa_instance_exts(const char **ext, uint32_t *n, uint32_t max) { (void)ext, (void)n, (void)max; }
-void vk_dlaa_device_exts(const VkExtensionProperties *have, uint32_t nhave, const char **ext, uint32_t *n, uint32_t max) {
-    (void)have, (void)nhave, (void)ext, (void)n, (void)max;
-}
-void vk_dlaa_frame(void) {}
-void vk_dlaa_pass(VkExec *ex) { (void)ex; }
-void vk_dlaa_draw(VkExec *ex) { (void)ex; }
-int vk_dlaa_skip_draw(VkExec *ex, const GfxShader *fs) { (void)ex, (void)fs; return 0; }
-void vk_dlaa_viewport(VkExec *ex, VkViewport *v) { (void)ex, (void)v; }
-int vk_dlaa_prev_camera(VkDescriptorBufferInfo *out, float jitter[2]) { (void)out, (void)jitter; return 0; }
+// ---- per-object motion vectors (vk_mvprev.c, vk_mvsurvey.c); DLSS itself is vk_dlaa.c (camera motion only)
 int vk_mvprev_on(void) { return 0; }
 void vk_mvprev_draw(VkExec *ex) { (void)ex; }
 void vk_mvprev_frame(void) {}

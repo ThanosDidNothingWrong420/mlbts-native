@@ -45,7 +45,8 @@ Layers, all vendored with attribution and `mlbts-native` markers on changes:
 
 **Not ported (TotK-specific):**
 - resolution patch sets;
-- DLAA and motion vectors (`vk_dlaa.c`, `vk_mv*`);
+- DLAA and motion vectors (`vk_dlaa.c`, `vk_mv*`); DLSS came back on 2026-11-13 with MLB's own frame and camera
+  motion, see below (TotK's per-object motion is still not ported);
 - HDR (`vk_hdr.c`); FSR (`vk_fsr.c`) came back on 2026-11-13, see below;
 - contact shadows;
 - the ImGui settings menu (back since 2026-11-13 with MLB's own pages, see below);
@@ -143,3 +144,19 @@ Each step ends with a run, a log, and a commit; the boot progress in docs/runtim
   (`runtime/shaders/fxaa.comp`, our own) on the scene in place first, so the HUD stays sharp. Brightness is compared
   in stops, as the scene is linear HDR before the game's exposure. `MLB_AA_STRENGTH` (0..100) sets the sub-pixel
   blending. Shaders compile with `tools/build_shaders.py` (glslang) into committed `*_spv.h` headers.
+- **NVIDIA DLSS / DLAA (`MLB_DLSS`, off by default; `MLB_DLSS_PRESET`; 2026-11-13).** `vk_dlaa.c` keeps TotK's NGX
+  half (the driver's `_nvngx.dll` loaded at run time, no SDK code) and adds MLB's frame. MLB is a forward renderer: a
+  pass with one B10G11R11 colour target and a D24S8 depth target of the same size is the scene and arms the frame
+  **[C]** (drawlogs and RenderDoc captures of 2026-11-10/11). At the composite draw (`aa_before_draw`, where FXAA and
+  FSR run) DLSS reads that pair and writes its picture at 1080p (DLAA: at the scene's own size), which the composite
+  samples in the scene's place, so the HUD is never jittered nor touched. The scene's draws get a Halton sub-pixel
+  viewport jitter. Camera: every scene vertex shader computes `gl_Position = c3[0]*x + c3[1]*y + c3[2]*z + c3[3]*w`
+  (RenderDoc, frame 18520 event 4746) **[C]**, so the first 64 bytes of vertex bank c3 are the view-projection; the block
+  most of a frame's depth-tested scene draws bind is the camera (173 of 174 draws in a frame of play). Motion vectors:
+  `shaders/dlss_mv.comp` reprojects depth through last frame's view-projection times the inverse of this frame's
+  (double precision on the CPU); a turn of more than ~10 degrees or a 10 % field-of-view change counts as a camera cut
+  and resets DLSS's history. Players and the ball get the camera's motion only. The mode sets the scene size through
+  `resolution.c` (DLAA 1920x1080, Quality 1280x720, Balanced 1114x626, Performance 960x540, Ultra Performance
+  640x360) when the driver has NGX and `nvngx_dlss.dll` (NVIDIA's, v310.9.1 as TotK's setup pins it, not in git) is
+  next to `mlb.exe`; restart to change it. Test knobs: `MLB_DLSS_MVDEBUG=1` (vectors instead of the picture),
+  `MLB_DLSS_MV=0`, `MLB_DLSS_JITTER=0`, `MLB_DLSS_TIMES=1` (GPU time every 600 frames).

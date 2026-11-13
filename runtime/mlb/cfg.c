@@ -38,9 +38,10 @@ static const CfgMeta metas[] = {
     {"OUTPUT_RES", "1920x1080", NULL, RESTART}, {"RENDER_SCALE", "game", "game|100|125|150", RESTART},   // mlbts-native: resolution.c (200 ran out of a game heap)
     // mlbts-native: UPSCALER bilinear by default (the game's own look); fsr: vk_fsr.c, on the 3D scene and the present
     {"UPSCALER", "bilinear", "fsr|bilinear", LIVE}, {"SHARPNESS", "80", "0..100", LIVE},
-    {"DLAA", "0", "0|1", RESTART}, {"DLSS", "dlaa", "dlaa|quality|balanced|performance|ultra_performance", LIVE},
-    {"DLSS_PRESET", "default", "default|k|j", LIVE},
-    {"DLSS_CHAR_MASK", "65", "0|35|65|100", LIVE}, {"FXAA", "1", "0|1", LIVE},
+    // mlbts-native: one DLSS row, off or the mode (vk_dlaa.c; the scene's size follows the mode, resolution.c), read at
+    // start; TotK's DLAA switch and its characters' mask (TotK's G-buffer classes) are not used. The preset is live.
+    {"DLSS", "off", "off|dlaa|quality|balanced|performance|ultra_performance", RESTART},
+    {"DLSS_PRESET", "default", "default|k|j|m|l|e", LIVE}, {"FXAA", "1", "0|1", LIVE},
     {"ASPECT", "fit", "fit|stretch", LIVE}, {"MOVIE_ASPECT", "keep", "keep|stretch", LIVE}, {"FOV", "100", "70..140", LIVE},
     {"ANISO", "game", "game|2|4|8|16", RESTART},   // vk_texture.c sampler_features
     // colour adjustment (vk_color.c); the preset is the menu's, the four values are what the present uses

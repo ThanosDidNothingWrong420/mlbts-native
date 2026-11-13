@@ -1,0 +1,33 @@
+// mlbts-native, our own: camera motion vectors for DLSS (vk_dlaa.c mv_pass). Each pixel's depth is taken from this
+// frame's clip space to last frame's through one matrix the CPU made in double precision (last view-projection times
+// the inverse of this one), and the vector is last frame's window position minus this frame's, in render pixels and
+// without the jitter: DLSS's default convention. Players and the ball that move on their own get only the camera's
+// motion (as in TotK Recomp's runtime/shaders/dlaa_mv.comp, which this follows; there is no per-object pass here).
+//
+// MLB's scene: the replay's viewports have negative heights, so window y grows downwards from ndc y = +1; NVN's depth
+// mode gives ndc z = depth (near is zero) unless the game asked for -w..w, which pc.z maps.
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D depth_tex;
+layout(binding = 1, rg16f) uniform writeonly image2D mv_out;
+layout(push_constant) uniform P {
+    mat4 m;        // this frame's ndc to last frame's clip space
+    vec2 size;     // render size in pixels
+    vec2 jitter;   // this frame's jitter in pixels as the scene was drawn (window x right, y down)
+    vec2 z;        // ndc z = depth * z.x + z.y
+} pc;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(pc.size.x) || p.y >= int(pc.size.y)) return;
+    float d = texelFetch(depth_tex, p, 0).r;
+    vec2 win = vec2(p) + 0.5 - pc.jitter;   // where this pixel's surface sits without the jitter
+    vec4 ndc = vec4(win.x / pc.size.x * 2.0 - 1.0, 1.0 - win.y / pc.size.y * 2.0, d * pc.z.x + pc.z.y, 1.0);
+    vec4 q = pc.m * ndc;
+    vec2 mv = vec2(0.0);
+    if (q.w > 1e-6) {
+        vec2 pn = q.xy / q.w;
+        mv = vec2((pn.x * 0.5 + 0.5) * pc.size.x, (0.5 - pn.y * 0.5) * pc.size.y) - win;
+    }
+    imageStore(mv_out, p, vec4(mv, 0.0, 0.0));
+}
