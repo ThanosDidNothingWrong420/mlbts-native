@@ -183,10 +183,8 @@ void vk_hdr_ui_compose(VkCommandBuffer cb, VkImageView dst_view, VkFormat fmt, u
 }
 void vk_hdr_to_srgb8(const uint8_t *in, uint8_t *out, size_t px, int a2r) { (void)a2r; memcpy(out, in, px * 4); }
 
-// ---- the in-game settings menu (ui/menu.cpp, ImGui) and keyboard/mouse input (input_win.c): not ported yet; the
-// window procedure then handles every message itself.
-void menu_overlay_draw(VkCommandBuffer cb) { (void)cb; }
-// No overlay. mlbts-native: MLB_SHOT=<frame>[,<frame>...] saves the presented picture of those frames as
+// ---- keyboard/mouse input (input_win.c): not ported; the in-game settings menu is ui/menu.cpp.
+// mlbts-native: MLB_SHOT=<frame>[,<frame>...] saves the presented picture of those frames as
 // <profile>/shot-<frame>.png through gfx_present.c's capture path (the one TotK's menu test shots use).
 void vk_drawlog_arm_at(long frame);   // vk_exec_draw.c
 // One frame's capture, `ahead` presents from now: its draws in the log (MLB_DRAWLOG format) and its picture as
@@ -199,8 +197,8 @@ void gfx_capture_arm(long ahead) {
     __atomic_store_n(&capture_at, f, __ATOMIC_RELAXED);
     rt_log("capture: frame %ld", f);
 }
-int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot) {
-    (void)t;
+// Called by ui/menu.cpp menu_overlay_frame at every present: sets *shot when this frame's picture is to be saved.
+int mlb_capture_tick(uint64_t frame, const char **shot) {
     static char path[1100];
     static int f12_was;
     HWND fg = GetForegroundWindow();
@@ -255,8 +253,6 @@ int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot) {
     }
     return 0;
 }
-void menu_vk_release(void) {}
-int menu_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res) { (void)h, (void)m, (void)w, (void)l, (void)res; return 0; }
 int input_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res) { (void)h, (void)m, (void)w, (void)l, (void)res; return 0; }
 void input_cursor_suspend(int on) { (void)on; }
 

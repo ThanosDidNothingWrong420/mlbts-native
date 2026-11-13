@@ -1,0 +1,96 @@
+// FXAA on the game's 3D scene (vk_aa.c): edge antialiasing of one image into another of the same size.
+// Our own implementation of the FXAA idea (Timothy Lottes, NVIDIA, 2009-2011): find where brightness changes sharply,
+// tell whether the edge runs across or along, walk along it to both ends, and resample the pixel shifted across the edge
+// by how far it sits from the nearer end, so a stair step turns into a slope. Thin detail smaller than a pixel is
+// blended with its neighbours as well (strength: pc.subpix).
+//
+// mlbts-native: MLB's scene is linear HDR before the game's exposure and tone curve (B10G11R11, typical values around
+// 0.005 at a ball park in daylight), so brightness is compared in stops (log2), which does not depend on the exposure;
+// FXAA's usual threshold relative to the brightest neighbour is a threshold in stops here.
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D src;           // the scene's copy, linear filter, clamped at the edges
+layout(binding = 1) writeonly uniform image2D dst;   // the result, the scene's format (write without format)
+
+layout(push_constant) uniform Push {
+    vec2 rcp;          // 1 / size
+    ivec2 size;
+    float subpix;      // 0..1: how much sub-pixel detail is blended
+    float threshold;   // stops of contrast below which a pixel is left alone
+} pc;
+
+float luma(vec3 c) { return log2(dot(c, vec3(0.2126, 0.7152, 0.0722)) + 1e-4); }
+float at(ivec2 p) { return luma(texelFetch(src, clamp(p, ivec2(0), pc.size - 1), 0).rgb); }
+float sampled(vec2 uv) { return luma(textureLod(src, uv, 0.0).rgb); }
+
+// Steps of the walk along an edge, in pixels: short first, longer once the edge is long.
+const int STEPS = 12;
+const float STEP[STEPS] = float[](1.0, 1.0, 1.0, 1.0, 1.0, 1.5, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0);
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, pc.size))) return;
+    vec4 centre = texelFetch(src, p, 0);
+    float c = luma(centre.rgb);
+    float n = at(p + ivec2(0, -1)), s = at(p + ivec2(0, 1)), w = at(p + ivec2(-1, 0)), e = at(p + ivec2(1, 0));
+    float hi = max(c, max(max(n, s), max(w, e))), lo = min(c, min(min(n, s), min(w, e)));
+    float range = hi - lo;
+    if (range < pc.threshold) {   // flat: most of the picture
+        imageStore(dst, p, centre);
+        return;
+    }
+    float nw = at(p + ivec2(-1, -1)), ne = at(p + ivec2(1, -1)), sw = at(p + ivec2(-1, 1)), se = at(p + ivec2(1, 1));
+
+    // Sub-pixel blend: how far the centre stands out from its 3x3 average, relative to the local contrast.
+    float avg = (2.0 * (n + s + w + e) + nw + ne + sw + se) / 12.0;
+    float sub = smoothstep(0.0, 1.0, clamp(abs(avg - c) / range, 0.0, 1.0));
+    float sub_offset = sub * sub * pc.subpix;
+
+    // Edge orientation: change down the columns (a horizontal edge) against change along the rows (a vertical one).
+    float across_rows = 2.0 * abs(n + s - 2.0 * c) + abs(nw + sw - 2.0 * w) + abs(ne + se - 2.0 * e);
+    float across_cols = 2.0 * abs(w + e - 2.0 * c) + abs(nw + ne - 2.0 * n) + abs(sw + se - 2.0 * s);
+    bool horizontal = across_rows >= across_cols;
+
+    // The side of the edge: the neighbour across it that differs more.
+    float l1 = horizontal ? n : w, l2 = horizontal ? s : e;
+    float g1 = l1 - c, g2 = l2 - c;
+    bool first = abs(g1) >= abs(g2);
+    float grad = 0.25 * max(abs(g1), abs(g2));
+    float across = horizontal ? pc.rcp.y : pc.rcp.x;   // one pixel across the edge, toward the chosen side
+    float side_l = c;
+    if (first) { across = -across; side_l = l1; } else { side_l = l2; }
+    float mid = 0.5 * (c + side_l);   // the brightness halfway across the edge
+
+    // Walk along the edge from its middle (half a pixel toward that side) both ways until the brightness there leaves
+    // mid by more than a quarter of the step across: the edge's ends.
+    vec2 uv = (vec2(p) + 0.5) * pc.rcp;
+    vec2 base = uv, along = horizontal ? vec2(pc.rcp.x, 0.0) : vec2(0.0, pc.rcp.y);
+    if (horizontal) base.y += 0.5 * across; else base.x += 0.5 * across;
+    vec2 a = base, b = base;
+    float ea = 0.0, eb = 0.0;
+    bool done_a = false, done_b = false;
+    for (int i = 0; i < STEPS && !(done_a && done_b); i++) {
+        if (!done_a) {
+            a -= along * STEP[i];
+            ea = sampled(a) - mid;
+            done_a = abs(ea) >= grad;
+        }
+        if (!done_b) {
+            b += along * STEP[i];
+            eb = sampled(b) - mid;
+            done_b = abs(eb) >= grad;
+        }
+    }
+    float da = horizontal ? uv.x - a.x : uv.y - a.y, db = horizontal ? b.x - uv.x : b.y - uv.y;
+    // The nearer end decides: the pixel moves across only when that end turns the way the centre does (it lies on
+    // the step's lower part); then by how close it is to the end: half a pixel at the end, nothing in the middle.
+    bool centre_below = c < mid;
+    bool ok = (da < db ? ea : eb) < 0.0 != centre_below;
+    float edge_offset = ok ? 0.5 - min(da, db) / (da + db) : 0.0;
+    float offset = max(edge_offset, sub_offset);
+
+    vec2 at_uv = uv;
+    if (horizontal) at_uv.y += offset * across; else at_uv.x += offset * across;
+    imageStore(dst, p, vec4(textureLod(src, at_uv, 0.0).rgb, centre.a));
+}

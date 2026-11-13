@@ -4,6 +4,9 @@
 // mlbts-native: MLB_X in the environment wins over TOTK_X, and the table has MLB's own rows (LANGUAGE, TIMEZONE).
 #include "cfg.h"
 
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>   // MoveFileExW (cfg_save)
+
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +28,8 @@ static const CfgMeta metas[] = {
     {"PAD_MAP", "label", "label|position", LIVE},   // hid.c: XInput face buttons by label or by place
     {"RUMBLE", "1", "0|1", LIVE},   // hid.c: vibration on the XInput pad
     {"GPU", "vulkan", "vulkan|null", RESTART},   // main.c: the graphics back end (gfx_null.c chooses by it)
+    {"AA", "fxaa", "off|fxaa", LIVE},   // vk_aa.c: antialiasing of the 3D scene before the game lays its HUD over it
+    {"AA_STRENGTH", "75", "0..100", LIVE},   // vk_aa.c: how much FXAA softens thin, sub-pixel detail
     // TotK Recomp's rows (cfg.c @ ae30a61); the TotK-only ones are read by nothing here
     // Screen
     {"FULLSCREEN", "0", "0|1", LIVE}, {"WINDOW_SIZE", "1920x1080", NULL, LIVE},
@@ -186,7 +191,98 @@ int cfg_load_file(void) {
 
 unsigned cfg_version(void) { return version; }
 int cfg_is_set(const char *name) { return cfg_get(name) != NULL; }
-int cfg_save(void) { return 0; }   // no settings file: values set at run time last for the run
+
+int cfg_from_env(const char *name) {
+    char k[64], var[80];
+    norm_key(name, k);
+    snprintf(var, sizeof var, "MLB_%s", k);
+    if (getenv(var)) return 1;
+    snprintf(var, sizeof var, "TOTK_%s", k);
+    return getenv(var) != NULL;
+}
+
+// mlbts-native: the settings the menu changed (cfg_set_saved), which cfg_save writes into mlb.cfg.
+#define MAX_SAVED 64
+static char saved_keys[MAX_SAVED][64];
+static int n_saved;
+
+void cfg_set_saved(const char *name, const char *value) {
+    char k[64];
+    norm_key(name, k);
+    cfg_set(k, value);
+    plat_mutex_lock(&set_lock);
+    int i = 0;
+    while (i < n_saved && strcmp(saved_keys[i], k)) i++;
+    if (i == n_saved && n_saved < MAX_SAVED) snprintf(saved_keys[n_saved++], sizeof saved_keys[0], "%s", k);
+    plat_mutex_unlock(&set_lock);
+}
+
+// mlbts-native: the menu's changes go into mlb.cfg beside the executable. A line that sets one of those keys (MLB_X,
+// TOTK_X or X, not commented out) gets the new value in place; the others, comments included, stay as the player
+// wrote them; keys without a line are added at the end under a heading. Written to mlb.cfg.tmp, then moved over
+// mlb.cfg, so a crash mid-write leaves the old file. 1 when written (or nothing to write).
+int cfg_save(void) {
+    char keys[MAX_SAVED][64], vals[MAX_SAVED][256];
+    plat_mutex_lock_shared(&set_lock);
+    int n = n_saved;
+    for (int i = 0; i < n; i++) {
+        snprintf(keys[i], sizeof keys[i], "%s", saved_keys[i]);
+        const char *v = NULL;
+        for (int j = 0; j < n_set && !v; j++)
+            if (!strcmp(set_values[j].key, keys[i])) v = set_values[j].value;
+        snprintf(vals[i], sizeof vals[i], "%s", v ? v : "");
+    }
+    plat_mutex_unlock_shared(&set_lock);
+    if (!n) return 1;
+    wchar_t path[1024], tmp[1040];
+    if (!plat_exe_dir_wide(path, 1000)) return 0;
+    wcscat(path, L"mlb.cfg");
+    swprintf(tmp, sizeof tmp / sizeof *tmp, L"%ls.tmp", path);
+    FILE *in = _wfopen(path, L"r"), *out = _wfopen(tmp, L"w");
+    if (!out) {
+        if (in) fclose(in);
+        return 0;
+    }
+    int done[MAX_SAVED] = {0};
+    char line[512];
+    while (in && fgets(line, sizeof line, in)) {
+        const char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        const char *eq = strchr(p, '=');
+        int hit = -1;
+        if (*p != '#' && *p != ';' && eq && eq - p < 63) {
+            char name[64], k[64];
+            size_t len = (size_t)(eq - p);
+            memcpy(name, p, len);
+            while (len && (name[len - 1] == ' ' || name[len - 1] == '\t')) len--;
+            name[len] = 0;
+            norm_key(name, k);
+            for (int i = 0; i < n && hit < 0; i++)
+                if (!strcmp(keys[i], k)) hit = i;
+        }
+        if (hit >= 0) {
+            fprintf(out, "MLB_%s=%s\n", keys[hit], vals[hit]);
+            done[hit] = 1;
+        } else {
+            fputs(line, out);
+            size_t l = strlen(line);
+            if (l && line[l - 1] != '\n') fputc('\n', out);
+        }
+    }
+    if (in) fclose(in);
+    int head = 0;
+    for (int i = 0; i < n; i++) {
+        if (done[i]) continue;
+        if (!head++) fputs("\n# --- Set in the in-game menu (F1) ----------------------------------------------\n", out);
+        fprintf(out, "MLB_%s=%s\n", keys[i], vals[i]);
+    }
+    int ok = !ferror(out);
+    ok &= fclose(out) == 0;
+    if (ok) ok = MoveFileExW(tmp, path, MOVEFILE_REPLACE_EXISTING) != 0;
+    if (!ok) _wremove(tmp);
+    rt_log("cfg: %s mlb.cfg (%d setting%s from the menu)", ok ? "wrote" : "could not write", n, n == 1 ? "" : "s");
+    return ok;
+}
 
 const CfgMeta *cfg_meta(const char *key) {
     char k[64];

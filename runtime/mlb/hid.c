@@ -22,6 +22,8 @@
 #include "cfg.h"
 #include "host.h"
 #include "platform/platform.h"
+int menu_is_open(void);   // ui/menu.cpp (ui/menu.h pulls in Vulkan)
+void menu_toggle(void);
 
 // ---- libnx layouts
 typedef struct { uint64_t sampling, buttons; int32_t lx, ly, rx, ry; uint32_t attributes, reserved; } NpadState;
@@ -97,26 +99,44 @@ static int window_focused(void) {
 
 static int key(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 
+// The Switch buttons of an XInput pad state.
+static uint64_t pad_bits(const XPad *p) {
+    uint64_t b = 0;
+    int label = strcmp(cfg_value("MLB_PAD_MAP"), "position") != 0;
+    static const struct { uint16_t x; int lab, pos; } face[] = {
+        {0x1000, B_A, B_B}, {0x2000, B_B, B_A}, {0x4000, B_X, B_Y}, {0x8000, B_Y, B_X},   // Xbox A B X Y
+    };
+    for (int i = 0; i < 4; i++)
+        if (p->buttons & face[i].x) b |= BIT(label ? face[i].lab : face[i].pos);
+    static const struct { uint16_t x; int bit; } other[] = {
+        {0x0001, B_UP}, {0x0002, B_DOWN}, {0x0004, B_LEFT}, {0x0008, B_RIGHT}, {0x0010, B_PLUS}, {0x0020, B_MINUS},
+        {0x0040, B_LSTICK}, {0x0080, B_RSTICK}, {0x0100, B_L}, {0x0200, B_R},
+    };
+    for (size_t i = 0; i < sizeof other / sizeof *other; i++)
+        if (p->buttons & other[i].x) b |= BIT(other[i].bit);
+    if (p->lt > 127) b |= BIT(B_ZL);
+    if (p->rt > 127) b |= BIT(B_ZR);
+    return b;
+}
+
+// mlbts-native: the in-game settings menu (ui/menu.cpp) reads the pad itself while it is open, in Switch button bits
+// (the same as the game's: A 0, B 1, X 2, Y 3, L 6, R 7, ZL 8, ZR 9, d-pad 12..15). 0 without a pad.
+int hid_menu_pad(uint64_t *buttons, int32_t *lx, int32_t *ly) {
+    XPad p;
+    *buttons = 0, *lx = *ly = 0;
+    if (!xinput_read(&p)) return 0;
+    *buttons = pad_bits(&p);
+    *lx = clamp_stick(p.lx), *ly = clamp_stick(p.ly);
+    return 1;
+}
+
 // The merged controller state: buttons and sticks.
 static void poll(NpadState *st) {
     uint64_t b = 0;
     int32_t lx = 0, ly = 0, rx = 0, ry = 0;
     XPad p;
     if (xinput_read(&p)) {
-        int label = strcmp(cfg_value("MLB_PAD_MAP"), "position") != 0;
-        static const struct { uint16_t x; int lab, pos; } face[] = {
-            {0x1000, B_A, B_B}, {0x2000, B_B, B_A}, {0x4000, B_X, B_Y}, {0x8000, B_Y, B_X},   // Xbox A B X Y
-        };
-        for (int i = 0; i < 4; i++)
-            if (p.buttons & face[i].x) b |= BIT(label ? face[i].lab : face[i].pos);
-        static const struct { uint16_t x; int bit; } other[] = {
-            {0x0001, B_UP}, {0x0002, B_DOWN}, {0x0004, B_LEFT}, {0x0008, B_RIGHT}, {0x0010, B_PLUS}, {0x0020, B_MINUS},
-            {0x0040, B_LSTICK}, {0x0080, B_RSTICK}, {0x0100, B_L}, {0x0200, B_R},
-        };
-        for (size_t i = 0; i < sizeof other / sizeof *other; i++)
-            if (p.buttons & other[i].x) b |= BIT(other[i].bit);
-        if (p.lt > 127) b |= BIT(B_ZL);
-        if (p.rt > 127) b |= BIT(B_ZR);
+        b = pad_bits(&p);
         lx = clamp_stick(p.lx), ly = clamp_stick(p.ly), rx = clamp_stick(p.rx), ry = clamp_stick(p.ry);
     }
     if (window_focused()) {
@@ -140,6 +160,21 @@ static void poll(NpadState *st) {
     if (rx >= STICK_DIR) b |= BIT(B_RS_RIGHT);
     if (ry >= STICK_DIR) b |= BIT(B_RS_UP);
     if (ry <= -STICK_DIR) b |= BIT(B_RS_DOWN);
+    // mlbts-native: the in-game settings menu (ui/menu.cpp). Minus and Plus pressed together (Back and Start on an
+    // Xbox pad) open or close it; while it is open the game gets an idle controller. Buttons held when it closes stay
+    // hidden from the game until released: the B that closed the menu would otherwise also go "back" in the game.
+    static uint64_t prev, hidden;
+    static int was_open;
+    const uint64_t combo = BIT(B_MINUS) | BIT(B_PLUS);
+    if ((b & combo) == combo && (prev & combo) != combo) menu_toggle();
+    prev = b;
+    int open = menu_is_open();
+    if (open) hidden = ~0ull;
+    else if (was_open) hidden = b;
+    was_open = open;
+    hidden &= b;   // a released button counts again
+    b &= ~hidden;
+    if (open) lx = ly = rx = ry = 0;
     st->buttons = b;
     st->lx = lx, st->ly = ly, st->rx = rx, st->ry = ry;
 }

@@ -29,7 +29,10 @@ LIBS = ['bcrypt', 'user32', 'kernel32', 'advapi32', 'ntdll', 'synchronization', 
         'dbghelp', 'gdi32', 'dwmapi', 'imm32', 'uuid']
 RUNTIME_SOURCES = ['runtime/core/*.c', 'runtime/core/platform/common.c', 'runtime/core/platform/win32.c',
                    'runtime/core/platform/audio_win32.c', 'runtime/core/platform/prof_win.c',
-                   'runtime/mlb/*.c', 'runtime/gfx/*.c', 'runtime/gfx/*.cpp']
+                   'runtime/mlb/*.c', 'runtime/gfx/*.c', 'runtime/gfx/*.cpp',
+                   # the in-game settings menu (F1) and Dear ImGui, which draws it
+                   'runtime/gfx/ui/*.cpp', 'runtime/third_party/imgui/*.cpp',
+                   'runtime/third_party/imgui/backends/*.cpp']
 DEPS = ROOT / 'work' / 'deps'   # tools/fetch_deps.py: Vulkan headers, VMA, vulkan-1.lib
 CXX_FLAGS = ['-O2', '-g', '-std=c++17', '-march=x86-64-v3', '-D_CRT_SECURE_NO_WARNINGS', '-Wno-nullability-completeness']
 
@@ -115,7 +118,7 @@ def main():
     if not (DEPS / 'lib' / 'vulkan-1.lib').is_file():
         raise SystemExit(f'{DEPS} is missing the Vulkan headers and import library: run tools/fetch_deps.py')
     inc_rt = ['-I', 'runtime/mlb', '-I', 'runtime/core', '-I', 'runtime/gfx', '-I', rel(gen), '-I', rel(DEPS / 'include'),
-              '-I', rel(DEPS / 'include' / 'vma')]
+              '-I', rel(DEPS / 'include' / 'vma'), '-I', 'runtime/third_party/imgui']
     inc_gen = ['-I', 'runtime/core', '-I', rel(gen)]
     for d in (rel(gen), rel(out)):
         if ' ' in d:

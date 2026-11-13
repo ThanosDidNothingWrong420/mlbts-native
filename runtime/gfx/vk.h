@@ -159,6 +159,14 @@ void vk_fsr_release(void);   // before the device goes away
 // scales that one instead, crop {0, 0, w, h}); VK_NULL_HANDLE = nothing recorded. src is in GENERAL, fmt its format.
 VkImage vk_color_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, const int crop[4]);
 void vk_color_release(void);   // before the device goes away
+// mlbts-native, vk_aa.c: antialiasing of the 3D scene in place, before the game's composite draw reads it (MLB_AA).
+// vk_aa_on: the setting (re-read when the settings change). vk_aa_record: outside a render pass, after a full barrier;
+// records the pass on the scene (level 0, layer 0, GENERAL) and a barrier after it; 1 when recorded. Once per scene
+// image and submission. vk_aa_status: 0 off, 1 smoothing, 2 no 3D scene lately, 3 not supported (the menu's note).
+int vk_aa_on(void);
+int vk_aa_record(VkCommandBuffer cb, uint64_t fence, VkImage scene, VkFormat fmt, uint32_t w, uint32_t h);
+int vk_aa_status(void);
+void vk_aa_release(void);
 // HDR output (vk_hdr.c). vk_hdr_wanted: TOTK_HDR, read once. vk_hdr_surface_format: the HDR10 surface format when wanted
 // and offered (1). vk_hdr_set_active: gfx_present.c says whether the swapchain is HDR10 (vk_hdr_active). vk_hdr_encode:
 // like vk_color_record, src's crop as PQ code values (RGBA16F, crop {0, 0, w, h}). vk_hdr_ui_target / vk_hdr_ui_compose:

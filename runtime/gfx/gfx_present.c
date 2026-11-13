@@ -800,6 +800,7 @@ void gfx_window_release_vk(void) {
         menu_vk_release();
         vk_fsr_release();
         vk_color_release();
+        vk_aa_release();   // mlbts-native: the scene's antialiasing (vk_aa.c)
         vk_hdr_release();
         vk_contact_release();
         free_capture();

@@ -2736,6 +2736,66 @@ static int pipe_memo_on(void) {
     return PM.on;
 }
 
+// mlbts-native: antialiasing of the 3D scene (vk_aa.c, MLB_AA). MLB's frame ends with one full-screen draw that
+// tone-maps its 3D scene (texture 0 of that draw: 1440x810 B10G11R11 at 0x154ea0000), scales it to 1080p and lays the
+// HUD over it; fragment shader daf10a59 in play, 1d3e4d6b on some menu screens (the drawlog's hashes, every saved
+// capture of 2026-11-10). Before that draw the scene is smoothed in place. MLB_AA_FS=<hash>,... adds composite shaders.
+// The answer per fragment shader is kept by its GfxShader pointer (one per translated shader, never freed), so other
+// draws pay a pointer lookup.
+static int aa_composite(VkExec *ex, const GfxShader *fs) {
+    enum { N = 1024 };
+    static struct { const GfxShader *fs; int8_t yes; } memo[N];
+    static uint32_t want[8] = {0xdaf10a59u, 0x1d3e4d6bu};
+    static int nwant = -1;
+    unsigned i = (unsigned)((uintptr_t)fs * 0x9E3779B97F4A7C15ull >> 54);
+    if (memo[i].fs == fs) return memo[i].yes;
+    if (nwant < 0) {
+        nwant = 2;
+        const char *e = cfg_get("MLB_AA_FS");
+        while (e && *e && nwant < 8) {
+            char *end;
+            want[nwant++] = (uint32_t)strtoul(e, &end, 16);
+            e = *end == ',' ? end + 1 : NULL;
+        }
+    }
+    const uint8_t *ctl, *code;
+    uint32_t len, h = 2166136261u;
+    int yes = 0;
+    if (ex->prog && find_stage(ex->prog, NVN_STAGE_FS, &ctl, &code, &len)) {
+        for (uint32_t k = 0; k < len; k++) h = (h ^ code[k]) * 16777619u;   // the drawlog's fs hash
+        for (int k = 0; k < nwant; k++) yes |= want[k] == h;
+    }
+    memo[i].fs = fs, memo[i].yes = (int8_t)yes;
+    if (yes) rt_log("vk_aa: composite draw found (fs %08x): the 3D scene it reads is smoothed first", h);
+    return yes;
+}
+
+static void aa_before_draw(VkExec *ex, const GfxShader *fs) {
+    if (!fs || !vk_aa_on() || !aa_composite(ex, fs)) return;
+    const GfxShaderRes *tr;
+    if (gfx_shader_resources(fs, GFX_RES_TEX, &tr) < 1) return;
+    uint64_t h = res_tex_handle(ex, NVN_STAGE_FS, &tr[0], 0);
+    view_t v;
+    int hv = 0;
+    const VkTexImage *im = h ? vk_texture_by_id((int)(h & 0xfffff), &v, &hv) : NULL;
+    // the scene: a float colour render target of 2D image, not one of this pass's own targets
+    if (!im || im->gone || im->type != VK_IMAGE_TYPE_2D || im->samples > 1 || im->width < 256 ||
+        (im->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 && im->format != VK_FORMAT_R16G16B16A16_SFLOAT))
+        return;
+    for (int i = 0; i < ex->pass_ncolor && i < 8; i++)
+        if (ex->color[i].image == im->image) return;
+    VkImage image = im->image;
+    VkFormat fmt = im->format;
+    uint32_t w = im->width, hh = im->height;
+    int reopen = ex->in_pass;
+    vk_exec_barrier(ex);   // ends the pass; the scene's writes are done before the copy
+    if (vk_aa_record(ex->cb, ex->fence, image, fmt, w, hh)) {
+        memset(&B, 0, sizeof B);   // its compute pipeline and descriptors replaced what the replay knows is bound
+        ex->recorded++;
+    }
+    if (reopen) vk_exec_pass_begin(ex);
+}
+
 // Pass, shaders, pipeline, fixed state and resources for a draw. 0: the draw is skipped.
 static int prepare_draw_inner(VkExec *ex, int prim, int32_t count, int restart);
 static long drawlog_now_l(void);
@@ -2823,6 +2883,7 @@ static int prepare_draw_inner(VkExec *ex, int prim, int32_t count, int restart) 
     }
     if (!vs || (has_fs && !fs)) return pd_why = !vs ? "vertex shader missing (translation failed?)" : "fragment shader missing (translation failed?)", 0;
     if (vk_dlaa_skip_draw(ex, fs)) return pd_why = "DLAA/FXAA replacement", 0;   // the game's FXAA off, or its scaling replaced by DLSS (vk_dlaa.c)
+    aa_before_draw(ex, fs);   // mlbts-native: the composite's 3D scene is antialiased first (vk_aa.c)
     uint32_t fbl = feedback_prepare(ex, fs);
     VkPipeState s = ex->pipe;
     s.vs = vs, s.fs = fs;

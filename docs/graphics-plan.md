@@ -48,7 +48,7 @@ Layers, all vendored with attribution and `mlbts-native` markers on changes:
 - DLAA and motion vectors (`vk_dlaa.c`, `vk_mv*`);
 - HDR (`vk_hdr.c`) and FSR (`vk_fsr.c`);
 - contact shadows;
-- the ImGui settings menu;
+- the ImGui settings menu (back since 2026-11-13 with MLB's own pages, see below);
 - TotK's movie decoder;
 - frame dumps and the flight recorder (until needed);
 - the shader prewarm list, which is built from TotK's captured shaders.
@@ -107,3 +107,19 @@ Each step ends with a run, a log, and a commit; the boot progress in docs/runtim
   with its own serial), and dispatches the compute stage's program.
 - **G5** open: the presented frames are black while the intro movie should play. MLB binds textures and samplers
   through separate handles and writes movie frames with `nvnTextureWriteTexels`; both are next to check.
+
+## Settings menu and antialiasing (2026-11-13)
+
+- **Menu.** F1, or Back and Start together on the pad, opens TotK's Dear ImGui menu (`runtime/gfx/ui/`), drawn over
+  the game in the present's command buffer. Pages: Graphics (antialiasing, colour), Display (fullscreen, window size,
+  presentation, aspect) and Controls (face-button layout, rumble). Changes apply at once and are written into
+  `mlb.cfg` (`cfg_save`: a `MLB_X=` line is updated in place, a missing one added under a heading; comments stay).
+  While it is open the game keeps running and `hid.c` gives it an idle controller. `MLB_MENU_TEST=<frame>[:<tab>]`
+  opens it at a frame (with `MLB_SHOT`, a picture of it).
+- **Antialiasing (`MLB_AA=fxaa`, default; `off`).** MLB renders its 3D scene into one 1440x810 B10G11R11 image
+  (`0x154ea0000`) without any antialiasing, draws the HUD into a separate 1920x1080 layer, and one full-screen draw
+  (fragment shader `daf10a59`, `1d3e4d6b` on some menus) tone-maps and scales the scene and lays the HUD over it
+  **[C]** (drawlogs of 2026-11-10). `vk_exec_draw.c aa_before_draw` recognises that draw and `vk_aa.c` runs FXAA
+  (`runtime/shaders/fxaa.comp`, our own) on the scene in place first, so the HUD stays sharp. Brightness is compared
+  in stops, as the scene is linear HDR before the game's exposure. `MLB_AA_STRENGTH` (0..100) sets the sub-pixel
+  blending. Shaders compile with `tools/build_shaders.py` (glslang) into committed `*_spv.h` headers.
