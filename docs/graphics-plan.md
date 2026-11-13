@@ -46,7 +46,7 @@ Layers, all vendored with attribution and `mlbts-native` markers on changes:
 **Not ported (TotK-specific):**
 - resolution patch sets;
 - DLAA and motion vectors (`vk_dlaa.c`, `vk_mv*`);
-- HDR (`vk_hdr.c`) and FSR (`vk_fsr.c`);
+- HDR (`vk_hdr.c`); FSR (`vk_fsr.c`) came back on 2026-11-13, see below;
 - contact shadows;
 - the ImGui settings menu (back since 2026-11-13 with MLB's own pages, see below);
 - TotK's movie decoder;
@@ -124,6 +124,18 @@ Each step ends with a run, a log, and a commit; the boot progress in docs/runtim
   performance overlay (`perfmon.c`; off costs one branch per present). Not offered: TotK's speaker setting (MLB's
   `audout` always folds 5.1 to stereo), the frame limiter, motion and mouse rows (nothing here reads them), key
   rebinding (hid.c has a fixed table).
+- **Internal resolution (`MLB_RENDER_SCALE`, 2026-11-13).** The scene's size is not computed: f_70005a5368 returns entry
+  min(level, 4) of a table in main's read-only data (pointer at `0x7002283d80`, table at `0x7001d818a0`): 960x540,
+  1280x720, 1366x768, **1440x810** (the TV's level 3), 1600x900 **[C]** (traced with a size log on
+  `nvnTextureBuilderSetSize2D`: three 1440x810 targets made by f_70005a4b88, called from f_70005a4634). The output
+  table beside it holds 1280x720 and 1920x1080. `runtime/mlb/resolution.c` scales every entry by the chosen
+  percentage of 1080p before the guest starts (it checks the bytes first). 150 % (2880x1620) runs at 60 fps on the
+  title screen; **200 % crashes** at about frame 1400 with a null write in f_7001267d20 (a game allocation that failed,
+  most likely a fixed graphics heap, as TotK's DynamicTextureAllocator **[H]**), so the menu stops at 150 %.
+- **FSR 1 (`MLB_UPSCALER=fsr`, off by default; `MLB_SHARPNESS`).** TotK's `vk_fsr.c` scales the picture up on the present
+  when the window is larger than 1080p, and `vk_fsr_scene` scales MLB's 1440x810 scene up to the composite's 1080p
+  pass right after FXAA; the composite then samples it in the scene's place (`vk_dlaa_swap_img/view`, TotK's DLSS
+  hook, held for that one draw). At 100 % and above there is nothing to scale up.
 - **Antialiasing (`MLB_AA=fxaa`, default; `off`).** MLB renders its 3D scene into one 1440x810 B10G11R11 image
   (`0x154ea0000`) without any antialiasing, draws the HUD into a separate 1920x1080 layer, and one full-screen draw
   (fragment shader `daf10a59`, `1d3e4d6b` on some menus) tone-maps and scales the scene and lays the HUD over it

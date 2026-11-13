@@ -2770,8 +2770,9 @@ static int aa_composite(VkExec *ex, const GfxShader *fs) {
     return yes;
 }
 
+static int fsr_swapped;   // aa_before_draw set vk_dlaa_swap_img for this draw; prepare_draw clears it after
 static void aa_before_draw(VkExec *ex, const GfxShader *fs) {
-    if (!fs || !vk_aa_on() || !aa_composite(ex, fs)) return;
+    if (!fs || !(vk_aa_on() || vk_fsr_scene_on()) || !aa_composite(ex, fs)) return;
     const GfxShaderRes *tr;
     if (gfx_shader_resources(fs, GFX_RES_TEX, &tr) < 1) return;
     uint64_t h = res_tex_handle(ex, NVN_STAGE_FS, &tr[0], 0);
@@ -2788,9 +2789,20 @@ static void aa_before_draw(VkExec *ex, const GfxShader *fs) {
     VkFormat fmt = im->format;
     uint32_t w = im->width, hh = im->height;
     int reopen = ex->in_pass;
+    uint32_t pw = ex->pass_w, ph = ex->pass_h;
     vk_exec_barrier(ex);   // ends the pass; the scene's writes are done before the copy
-    if (vk_aa_record(ex->cb, ex->fence, image, fmt, w, hh)) {
-        memset(&B, 0, sizeof B);   // its compute pipeline and descriptors replaced what the replay knows is bound
+    int recorded = vk_aa_on() && vk_aa_record(ex->cb, ex->fence, image, fmt, w, hh);
+    // FSR (vk_fsr.c vk_fsr_scene): the scene scaled up to the composite's pass, sampled in its place by this draw
+    // (tex_info swaps the view in passes larger than the scene)
+    VkImageView up;
+    if (vk_fsr_scene(ex->cb, ex->fence, image, fmt, w, hh, pw, ph, &up)) {
+        vk_dlaa_swap_img = im;
+        vk_dlaa_swap_view = up;
+        fsr_swapped = 1;
+        recorded = 1;
+    }
+    if (recorded) {
+        memset(&B, 0, sizeof B);   // their compute pipelines and descriptors replaced what the replay knows is bound
         ex->recorded++;
     }
     if (reopen) vk_exec_pass_begin(ex);
@@ -2806,6 +2818,11 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     vk_exec_dq_end(ex);   // the previous draw's query ends before this one's preparation can begin a game query
     pd_why = NULL;
     int ok = prepare_draw_inner(ex, prim, count, restart);
+    if (fsr_swapped) {   // mlbts-native: the FSR scene swap holds for the composite draw alone (aa_before_draw)
+        fsr_swapped = 0;
+        vk_dlaa_swap_img = NULL;
+        vk_dlaa_swap_view = VK_NULL_HANDLE;
+    }
     if (!ok && !drawlog_now_l() && vk_exec_targets_watched(ex)) {   // a dropped draw into a watched target, any frame
         uint32_t h[2] = {0, 0};
         for (int st = 0; st < 2; st++) {

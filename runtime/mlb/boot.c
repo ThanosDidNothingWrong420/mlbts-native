@@ -10,6 +10,8 @@
 #include "host.h"
 #include "platform/platform.h"
 
+void res_apply(void);   // resolution.c
+
 #define SYM_INIT_START "_ZN2nn4init5StartEmmPFvvES2_S2_"
 #define CTOR_DONE 2   // a module's constructor flag after its DT_INIT ran the init_array
 
@@ -127,6 +129,7 @@ void rt_boot(void) {
     check_npdm();
     ldr_load(rt_config()->exefs);
     rt_patches_init();
+    res_apply();   // mlbts-native, resolution.c: MLB_RENDER_SCALE rewrites the scene size table before the game reads it
     cb_addr[0] = hostfn_register("<rtld loader_ready>", cb_loader_ready);
     cb_addr[1] = hostfn_register("<rtld module_inits>", cb_module_inits);
     cb_addr[2] = hostfn_register("<rtld module_finis>", cb_module_finis);

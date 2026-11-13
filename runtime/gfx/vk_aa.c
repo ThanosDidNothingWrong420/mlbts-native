@@ -206,7 +206,9 @@ int vk_aa_record(VkCommandBuffer cb, uint64_t fence, VkImage scene, VkFormat fmt
          .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &src},
         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 1, .descriptorCount = 1,
          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &dst}};
-    A.push(cb, VK_PIPELINE_BIND_POINT_COMPUTE, A.layout, 0, 2, wr);
+    // through the recorder (vk_rec.h) like the vkCmd* calls around it: a direct call would reach the command buffer
+    // ahead of them, or race the recorder thread that owns it
+    rec_push(A.push, cb, VK_PIPELINE_BIND_POINT_COMPUTE, A.layout, 0, 2, wr);
     struct { float rcp[2]; int32_t size[2]; float subpix, threshold, pad[2]; } pc = {
         {1.0f / (float)w, 1.0f / (float)h}, {(int32_t)w, (int32_t)h}, A.subpix,
         0.3f,   // stops: about 23 % brighter or darker than a neighbour, FXAA's usual edge threshold

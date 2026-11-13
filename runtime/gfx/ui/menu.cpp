@@ -284,7 +284,7 @@ static bool g_modal;            // a confirmation is open: B and Esc close it, n
 
 // Every setting the pages show, for "Reset all settings" (cfg_reset) and "Restart now".
 static const char *const kMenuKeys[] = {
-    "AA", "AA_STRENGTH", "ANISO", "COLOR_PRESET", "COLOR_BRIGHTNESS", "COLOR_CONTRAST", "COLOR_SATURATION",
+    "RENDER_SCALE", "UPSCALER", "SHARPNESS", "AA", "AA_STRENGTH", "ANISO", "COLOR_PRESET", "COLOR_BRIGHTNESS", "COLOR_CONTRAST", "COLOR_SATURATION",
     "COLOR_GAMMA", "FULLSCREEN", "WINDOW_SIZE", "VK_PRESENT", "ASPECT", "GPU_INDEX", "PERF_OVERLAY", "FRAME_QUEUE",
     "ASSUME_FOCUS", "VOLUME", "PAD_MAP", "RUMBLE", "RUMBLE_STRENGTH", "STICK_DEADZONE", "LSTICK_DEADZONE",
     "RSTICK_DEADZONE", "ASYNC_PREEMPT", "REPLAY_ASYNC", "PIPE_WAIT", "PIPE_SKIP", "LIB_PREBUILD",
@@ -353,8 +353,33 @@ static void rows_color(void) {
     if (moved && strcmp(cfg_value("COLOR_PRESET"), "custom")) cfg_set_saved("COLOR_PRESET", "custom");
 }
 
+// "in use: ..." under the upscaler while FSR has nothing to do (the scene is as large as the picture or larger).
+static const char *upscaler_note(void) {
+    if (strcmp(cfg_value("UPSCALER"), "fsr") || !strcmp(cfg_value("RENDER_SCALE"), "game")) return nullptr;
+    return "not used at this resolution";
+}
+
 static void tab_graphics(float scale) {
     opt_begin("##graphics", scale);
+    opt_group("Resolution");
+    static const char *const rs[] = {"game", "100", "125", "150"};
+    static const char *const rs_names[] = {"Game (1440 \xc3\x97 810)", "100 % (1920 \xc3\x97 1080)",
+                                           "125 % (2400 \xc3\x97 1350)", "150 % (2880 \xc3\x97 1620)"};
+    opt_choice_list("RENDER_SCALE", "Internal resolution", rs, rs_names, 4,
+                    "The size the game draws its 3D scene at. On the TV the game draws it at 1440 x 810 and stretches it "
+                    "to 1080p, which makes it soft. 100 % draws it at full 1080p; 125 % and 150 % draw it larger and "
+                    "shrink it, which also smooths edges (supersampling). The HUD and menus are always 1080p.\n\n"
+                    "Costs GPU time and video memory: 150 % draws about four times the pixels of the game's size. "
+                    "200 % runs the game out of its own graphics memory and crashes, so it is not offered.");
+    static const char *const up[] = {"FSR 1", "Bilinear"};
+    opt_choice("UPSCALER", "Upscaling", up, 2,
+               "How the 3D scene is stretched to 1080p when the internal resolution is the game's.\n\n"
+               "Bilinear is the game's own. FSR 1 (AMD FidelityFX Super Resolution) keeps edges and detail sharper. "
+               "It runs before the game draws its HUD, so text is not touched. It also scales the picture up when "
+               "the window is larger than 1080p. Costs a fraction of a millisecond.",
+               upscaler_note());
+    opt_slider("SHARPNESS", "FSR sharpness", 0, 100,
+               "How much FSR sharpens after scaling up; 0 turns the sharpening off.", 5, "%.0f %%");
     opt_group("Antialiasing");
     static const char *const aa[] = {"Off", "FXAA"};
     opt_choice("AA", "Antialiasing", aa, 2,

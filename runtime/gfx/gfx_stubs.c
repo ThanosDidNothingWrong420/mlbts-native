@@ -146,17 +146,11 @@ uint64_t vk_mvprev_step(int stage, int index, uint64_t size) { (void)stage, (voi
 void vk_mvsurvey_draw(VkExec *ex) { (void)ex; }
 void vk_mvsurvey_frame(void) {}
 
-// ---- contact shadows (vk_contact.c), FSR 1 (vk_fsr.c)
+// ---- contact shadows (vk_contact.c)
 int vk_contact_strength(void) { return 0; }
 void vk_contact_pass_begin(VkExec *ex) { (void)ex; }
 void vk_contact_flush(VkExec *ex) { (void)ex; }
 void vk_contact_release(void) {}
-int vk_fsr_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, int sw, int sh, const int crop[4],
-                  VkImage dst, const int out[4]) {
-    (void)cb, (void)slot, (void)src, (void)fmt, (void)sw, (void)sh, (void)crop, (void)dst, (void)out;
-    return 0;   // not recorded: the present blits
-}
-void vk_fsr_release(void) {}
 
 // ---- HDR output (vk_hdr.c): SDR only
 int vk_hdr_track;

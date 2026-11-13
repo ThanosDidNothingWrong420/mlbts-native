@@ -154,6 +154,11 @@ void vk_present_blit(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int
 int vk_fsr_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, int sw, int sh, const int crop[4],
                   VkImage dst, const int out[4]);
 void vk_fsr_release(void);   // before the device goes away
+// mlbts-native: FSR 1 on MLB's 3D scene (vk_fsr.c): EASU (+ RCAS) of the sw x sh scene to dw x dh, recorded into cb
+// (outside a pass); 1 with the result's view in *out, 0 when off (MLB_UPSCALER) or nothing to scale up.
+int vk_fsr_scene_on(void);
+int vk_fsr_scene(VkCommandBuffer cb, uint64_t fence, VkImage scene, VkFormat fmt, uint32_t sw, uint32_t sh, uint32_t dw,
+                 uint32_t dh, VkImageView *out);
 // Colour adjustment on the present (vk_color.c): with TOTK_COLOR_* away from their defaults, records a pass that writes
 // src's crop rectangle {x, y, w, h}, adjusted, into an RGBA16F image of that size in GENERAL and returns it (the caller
 // scales that one instead, crop {0, 0, w, h}); VK_NULL_HANDLE = nothing recorded. src is in GENERAL, fmt its format.
