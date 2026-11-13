@@ -158,7 +158,7 @@ title IDs and module layout differ.
 1. **TotK PC Recomp**, https://github.com/valentderah/totk-pc-recomp (`ae30a61`): the source of recomp/, runtime/core
    and runtime/gfx. Read it first for anything in those trees.
 2. **Astral Chain PC Recomp**, https://github.com/captainj-sparrow/astral-chain-pc-recomp: `audout:u` came from it.
-3. **Power Moon Recomp**, https://gitlab.com/zzzarathustra-dev/power-moon-recomp.
+3. **Super Odyssey PC Recomp**, https://github.com/Simon3Sarkis/super-odyssey-pc-recomp.
 4. **Savage Wind Recomp**, https://github.com/Revivedx/SavageWindRecomp.
 
 Ask before running code from a reference repo, except TotK's lifter, which the user approved as a coverage oracle.
@@ -171,3 +171,4 @@ Ryujinx runs 1.0.15 for the user and can be used as a correctness oracle.
 - Verify against the actual binaries and captures; clearly separate confirmed findings from hypotheses.
 - Fix root causes in the port, not symptoms per screen. Implement incrementally; build and smoke-test each change.
 - Document significant discoveries in code comments and `docs/`. Avoid unnecessary abstractions.
+- It is preferred that you use your edit tool to edit files instead of using commands or creating scripts to edit them.
