@@ -4,8 +4,9 @@
 // MLB_TRACE=sched).
 //
 // Ported from TotK Recomp runtime/perf.c @ ae30a61 (MIT, Copyright (c) 2026 Valiantsin Dzerakh;
-// LICENSE.totk-recomp). mlbts-native leaves out the performance overlay (perfmon.c), the flight recorder (flight.c),
-// the A/B blocks and TOTK_ONE_PER_CORE: rt_ab is 0 and rt_knob is TotK's.
+// LICENSE.totk-recomp). mlbts-native leaves out the flight recorder (flight.c), the A/B blocks and TOTK_ONE_PER_CORE:
+// rt_ab is 0 and rt_knob is TotK's. The performance overlay's numbers (perfmon.c, the settings menu's
+// MLB_PERF_OVERLAY) came back with the menu on 2026-11-13.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +14,7 @@
 #include "cfg.h"
 #include "gfx.h"
 #include "host.h"
+#include "perfmon.h"
 #include "platform/platform.h"
 #include "prof.h"
 
@@ -26,11 +28,17 @@ __attribute__((weak)) int prof_sampler_start(void) {
 __attribute__((weak)) void prof_sampler_write(void) {}
 __attribute__((weak)) void prof_sampler_frame(uint64_t frame, uint64_t now, uint64_t d) { (void)frame, (void)now, (void)d; }
 
-static int perf_on;   // MLB_TRACE=perf: event counts are taken. Wait times are always taken (frame-time summary).
+// MLB_TRACE=perf or the full performance overlay: event counts are taken. Wait times are always taken (frame-time
+// summary). perf_base: the part fixed at start.
+static int perf_on, perf_base;
+static int overlay;   // performance overlay mode (perf_set_overlay): 0 off, 1 fps, 2 full
 
-void perf_set_overlay(int mode) { (void)mode; }   // no overlay in mlbts-native
+void perf_set_overlay(int mode) {
+    __atomic_store_n(&overlay, mode, __ATOMIC_RELAXED);
+    __atomic_store_n(&perf_on, perf_base || mode == 2, __ATOMIC_RELAXED);
+}
 
-int perf_gpu_timing(void) { return (rt_trace & RT_TRACE_PERF) != 0; }
+int perf_gpu_timing(void) { return (rt_trace & RT_TRACE_PERF) || __atomic_load_n(&overlay, __ATOMIC_RELAXED) == 2; }
 
 static volatile int64_t gpu_busy_total;
 
@@ -40,7 +48,8 @@ uint64_t perf_gpu_busy_total(void) { return (uint64_t)__atomic_load_n(&gpu_busy_
 
 void prof_start(void) {
     atexit(perf_summary_flush);
-    perf_on = (rt_trace & RT_TRACE_PERF) != 0;
+    perf_base = (rt_trace & RT_TRACE_PERF) != 0;
+    perf_on = perf_base || overlay == 2;
     if (prof_sampler_start()) atexit(prof_write);
 }
 
@@ -220,7 +229,9 @@ void perf_present(uint64_t frame) {
     if (rt_trace & RT_TRACE_SCHED) kern_sched_report(frame);
     uint64_t now = kern_now_ns(), d = last ? now - last : 0;
     prof_sampler_frame(frame, now, last ? d : 0);
-    ft_frame(frame, now, d);   // d is 0 on the first present: it only starts the period
+    uint64_t rep = ft_frame(frame, now, d);   // d is 0 on the first present: it only starts the period
+    if (__atomic_load_n(&overlay, __ATOMIC_RELAXED))   // the overlay's only cost while it is off: this branch
+        perfmon_frame(now, d, frame_ns, rep, __atomic_load_n(&counts[PERF_CNT_TEX_UP], __ATOMIC_RELAXED));
     kern_core_diag_frame(frame, d);
     if (!(rt_trace & RT_TRACE_PERF)) {
         memset(frame_ns, 0, sizeof frame_ns);

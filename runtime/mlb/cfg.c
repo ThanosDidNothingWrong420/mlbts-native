@@ -55,7 +55,10 @@ static const CfgMeta metas[] = {
     {"SHADOW_RANGE", "100", "50..400", RESTART}, {"CONTACT_SHADOWS", "0", "0..100", RESTART},
     {"PCSS", "0", "0..200", RESTART},
     // Game
-    {"FPS_LIMIT", "60", "30|40|45|60|90|120|144|display", LIVE}, {"FPS60", "1", "0|1", LIVE}, {"FRAME_QUEUE", "0", "0|1", LIVE},
+    // mlbts-native: FRAME_QUEUE on (uneven frames at 60): the frame queue (nvn_api_obj.c nvnWindowAcquireTexture).
+    // Without it a window image is free only one period after its present, so a frame that runs a little long misses
+    // its slot; with it the game draws the next frame while the previous one waits for its turn.
+    {"FPS_LIMIT", "60", "30|40|45|60|90|120|144|display", LIVE}, {"FPS60", "1", "0|1", LIVE}, {"FRAME_QUEUE", "1", "0|1", LIVE},
     {"REALTIME", "1", "0|1", RESTART}, {"CLOTH_REALTIME", "1", "0|1", RESTART},
     {"MODS_REBUILD", "auto", "auto|off", RESTART},
     {"HIGHFPS_FIX", "1", "0|1", RESTART},
@@ -64,7 +67,8 @@ static const CfgMeta metas[] = {
     {"ASSUME_FOCUS", "1", "0|1", LIVE},   // read on every focus change (ov_system.c)
     // Sound, Controls, Menu
     {"VOLUME", "100", "0..100", LIVE}, {"AUDIO_CHANNELS", "stereo", "auto|stereo|5.1", RESTART},
-    {"MOTION", "1", "0|1", LIVE}, {"RUMBLE_STRENGTH", "130", "0..300", LIVE}, {"RUMBLE_CURVE", "0.6", "0.2..1.5", LIVE},
+    // mlbts-native: RUMBLE_STRENGTH 100 (TotK 130), the strength MLB had before the row was read (hid.c)
+    {"MOTION", "1", "0|1", LIVE}, {"RUMBLE_STRENGTH", "100", "0..300", LIVE}, {"RUMBLE_CURVE", "0.6", "0.2..1.5", LIVE},
     {"RUMBLE_TRIGGERS", "0", "0|1", LIVE}, {"PAD_LAYOUT", "auto", "auto|nintendo|xbox", LIVE},
     {"PROMPTS", "nintendo", "nintendo|xbox|pc", RESTART},
     {"STICK_DEADZONE", "8", "0..50", LIVE}, {"STICK_SENS", "1", "0.1..3", RESTART},
@@ -79,7 +83,10 @@ static const CfgMeta metas[] = {
     {"DISCORD_APP_ID", "1567232599846293504", NULL, LIVE},
     {"DISCORD_IMAGE", "totk_512x512", NULL, LIVE},
     // Advanced: scheduling
-    {"ASYNC_PREEMPT", "1", "0|1|2", RESTART}, {"REPLAY_ASYNC", "0", "0|1", RESTART},
+    // mlbts-native: REPLAY_ASYNC on (the batting frame rate): the replay runs on its own thread (vk_backend.c).
+    // Synchronous, it ran on the game's main thread after the game's own work, and busy at-bat scenes took 6-9 ms of
+    // replay on top of 10-12 ms of game work a frame (45-55 fps).
+    {"ASYNC_PREEMPT", "1", "0|1|2", RESTART}, {"REPLAY_ASYNC", "1", "0|1", RESTART},
     {"FREE_CORES", "0", "0|1", RESTART}, {"TIMER_1MS", "1", "0|1", RESTART},
     // shaders and pipelines
     {"PIPE_WAIT", "default", "default|draw", RESTART}, {"PIPE_SKIP", "fullscreen", "strict|any|fullscreen", RESTART},
@@ -106,7 +113,7 @@ static const CfgMeta metas[] = {
 };
 
 // Values set at run time (cfg_set): a small table under a lock; strings are never freed, as readers may hold them.
-#define MAX_SET 64
+#define MAX_SET 256   // mlbts-native: 64 in TotK; mlb.cfg and the menu's many rows set more
 static struct { char key[64]; const char *value; } set_values[MAX_SET];
 static int n_set;
 static PlatMutex set_lock = PLAT_MUTEX_INIT;
@@ -202,7 +209,7 @@ int cfg_from_env(const char *name) {
 }
 
 // mlbts-native: the settings the menu changed (cfg_set_saved), which cfg_save writes into mlb.cfg.
-#define MAX_SAVED 64
+#define MAX_SAVED 256
 static char saved_keys[MAX_SAVED][64];
 static int n_saved;
 
@@ -221,8 +228,15 @@ void cfg_set_saved(const char *name, const char *value) {
 // TOTK_X or X, not commented out) gets the new value in place; the others, comments included, stay as the player
 // wrote them; keys without a line are added at the end under a heading. Written to mlb.cfg.tmp, then moved over
 // mlb.cfg, so a crash mid-write leaves the old file. 1 when written (or nothing to write).
+static int save_file(char (*keys)[64], char (*vals)[256], int n);
+static int last_save_ok = 1;
+int cfg_last_save_ok(void) { return __atomic_load_n(&last_save_ok, __ATOMIC_RELAXED); }
+
 int cfg_save(void) {
-    char keys[MAX_SAVED][64], vals[MAX_SAVED][256];
+    // one copy of the keys and values at a time: the menu (present path) and F11 (window thread) both save
+    static PlatMutex save_lock = PLAT_MUTEX_INIT;
+    static char keys[MAX_SAVED][64], vals[MAX_SAVED][256];
+    plat_mutex_lock(&save_lock);
     plat_mutex_lock_shared(&set_lock);
     int n = n_saved;
     for (int i = 0; i < n; i++) {
@@ -233,7 +247,14 @@ int cfg_save(void) {
         snprintf(vals[i], sizeof vals[i], "%s", v ? v : "");
     }
     plat_mutex_unlock_shared(&set_lock);
-    if (!n) return 1;
+    int ok = 1;
+    if (n) ok = save_file(keys, vals, n);
+    __atomic_store_n(&last_save_ok, ok, __ATOMIC_RELAXED);
+    plat_mutex_unlock(&save_lock);
+    return ok;
+}
+
+static int save_file(char (*keys)[64], char (*vals)[256], int n) {
     wchar_t path[1024], tmp[1040];
     if (!plat_exe_dir_wide(path, 1000)) return 0;
     wcscat(path, L"mlb.cfg");
@@ -243,7 +264,8 @@ int cfg_save(void) {
         if (in) fclose(in);
         return 0;
     }
-    int done[MAX_SAVED] = {0};
+    static int done[MAX_SAVED];
+    memset(done, 0, sizeof done);
     char line[512];
     while (in && fgets(line, sizeof line, in)) {
         const char *p = line;
@@ -282,6 +304,29 @@ int cfg_save(void) {
     if (!ok) _wremove(tmp);
     rt_log("cfg: %s mlb.cfg (%d setting%s from the menu)", ok ? "wrote" : "could not write", n, n == 1 ? "" : "s");
     return ok;
+}
+
+int cfg_reset(const char *const *keys, int n) {
+    int done = 0;
+    for (int i = 0; i < n; i++) {
+        const CfgMeta *m = cfg_meta(keys[i]);
+        if (!m || cfg_from_env(m->key)) continue;
+        const char *now = cfg_get(m->key);
+        if (now && strcmp(now, m->def)) {
+            cfg_set_saved(m->key, m->def);
+            done++;
+        }
+    }
+    return done;
+}
+
+const CfgMeta *cfg_meta_at(int i) { return i >= 0 && i < (int)(sizeof metas / sizeof *metas) ? &metas[i] : NULL; }
+
+void cfg_each_active(void (*fn)(const char *key, const char *value, int from_env, void *ctx), void *ctx) {
+    for (size_t i = 0; i < sizeof metas / sizeof *metas; i++) {
+        const char *v = cfg_get(metas[i].key);
+        if (v && *v) fn(metas[i].key, v, cfg_from_env(metas[i].key), ctx);
+    }
 }
 
 const CfgMeta *cfg_meta(const char *key) {

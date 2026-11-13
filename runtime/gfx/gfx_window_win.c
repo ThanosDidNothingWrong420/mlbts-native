@@ -210,7 +210,8 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
             input_cursor_suspend(1);
             toggle_fullscreen(h);
             input_cursor_suspend(0);
-            cfg_set("TOTK_FULLSCREEN", is_fullscreen(h) ? "1" : "0");   // the menu shows it; the next start keeps it
+            // mlbts-native: cfg_set_saved, so cfg_save writes it into mlb.cfg (plain cfg_set was not saved)
+            cfg_set_saved("TOTK_FULLSCREEN", is_fullscreen(h) ? "1" : "0");   // the menu shows it; the next start keeps it
             cfg_save();
             note_applied();   // what cfg_get reads now (the environment may still override it)
         }

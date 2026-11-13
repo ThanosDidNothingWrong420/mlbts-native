@@ -11,7 +11,7 @@
 // the frame's display time from the pacer (nvn_api_obj.c), so present-to-present intervals stay even whatever the
 // replay took. The blit is already on the queue, so the wait blocks no submission.
 //
-// Asynchronous replay (TOTK_REPLAY_ASYNC, default 0; 1 turns it on): nvnQueueSubmitCommands
+// Asynchronous replay (TOTK_REPLAY_ASYNC; mlbts-native: default 1, cfg.c; 0 turns it off): nvnQueueSubmitCommands
 // and nvnQueuePresentTexture only queue. Each item gets its timeline value at enqueue (vk_sync_reserve), in queue
 // order; the replay thread runs the synchronous submit and present bodies in that order, so every value is signalled
 // by the submission it was handed out for. The game runs at most one frame ahead: queueing present N waits until the

@@ -345,14 +345,8 @@ int main(int argc, char **argv) {
     // and the guest scheduler's report every 120 presents (per thread: run, block, sleep and core-wait shares, wake and
     // core-grant latency, sleep asked against taken): the uneven frames at 60 fps
     if (!cfg_get("MLB_TRACE")) cfg_set("TRACE", "perf,sched");
-    // mlbts-native, on trial (the batting frame rate): the replay runs on its own thread (vk_backend.c). Synchronous, it
-    // ran on the game's main thread after the game's own work, and busy at-bat scenes took 6-9 ms of replay on top of
-    // 10-12 ms of game work a frame (45-55 fps). MLB_REPLAY_ASYNC=0: synchronous, as before.
-    if (!cfg_get("MLB_REPLAY_ASYNC")) cfg_set("REPLAY_ASYNC", "1");
-    // mlbts-native, on trial (uneven frames at 60): the frame queue (nvn_api_obj.c nvnWindowAcquireTexture). Without
-    // it a window image is free only one period after its present, so a frame that runs a little long misses its slot;
-    // with it the game draws the next frame while the previous one waits for its turn. MLB_FRAME_QUEUE=0: as before.
-    if (!cfg_get("MLB_FRAME_QUEUE")) cfg_set("FRAME_QUEUE", "1");
+    // REPLAY_ASYNC and FRAME_QUEUE are on by default: their rows in cfg.c say why (the settings menu's reset needs the
+    // defaults in the table)
     parse_trace();
     parse_fntrace();
     cfg = (RtConfig){.exefs = cfg_get("MLB_EXEFS") ? cfg_get("MLB_EXEFS") : rt_default_exefs,
@@ -391,6 +385,7 @@ int main(int argc, char **argv) {
         if (!cfg_get("MLB_SAMPLER_SLOW")) cfg_set("SAMPLER_SLOW", "19");
     } else if (!strcmp(cfg_get("MLB_SAMPLER"), "off")) cfg_set("SAMPLER", "");
     prof_start();   // perf.c: the frame-time summary, MLB_TRACE=perf, MLB_SAMPLER
+    playtime_init();   // playtime.c: the settings menu's play time, in <profile>/playtime.txt
     rt_boot();
     return 0;
 }

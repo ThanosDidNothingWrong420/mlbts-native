@@ -11,7 +11,9 @@
 //       left stick W A S D, right stick I J K L, d-pad arrow keys, A Enter or Space, B Escape or Backspace, X R, Y F,
 //       L Q, R E, ZL 1, ZR 3, + Tab, - M, left stick click C, right stick click V.
 // Vibration plays on the XInput pad's motors (MLB_RUMBLE=0: off): the low band's amplitude on the left motor, the high
-// band's on the right. Nothing here allocates guest memory or calls back into the guest.
+// band's on the right, times MLB_RUMBLE_STRENGTH percent. The XInput sticks get a radial dead zone
+// (MLB_LSTICK_DEADZONE / MLB_RSTICK_DEADZONE, else MLB_STICK_DEADZONE, percent; the settings menu's Controls tab).
+// Nothing here allocates guest memory or calls back into the guest.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
@@ -90,6 +92,41 @@ static int xinput_read(XPad *out) {
 
 static int32_t clamp_stick(int32_t v) { return v > STICK_MAX ? STICK_MAX : v < -STICK_MAX ? -STICK_MAX : v; }
 
+// ---- the settings this file reads, again whenever cfg_version changes (the settings menu applies them live)
+static unsigned knobs_ver;
+static double dz_l, dz_r, rumble_gain = 1;
+
+static double dead_zone_of(const char *key) {
+    const char *v = cfg_get(key);   // unset or empty: both sticks' value
+    double d = v && *v ? cfg_double(key) : cfg_double("STICK_DEADZONE");
+    return d < 0 ? 0 : d > 50 ? 0.5 : d / 100;
+}
+
+static void knobs(void) {
+    unsigned v = cfg_version();
+    if (v == __atomic_load_n(&knobs_ver, __ATOMIC_ACQUIRE)) return;
+    dz_l = dead_zone_of("LSTICK_DEADZONE");
+    dz_r = dead_zone_of("RSTICK_DEADZONE");
+    double g = cfg_double("RUMBLE_STRENGTH");
+    rumble_gain = g < 0 ? 0 : g / 100;
+    __atomic_store_n(&knobs_ver, v, __ATOMIC_RELEASE);
+}
+
+// A radial dead zone: a stick inside dz of its travel reads as centred; past it, the rest of the travel is spread
+// over the whole range, so a small push still starts at zero and full deflection stays full.
+static void dead_zone(int32_t *x, int32_t *y, double dz) {
+    if (dz <= 0) return;
+    double fx = *x / (double)STICK_MAX, fy = *y / (double)STICK_MAX, m = sqrt(fx * fx + fy * fy);
+    if (m <= dz) {
+        *x = *y = 0;
+        return;
+    }
+    double out = (m - dz) / (1 - dz);
+    double s = (out > 1 ? 1 : out) / m;
+    *x = clamp_stick((int32_t)lrint(fx * s * STICK_MAX));
+    *y = clamp_stick((int32_t)lrint(fy * s * STICK_MAX));
+}
+
 static int window_focused(void) {
     HWND w = GetForegroundWindow();
     DWORD pid = 0;
@@ -130,14 +167,30 @@ int hid_menu_pad(uint64_t *buttons, int32_t *lx, int32_t *ly) {
     return 1;
 }
 
+// mlbts-native: the settings menu's dead zone rows show how far each stick is pushed now, before the dead zone (a
+// drifting stick's resting value). now[0] left, now[1] right, in percent of full travel; 0 without a pad.
+int hid_stick_percent(double now[2]) {
+    XPad p;
+    now[0] = now[1] = 0;
+    if (!xinput_read(&p)) return 0;
+    double lx = p.lx / (double)STICK_MAX, ly = p.ly / (double)STICK_MAX, rx = p.rx / (double)STICK_MAX,
+           ry = p.ry / (double)STICK_MAX;
+    now[0] = fmin(sqrt(lx * lx + ly * ly), 1) * 100;
+    now[1] = fmin(sqrt(rx * rx + ry * ry), 1) * 100;
+    return 1;
+}
+
 // The merged controller state: buttons and sticks.
 static void poll(NpadState *st) {
     uint64_t b = 0;
     int32_t lx = 0, ly = 0, rx = 0, ry = 0;
     XPad p;
+    knobs();
     if (xinput_read(&p)) {
         b = pad_bits(&p);
         lx = clamp_stick(p.lx), ly = clamp_stick(p.ly), rx = clamp_stick(p.rx), ry = clamp_stick(p.ry);
+        dead_zone(&lx, &ly, dz_l);
+        dead_zone(&rx, &ry, dz_r);
     }
     if (window_focused()) {
         static const struct { int vk, bit; } keys[] = {
@@ -315,6 +368,8 @@ static void ov_vib_send(Cpu *c) {
     else vib_low = v->amp_low > v->amp_high ? v->amp_low : v->amp_high;
     float lo = vib_low, hi = vib_high;
     plat_mutex_unlock(&lock);
+    knobs();
+    lo *= (float)rumble_gain, hi *= (float)rumble_gain;
     plat_once(&xinput_once, xinput_load, NULL);
     if (x_set && pad_slot >= 0) {
         XVibration xv = {(uint16_t)(fminf(fmaxf(lo, 0), 1) * 65535), (uint16_t)(fminf(fmaxf(hi, 0), 1) * 65535)};

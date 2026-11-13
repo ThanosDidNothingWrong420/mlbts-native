@@ -10,8 +10,10 @@
 // Copyright (c) 2026 Peiikai): dark green panels, gold accents, the tab bar with L / R or Q / E, the window over a
 // dimmed game, two-pane option rows (option_rows.cpp).
 //
-// mlbts-native: MLB's pages (Graphics, Display, Controls) over the settings this port reads live; English text only
-// (TotK's translated catalog, its mods, cheats, amiibo, binds and performance overlay pages are not ported). F1, or
+// mlbts-native: MLB's pages (Graphics, Display, Game, Sound, Controls, Advanced) over the settings this port reads,
+// with TotK's performance overlay (F10) and its Advanced helpers; English text only. TotK's translated catalog, its
+// mods, cheats, amiibo and key binding pages and its TotK-only rows (resolution patches, shadows, DLSS, HDR, frame
+// limit, motion, mouse) are not ported. F1, or
 // Minus and Plus together on the pad (Back and Start, hid.c), open and close it; B or Esc close it. While it is open the
 // game keeps running and gets an idle controller (hid.c). Changes apply at once and go into mlb.cfg (cfg_save).
 // Closed, it costs one atomic load per present on top of the F12 capture check (gfx_stubs.c mlb_capture_tick).
@@ -38,6 +40,11 @@ extern const char rt_port_version[];
 int hid_menu_pad(uint64_t *buttons, int32_t *lx, int32_t *ly);   // mlb/hid.c
 int vk_aa_status(void);                                          // vk_aa.c
 int mlb_capture_tick(uint64_t frame, const char **shot);         // gfx_stubs.c: F12 / MLB_SHOT captures
+int hid_stick_percent(double now[2]);                            // mlb/hid.c
+int playtime_get(uint64_t *total_s, uint64_t *session_s);        // core/playtime.c
+int fs_save_busy(void);                                          // core/fs_host.c
+#include "perfmon.h"
+#include "sysinfo.h"
 }
 
 // Roboto Medium (Apache-2.0, ui/fonts/LICENSE-Roboto.txt) with Latin glyphs.
@@ -74,7 +81,6 @@ extern "C" int menu_is_open(void) { return g_open.load(std::memory_order_relaxed
 extern "C" void menu_toggle(void) {
     if (!g_failed.load(std::memory_order_relaxed)) change_open(-1);
 }
-extern "C" void menu_perf_cycle(void) {}   // TotK's performance overlay: not ported
 
 // ---- events from the window adapter, queued while the menu is open; the present path hands them to ImGui
 enum { EV_KEY, EV_POS, EV_BUTTON, EV_WHEEL, EV_FOCUS, EV_MAX = 256 };
@@ -269,11 +275,45 @@ extern "C" void menu_vk_release(void) {
 extern "C" int menu_font_check(void) { return 1; }
 
 // ---- the pages
-enum { TAB_GRAPHICS, TAB_DISPLAY, TAB_CONTROLS, TAB_COUNT };
-static const char *const kTabNames[TAB_COUNT] = {"Graphics", "Display", "Controls"};
+enum { TAB_GRAPHICS, TAB_DISPLAY, TAB_GAME, TAB_SOUND, TAB_CONTROLS, TAB_ADVANCED, TAB_COUNT };
+static const char *const kTabNames[TAB_COUNT] = {"Graphics", "Display", "Game", "Sound", "Controls", "Advanced"};
 static int g_tab;               // the tab shown
 static int g_tab_request = -1;  // select this tab at the next layout; -1 none
 static int g_focus_page = -1;   // this tab's first row takes the cursor once it is shown; -1 none
+static bool g_modal;            // a confirmation is open: B and Esc close it, not the menu; L / R stay on the page
+
+// Every setting the pages show, for "Reset all settings" (cfg_reset) and "Restart now".
+static const char *const kMenuKeys[] = {
+    "AA", "AA_STRENGTH", "ANISO", "COLOR_PRESET", "COLOR_BRIGHTNESS", "COLOR_CONTRAST", "COLOR_SATURATION",
+    "COLOR_GAMMA", "FULLSCREEN", "WINDOW_SIZE", "VK_PRESENT", "ASPECT", "GPU_INDEX", "PERF_OVERLAY", "FRAME_QUEUE",
+    "ASSUME_FOCUS", "VOLUME", "PAD_MAP", "RUMBLE", "RUMBLE_STRENGTH", "STICK_DEADZONE", "LSTICK_DEADZONE",
+    "RSTICK_DEADZONE", "ASYNC_PREEMPT", "REPLAY_ASYNC", "PIPE_WAIT", "PIPE_SKIP", "LIB_PREBUILD",
+    "LIB_PREBUILD_THREADS", "PIPE_PREBUILD", "PREWARM_XLATE", "GPL", "ASTC", "MEMORY", "TEX_ALIAS",
+    "TEX_VRAM_PRESSURE", "ASTC_BC", "LOD_GUARD", "FIX_C0", "FIX_ZERO", "BIND_SKIP", "SHADER_MEMO", "PIPE_MEMO",
+    "TEX_MEMO", "DESC_TEMPLATE", "PUSH_SKIP", "SPLIT_DRAWS", "VK_VALIDATION", "VK_DYN_VERTEX", "VK_DYN_A2C",
+    "VK_SUBGROUP_PIN",
+};
+enum { N_MENU_KEYS = sizeof kMenuKeys / sizeof *kMenuKeys };
+
+// The settings read only at start: each one's value as this run started, so "Restart now" shows once one differs.
+static struct { const char *key; char at_start[64]; } g_restart_keys[N_MENU_KEYS];
+static int g_n_restart_keys = -1;
+
+static void note_start_values(void) {
+    g_n_restart_keys = 0;
+    for (const char *k : kMenuKeys) {
+        const CfgMeta *m = cfg_meta(k);
+        if (!m || m->live) continue;
+        g_restart_keys[g_n_restart_keys].key = k;
+        snprintf(g_restart_keys[g_n_restart_keys++].at_start, sizeof g_restart_keys[0].at_start, "%s", cfg_value(k));
+    }
+}
+
+static bool restart_pending(void) {
+    for (int i = 0; i < g_n_restart_keys; i++)
+        if (strcmp(cfg_value(g_restart_keys[i].key), g_restart_keys[i].at_start)) return true;
+    return false;
+}
 
 // What the antialiasing pass did lately (vk_aa_status), under its value.
 static const char *aa_note(void) {
@@ -328,8 +368,48 @@ static void tab_graphics(float scale) {
                "How much FXAA also softens thin details smaller than a pixel (the netting, distant lines, "
                "shimmering on the grass). Higher is smoother but a little blurrier; 0 only smooths the edges.",
                5, "%.0f %%");
+    opt_group("Textures");
+    static const char *const aniso[] = {"game", "2", "4", "8", "16"};
+    static const char *const aniso_names[] = {"Game", "2x", "4x", "8x", "16x"};
+    opt_choice_list("ANISO", "Texture filtering", aniso, aniso_names, 5,
+                    "Anisotropic filtering: the grass, the infield dirt and the stands seen at a shallow angle stay "
+                    "sharp into the distance instead of blurring. Game: the level the game asks for, as on the Switch. "
+                    "Higher levels cost a little GPU time.");
     rows_color();
     opt_end();
+}
+
+// ---- Display
+enum { MAX_GPUS = 8 };
+static char g_gpu_names[MAX_GPUS][VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
+static int g_gpu_n = -1;   // -1: not listed yet
+
+// The Vulkan devices in vkEnumeratePhysicalDevices order, which MLB_GPU_INDEX counts in (vk_device.c pick_device).
+static void list_gpus(VkInstance inst) {
+    if (g_gpu_n >= 0) return;
+    VkPhysicalDevice pd[MAX_GPUS];
+    uint32_t n = MAX_GPUS;
+    if (vkEnumeratePhysicalDevices(inst, &n, pd) < 0) n = 0;   // VK_INCOMPLETE keeps the first MAX_GPUS
+    for (uint32_t i = 0; i < n; i++) {
+        VkPhysicalDeviceProperties p;
+        vkGetPhysicalDeviceProperties(pd[i], &p);
+        snprintf(g_gpu_names[i], sizeof g_gpu_names[i], "%s", p.deviceName);
+    }
+    g_gpu_n = (int)n;
+}
+
+static void row_gpu(void) {
+    const char *vals[MAX_GPUS + 1], *names[MAX_GPUS + 1];
+    char idx[MAX_GPUS][4];
+    vals[0] = "";
+    names[0] = "Automatic";
+    for (int i = 0; i < g_gpu_n; i++) {
+        snprintf(idx[i], sizeof idx[i], "%d", i);
+        vals[i + 1] = idx[i];
+        names[i + 1] = g_gpu_names[i];
+    }
+    opt_choice_list("GPU_INDEX", "Graphics card", vals, names, g_gpu_n + 1,
+                    "The graphics card that draws the game. Automatic picks the first dedicated card.");
 }
 
 static const int kSizes[][2] = {{1280, 720}, {1366, 768}, {1600, 900}, {1920, 1080}, {2560, 1440}, {3200, 1800},
@@ -368,12 +448,20 @@ static void row_window_size(void) {
                     "1080p and is scaled to the window.");
 }
 
+// The menu's name of an MLB_VK_PRESENT mode; NULL for another.
+static const char *present_name(const char *mode) {
+    return !strcmp(mode, "fifo") ? "VSync" : !strcmp(mode, "mailbox") ? "Fast VSync"
+         : !strcmp(mode, "immediate") ? "Off" : nullptr;
+}
+
 // "in use: VSync" under the Presentation value when the swapchain got another mode than the setting (a driver without
 // mailbox gets fifo); NULL when they agree or before the first swapchain.
 static const char *present_note(void) {
-    const char *got = gfx_window_present_mode();
-    if (!*got || !strcmp(got, cfg_value("VK_PRESENT"))) return nullptr;
-    return !strcmp(got, "fifo") ? "in use: VSync" : !strcmp(got, "mailbox") ? "in use: Fast VSync" : "in use: Off";
+    const char *got = gfx_window_present_mode(), *name = present_name(got);
+    if (!*got || !strcmp(got, cfg_value("VK_PRESENT")) || !name) return nullptr;
+    static char note[64];
+    snprintf(note, sizeof note, "in use: %s", name);
+    return note;
 }
 
 static void tab_display(float scale) {
@@ -390,9 +478,50 @@ static void tab_display(float scale) {
     opt_choice("ASPECT", "Aspect ratio", aspect, 2,
                "Keep 16:9 adds black bars when the window has another shape. Stretch fills the window and distorts "
                "the picture.");
+    row_gpu();
+    static const char *const perf[] = {"Off", "FPS", "Full"};
+    opt_choice("PERF_OVERLAY", "Performance overlay", perf, 3,
+               "The frame rate in the top right corner. Full adds frame times with a graph, CPU, GPU and memory load, "
+               "temperatures and where the render thread waited. F10 cycles the modes.\n\n"
+               "Off costs nothing; FPS next to nothing; Full samples the machine twice a second and times the GPU.");
     opt_end();
 }
 
+// ---- Game
+// Play time across runs (playtime.c), read only. Hidden while it is not counted (no profile directory).
+static void row_play_time(void) {
+    uint64_t total, session;
+    if (!playtime_get(&total, &session)) return;
+    char value[64], desc[512];
+    snprintf(value, sizeof value, "%llu h %02u min", (unsigned long long)(total / 3600), (unsigned)(total / 60 % 60));
+    snprintf(desc, sizeof desc,
+             "Time in the game over all runs, counted while the game window has the focus and the game draws frames. "
+             "Kept in playtime.txt in the profile folder, next to the saves.\n\nThis run: %llu h %02u min.",
+             (unsigned long long)(session / 3600), (unsigned)(session / 60 % 60));
+    opt_button("##play_time", "Play time", desc, value);
+}
+
+static void tab_game(float scale) {
+    opt_begin("##game", scale);
+    opt_toggle("FRAME_QUEUE", "Frame queue",
+               "The game starts a frame while the previous one waits for its turn on screen: far fewer dropped frames "
+               "at 60 fps, up to one frame more input delay. Applies at once.");
+    opt_toggle("ASSUME_FOCUS", "Keep running out of focus",
+               "On (the default), the game keeps running while you are in another window, and the keyboard stays "
+               "quiet until the window is in front again. Off, it pauses when its window loses focus, as on the "
+               "Switch when Home is pressed.");
+    row_play_time();
+    opt_end();
+}
+
+static void tab_sound(float scale) {
+    opt_begin("##sound", scale);
+    opt_slider("VOLUME", "Volume", 0, 100, "Master volume of the game: crowd, commentary, music and effects.", 5,
+               "%.0f %%");
+    opt_end();
+}
+
+// ---- Controls
 static void tab_controls(float scale) {
     opt_begin("##controls", scale);
     static const char *const map[] = {"By label", "By position"};
@@ -401,14 +530,220 @@ static void tab_controls(float scale) {
                "(confirm), B is B. By position: the buttons work by where they sit, as on a Switch controller, so the "
                "east button (Xbox B) confirms.");
     opt_toggle("RUMBLE", "Vibration", "Controller rumble when the game asks for it.");
+    opt_slider("RUMBLE_STRENGTH", "Vibration strength", 0, 300,
+               "How strongly the controller vibrates. 100 % is the strength the game asks for; above it, weak "
+               "rumble gets stronger and strong rumble stays at the motors' maximum.",
+               10, "%.0f %%");
+    // One dead zone row per stick, falling back to MLB_STICK_DEADZONE (both sticks) while unset. With a controller
+    // connected each row shows how far its stick is pushed now, before the dead zone: a drifting stick's resting value.
+    opt_group("Analog sticks");
+    double now[2];
+    bool pad = hid_stick_percent(now) != 0;
+    char note[2][48];
+    for (int s = 0; s < 2; s++) snprintf(note[s], sizeof note[s], "stick now: %.0f %%", now[s]);
+    static const char dz_desc[] =
+        "How far a controller stick moves before the game sees it. Raise it if the batting cursor, a fielder or a "
+        "menu cursor moves on its own: let go of the stick, read \"stick now\" and set the dead zone a few percent "
+        "above it. The rest of the stick's travel is spread over the full range, so full deflection stays full.";
+    opt_slider("LSTICK_DEADZONE", "Left stick dead zone", 0, 50, dz_desc, 1, "%.0f %%", pad ? note[0] : nullptr,
+               "STICK_DEADZONE");
+    opt_slider("RSTICK_DEADZONE", "Right stick dead zone", 0, 50, dz_desc, 1, "%.0f %%", pad ? note[1] : nullptr,
+               "STICK_DEADZONE");
     opt_group("Keys");
-    opt_text("Open or close this menu: F1, or Back and Start together on the controller. Esc or B closes it. "
-             "Q / E or LB / RB switch the tabs.");
+    opt_text("Keyboard: left stick W A S D, right stick I J K L, d-pad arrow keys, A Enter or Space, B Esc or "
+             "Backspace, X R, Y F, L Q, R E, ZL 1, ZR 3, + Tab, - M, stick clicks C and V.\n\n"
+             "This menu: F1, or Back and Start together on the controller. Esc or B closes it, Q / E or LB / RB switch "
+             "the tabs. F10 cycles the performance overlay, F11 switches fullscreen.");
     opt_end();
 }
 
-// ---- the window: title, tabs (L / R or Q / E switch), the page, and the bottom row with "Continue" and "Quit game".
-// B on the gamepad and Esc close it.
+// ---- Advanced: the testing and troubleshooting switches MLB reads, the bug report helpers and the reset
+static void row_threads(const char *key, const char *label, const char *desc) {
+    static const char *const vals[] = {"", "1", "2", "4", "6", "8", "12", "16", "24", "32", "48", "64"};
+    static const char *const names[] = {"Automatic", "1", "2", "4", "6", "8", "12", "16", "24", "32", "48", "64"};
+    opt_choice_list(key, label, vals, names, sizeof vals / sizeof *vals, desc);
+}
+
+// Automatic (unset) / Off / On, for the keys whose default depends on the machine.
+static void row_auto(const char *key, const char *label, const char *desc) {
+    static const char *const vals[] = {"", "0", "1"}, *const names[] = {"Automatic", "Off", "On"};
+    opt_choice_list(key, label, vals, names, 3, desc);
+}
+
+static bool validation_layer_present(void) {
+    static int have = -1;
+    if (have < 0) {
+        uint32_t n = 0;
+        vkEnumerateInstanceLayerProperties(&n, nullptr);
+        VkLayerProperties *l = (VkLayerProperties *)calloc(n ? n : 1, sizeof *l);
+        have = 0;
+        if (l && vkEnumerateInstanceLayerProperties(&n, l) >= 0)
+            for (uint32_t i = 0; i < n && !have; i++) have = !strcmp(l[i].layerName, "VK_LAYER_KHRONOS_validation");
+        free(l);
+    }
+    return have != 0;
+}
+
+// A button's result shown in its value for a few seconds: 1 done, -1 failed.
+struct ActionNote { uint64_t until; int result; };
+
+static const char *action_value(const ActionNote &a, const char *done_text) {
+    if (!a.result || plat_now_ns() > a.until) return "";
+    return a.result > 0 ? done_text : "did not work";
+}
+
+static void action_done(ActionNote &a, bool ok) { a = {plat_now_ns() + 3000000000ull, ok ? 1 : -1}; }
+
+// A confirmation over the menu: Cancel has the cursor first; B and Esc cancel. True when yes was chosen.
+static bool confirm_popup(const char *id, const char *text, const char *yes, const char *warn, bool yes_disabled,
+                          const char *back_to) {
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    if (!ImGui::BeginPopupModal(id, nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize))
+        return false;
+    g_modal = true;
+    ImGui::TextUnformatted(text);
+    if (warn) ImGui::TextColored(ImVec4(0.95f, 0.45f, 0.35f, 1), "%s", warn);
+    ImGui::Spacing();
+    const char *no = "Cancel";
+    const ImGuiStyle &st = ImGui::GetStyle();
+    float bw = fmaxf(ImGui::CalcTextSize(yes).x, ImGui::CalcTextSize(no).x) + st.FramePadding.x * 4;
+    bool close = ImGui::Button(no, ImVec2(bw, 0)), chosen = false;
+    if (ImGui::IsWindowAppearing()) ImGui::SetItemDefaultFocus();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(yes_disabled);
+    if (ImGui::Button(yes, ImVec2(bw, 0))) chosen = close = true;
+    ImGui::EndDisabled();
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false))
+        close = true;
+    if (close) {
+        ImGui::CloseCurrentPopup();
+        if (back_to) opt_focus_key(back_to);   // back on the row it came from
+    }
+    ImGui::EndPopup();
+    return chosen;
+}
+
+// "Restart now": writes mlb.cfg, then closes the game as Quit does and starts it again (gfx_window_request_restart).
+// It waits while the game writes a save, and the game stays when mlb.cfg cannot be written, as the new settings would
+// not come back.
+static void restart_confirm(void) {
+    bool saving = fs_save_busy() != 0;
+    const char *warn = saving ? "The game is saving: Restart is possible in a moment."
+                     : !cfg_last_save_ok() ? "Could not save the settings to mlb.cfg." : nullptr;
+    if (!confirm_popup("##restart_confirm", "Restart the game now? Progress since your last save is lost.", "Restart",
+                       warn, saving, nullptr))
+        return;
+    opt_save_tick(1);
+    if (cfg_last_save_ok()) gfx_window_request_restart();
+}
+
+static void reset_all(void) {
+    int done = cfg_reset(kMenuKeys, N_MENU_KEYS);
+    opt_save_soon();
+    rt_log("menu: reset %d settings to their defaults", done);
+}
+
+static void tab_advanced(float scale) {
+    static ActionNote copy_note, log_note;
+    opt_begin("##advanced", scale);
+    opt_text("These settings are for testing and troubleshooting. Change them only when you know why.", true);
+
+    opt_group("Scheduling");
+    static const char *const preempt[] = {"Off", "On", "Inheritance only"};
+    opt_choice("ASYNC_PREEMPT", "Virtual core preemption", preempt, 3,
+               "Lets a game thread interrupt another one on the same virtual core, as the Switch does.");
+    opt_toggle("REPLAY_ASYNC", "GPU frame prep on its own thread",
+               "Prepares frames for the GPU on a separate thread instead of the game's main thread. Off, busy at-bat "
+               "scenes ran at 45-55 fps; on, 60. Adds up to one frame of latency.");
+
+    opt_group("Shaders and pipelines");
+    static const char *const wait[] = {"Default", "Old (draw)"};
+    opt_choice("PIPE_WAIT", "Waiting draw handling", wait, 2,
+               "Default keeps the current scheduling with a reserved worker for waiting draws; Old (draw) uses the "
+               "previous scheduling.");
+    static const char *const skip[] = {"Strict", "Any", "Fullscreen passes"};
+    opt_choice("PIPE_SKIP", "Draws skipped while a pipeline builds", skip, 3,
+               "Which draws are dropped for a frame instead of waiting for their pipeline to be built.");
+    opt_toggle("LIB_PREBUILD", "Stage library prebuild", "Builds shader stage libraries ahead of time in the background.");
+    row_threads("LIB_PREBUILD_THREADS", "Stage library prebuild threads",
+                "Threads used for the prebuild; Automatic picks a number from your CPU.");
+    opt_toggle("PIPE_PREBUILD", "Pipeline prebuild", "Builds known pipelines ahead of time.");
+    row_threads("PREWARM_XLATE", "Translator prewarm",
+                "Threads that translate known shaders at start; Automatic takes half the CPU threads, at most 16.");
+    opt_toggle("GPL", "Graphics pipeline library",
+               "Uses the Vulkan pipeline library extension; turn off if your driver misbehaves with it.");
+
+    opt_group("Textures and memory");
+    static const char *const astc[] = {"Automatic", "GPU shader", "Native", "CPU"};
+    opt_choice("ASTC", "ASTC texture decoding", astc, 4, "Where compressed ASTC textures are decoded.");
+    static const char *const mem[] = {"Automatic", "Import", "Mirror", "Verify"};
+    opt_choice("MEMORY", "GPU memory mode", mem, 4,
+               "How game memory is shared with the GPU. Automatic: a video-memory mirror on a dedicated card, "
+               "shared memory on an integrated one.");
+    opt_toggle("TEX_ALIAS", "Texture aliasing",
+               "A new texture created over a live texture's memory starts with that content instead of empty.");
+    opt_slider("TEX_VRAM_PRESSURE", "Texture memory limit", 0, 100,
+               "Percent of video memory above which textures the game released are dropped (they come back from "
+               "storage when used again). 0 keeps them.",
+               1, "%.0f %%");
+    row_auto("ASTC_BC", "Compress ASTC to BC3",
+             "With the GPU decoder: re-encodes decoded ASTC textures to BC3, a quarter of the video memory. Textures "
+             "look slightly blockier. Automatic: on for GPUs with 4 GB of video memory or less.");
+
+    opt_group("Render fixes");
+    opt_toggle("LOD_GUARD", "LOD guard",
+               "Waits for the game to finish rewriting level-of-detail data before the GPU reads it.");
+    opt_toggle("FIX_C0", "Constant buffer fix",
+               "Fills the driver-reserved constant bank c0 (storage sizes, dispatch size, point size, base instance) "
+               "instead of reading zeros.");
+    opt_toggle("FIX_ZERO", "Zero new GPU memory", "New GPU memory pools start zero-filled, as Switch memory does.");
+    opt_toggle("BIND_SKIP", "Skip repeated binds", "Optimisation: skips bindings that did not change.");
+    opt_toggle("SHADER_MEMO", "Shader memo", "Optimisation: remembers shader lookups.");
+    opt_toggle("PIPE_MEMO", "Pipeline memo", "Optimisation: reuses the previous draw's pipeline when its state repeats.");
+    opt_toggle("TEX_MEMO", "Texture binding memo", "Optimisation: remembers texture descriptors between draws.");
+    opt_toggle("DESC_TEMPLATE", "Descriptor templates", "Optimisation: updates descriptors in bulk.");
+    opt_toggle("PUSH_SKIP", "Skip repeated push constants", "Optimisation: skips push constants that did not change.");
+    opt_slider("SPLIT_DRAWS", "Early GPU submission", 0, 1000,
+               "Submits GPU work in parts every N draws between passes so the GPU starts earlier; 0 turns it off.", 8,
+               "%.0f");
+
+    opt_group("Vulkan");
+    opt_toggle("VK_VALIDATION", "Validation layer",
+               validation_layer_present()
+                   ? "Checks every Vulkan call and slows the game down a lot."
+                   : "Checks every Vulkan call and slows the game down a lot.\n\nThe validation layer is not installed "
+                     "(it comes with the Vulkan SDK): turning this on does nothing.");
+    row_auto("VK_DYN_VERTEX", "Dynamic vertex state",
+             "Forces dynamic vertex input on or off; Automatic depends on the GPU.");
+    row_auto("VK_DYN_A2C", "Dynamic alpha to coverage",
+             "Forces dynamic alpha to coverage on or off. Automatic: off on AMD's driver for RDNA 2 and older, on "
+             "elsewhere.");
+    opt_toggle("VK_SUBGROUP_PIN", "Pin subgroup size", "Fixes the shader subgroup size.");
+
+    opt_group("Diagnostics");
+    if (opt_button("##open_log", "Open log folder", "Shows the folder with mlb.log, the log of this run.",
+                   action_value(log_note, ""))) {
+        char dir[512];
+        bool ok = sysinfo_log_folder(dir, sizeof dir) && plat_open_folder(dir);
+        if (!ok) action_done(log_note, false);   // success shows as the opened folder
+    }
+    if (opt_button("##copy_info", "Copy system info",
+                   "Copies the GPU, driver, CPU, RAM and every changed setting to the clipboard, for a bug report.",
+                   action_value(copy_note, "Copied"))) {
+        static char text[16384];
+        action_done(copy_note, sysinfo_text(text, sizeof text) > 0 && plat_clipboard_set(text));
+    }
+    bool ask_reset = opt_button("##reset", "Reset all settings to defaults",
+                                "Every setting on every tab back to its default, written to mlb.cfg. Settings an "
+                                "environment variable fixes stay.");
+    opt_end();
+    if (ask_reset) ImGui::OpenPopup("##reset_confirm");   // at the level BeginPopupModal looks it up
+    if (confirm_popup("##reset_confirm", "Reset every setting to its default?", "Reset", nullptr, false, "##reset"))
+        reset_all();
+}
+
+// ---- the window: title, tabs (L / R or Q / E switch), the page, and the bottom row with "Restart now" (once a
+// setting read at start changed), "Continue" and "Quit game". B on the gamepad and Esc close it.
 static void layout_menu(uint32_t w, uint32_t h, float scale) {
     ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), ImVec2((float)w, (float)h), IM_COL32(0, 0, 0, 120));
     float ww = fminf(w * 0.88f, 1400 * scale), wh = fminf(h * 0.86f, 820 * scale);
@@ -422,7 +757,10 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
     ImGui::SameLine(ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x - ImGui::CalcTextSize(version).x);
     ImGui::TextDisabled("%s", version);
 
-    int step = ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false) || ImGui::IsKeyPressed(ImGuiKey_E, false)   ? 1
+    bool was_modal = g_modal;
+    g_modal = false;   // set again by a confirmation laid out this frame
+    int step = was_modal ? 0
+             : ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false) || ImGui::IsKeyPressed(ImGuiKey_E, false) ? 1
              : ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false) || ImGui::IsKeyPressed(ImGuiKey_Q, false) ? -1
                                                                                                          : 0;
     if (step) g_tab_request = (g_tab + step + TAB_COUNT) % TAB_COUNT;
@@ -441,11 +779,16 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
                 g_focus_page = -1;
             }
             ImGui::Spacing();
+            // the page's rows are a NavFlattened child of this window itself (TotK's note: behind a second child
+            // level the rows scrolled out above the tabs won D-pad moves from the buttons and the tabs)
             opt_reserve_bottom(bottom);
             switch (k) {
             case TAB_GRAPHICS: tab_graphics(scale); break;
             case TAB_DISPLAY: tab_display(scale); break;
+            case TAB_GAME: tab_game(scale); break;
+            case TAB_SOUND: tab_sound(scale); break;
             case TAB_CONTROLS: tab_controls(scale); break;
+            case TAB_ADVANCED: tab_advanced(scale); break;
             }
             ImGui::EndTabItem();
         }
@@ -453,23 +796,271 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
         ImGui::EndTabBar();
     }
 
-    // bottom row: the two buttons on the right
+    // bottom row: the save status on the left, the buttons on the right
     ImGui::Spacing();
     float y = ImGui::GetCursorPosY();
     ImGui::SetCursorPosY(y + st.FramePadding.y);
-    ImGui::TextDisabled("Changes apply at once and are saved to mlb.cfg.");
-    const char *cont = "Continue", *quit = "Quit game";
-    float bw = fmaxf(ImGui::CalcTextSize(cont).x, ImGui::CalcTextSize(quit).x) + st.FramePadding.x * 4;
-    ImGui::SetCursorPos(ImVec2(ImGui::GetWindowWidth() - st.WindowPadding.x - bw * 2 - st.ItemSpacing.x, y));
+    if (!cfg_last_save_ok())   // stays until a save succeeds; the settings hold for the session
+        ImGui::TextColored(ImVec4(0.95f, 0.45f, 0.35f, 1), "Could not save the settings to mlb.cfg.");
+    else
+        ImGui::TextDisabled("Changes are saved to mlb.cfg.");
+    bool restart = restart_pending();
+    const char *rs = "Restart now", *cont = "Continue", *quit = "Quit game";
+    float bw = fmaxf(fmaxf(ImGui::CalcTextSize(cont).x, ImGui::CalcTextSize(quit).x), ImGui::CalcTextSize(rs).x) +
+               st.FramePadding.x * 4;
+    int nb = restart ? 3 : 2;
+    ImGui::SetCursorPos(ImVec2(ImGui::GetWindowWidth() - st.WindowPadding.x - bw * nb - st.ItemSpacing.x * (nb - 1), y));
+    if (restart) {
+        if (ImGui::Button(rs, ImVec2(bw, 0))) ImGui::OpenPopup("##restart_confirm");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("A setting you changed applies after a restart.");
+        restart_confirm();
+        ImGui::SameLine();
+    }
     if (ImGui::Button(cont, ImVec2(bw, 0))) change_open(0);
     ImGui::SameLine();
     if (ImGui::Button(quit, ImVec2(bw, 0))) gfx_window_request_close();
-    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false))
+    if (!was_modal && !g_modal &&
+        (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)))
         change_open(0);
     ImGui::End();
 }
 
 static int g_save_pending;   // a changed setting still waits for its write to mlb.cfg (opt_save_tick)
+
+// ---- the performance overlay (MLB_PERF_OVERLAY), in the top right corner, after TotK Recomp's menu.cpp. "fps": the
+// frame rate over the presents of the last half second. "full": a panel of perfmon.c's numbers: the machine's load
+// and temperatures, the frame rate and frame times with a graph, the render thread's waits. Off, it costs a
+// cfg_version load per present.
+static unsigned g_perf_ver = ~0u;
+static int g_perf_mode;                  // 0 off, 1 fps, 2 full
+static std::atomic<int> g_perf_save;     // F10 changed the mode: mlb.cfg is written on the present thread
+static uint64_t g_perf_last_ns, g_perf_win_ns;
+static int g_perf_frames;
+static char g_perf_text[64];
+
+static int perf_mode_of(const char *s) { return !strcmp(s, "full") ? 2 : !strcmp(s, "fps") ? 1 : 0; }
+
+extern "C" void menu_perf_cycle(void) {
+    static const char *const modes[] = {"off", "fps", "full"};
+    cfg_set_saved("PERF_OVERLAY", modes[(perf_mode_of(cfg_value("PERF_OVERLAY")) + 1) % 3]);
+    g_perf_save.store(1);
+}
+
+// The device the game renders on, for perfmon's GPU counters (by LUID), NVML (by name) and ADL (by PCI bus, else
+// name); once, before full mode.
+static void perf_gpu_once(const MenuTarget *t) {
+    static bool done;
+    if (done) return;
+    done = true;
+    uint32_t ne = 0;
+    vkEnumerateDeviceExtensionProperties(t->phys, NULL, &ne, NULL);
+    VkExtensionProperties *ep = (VkExtensionProperties *)calloc(ne ? ne : 1, sizeof *ep);
+    bool has_bus = false;
+    if (ep && vkEnumerateDeviceExtensionProperties(t->phys, NULL, &ne, ep) >= 0)
+        for (uint32_t i = 0; i < ne && !has_bus; i++) has_bus = !strcmp(ep[i].extensionName, VK_EXT_PCI_BUS_INFO_EXTENSION_NAME);
+    free(ep);
+    VkPhysicalDevicePCIBusInfoPropertiesEXT bus = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT};
+    VkPhysicalDeviceIDProperties id = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES, has_bus ? &bus : nullptr};
+    VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &id};
+    vkGetPhysicalDeviceProperties2(t->phys, &p2);
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(t->phys, &mp);
+    uint64_t vram = 0;
+    for (uint32_t h = 0; h < mp.memoryHeapCount; h++)
+        if (mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) vram += mp.memoryHeaps[h].size;
+    perfmon_set_gpu(p2.properties.deviceName, id.deviceLUIDValid ? id.deviceLUID : NULL, has_bus ? (int)bus.pciBus : -1,
+                    (float)(vram >> 20));
+}
+
+static void perf_tick(uint64_t now, const MenuTarget *t) {
+    if (cfg_version() != g_perf_ver) {
+        g_perf_ver = cfg_version();
+        int m = perf_mode_of(cfg_value("PERF_OVERLAY"));
+        if (m != g_perf_mode) {
+            g_perf_last_ns = 0, g_perf_text[0] = 0;
+            if (m == 2) perf_gpu_once(t);
+            perfmon_mode(m);
+        }
+        g_perf_mode = m;
+    }
+    if (g_perf_mode != 1) return;
+    uint64_t d = now - g_perf_last_ns;
+    if (!g_perf_last_ns || d > 2000000000ull) {   // first frame, or a stall the window should not average in
+        g_perf_win_ns = 0;
+        g_perf_frames = 0;
+    } else {
+        g_perf_win_ns += d;
+        g_perf_frames++;
+        if (g_perf_win_ns >= 500000000ull) {
+            snprintf(g_perf_text, sizeof g_perf_text, "%.0f fps", g_perf_frames * 1e9 / g_perf_win_ns);
+            g_perf_win_ns = 0;
+            g_perf_frames = 0;
+        }
+    }
+    g_perf_last_ns = now;
+}
+
+// The panel keeps its width while the numbers change: every column is as wide as the widest text it can show, measured
+// on samples of 8s (Roboto's digits share one width), and the numbers are right-aligned in it.
+struct PerfCol { const char *fmt; float sample; };
+
+static float perf_text_w(const char *fmt, float v) {
+    char b[64];
+    snprintf(b, sizeof b, fmt, v);
+    return ImGui::CalcTextSize(b).x;
+}
+
+static void perf_column(const char *id, const PerfCol *cols, int n, const char *const *labels = nullptr, int nl = 0) {
+    float w = ImGui::CalcTextSize("-").x;
+    for (int i = 0; i < n; i++) w = fmaxf(w, perf_text_w(cols[i].fmt, cols[i].sample));
+    for (int i = 0; i < nl; i++) w = fmaxf(w, ImGui::CalcTextSize(labels[i]).x);
+    ImGui::TableSetupColumn(id, ImGuiTableColumnFlags_WidthFixed, w);
+}
+
+static void perf_right(const char *s, bool dim) {
+    float pad = ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(s).x;
+    if (pad > 0) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + pad);
+    if (dim) ImGui::TextDisabled("%s", s);
+    else ImGui::TextUnformatted(s);
+}
+
+// One cell of the full panel's table: fmt (one number) with v, or "-" when the machine gives none.
+static void perf_cell(const char *fmt, float v) {
+    ImGui::TableNextColumn();
+    if (v < 0) return perf_right("-", true);
+    char b[64];
+    snprintf(b, sizeof b, fmt, v);
+    perf_right(b, false);
+}
+
+static void perf_label(const char *label, const ImVec4 &c) {
+    ImGui::TableNextColumn();
+    ImGui::TextColored(c, "%s", label);
+}
+
+static float perf_gb(float mb) { return mb < 0 ? -1 : mb / 1024; }
+
+// The picture lines: the window, the game image the present shows, how the present scaled it and the presentation
+// mode in use.
+static void perf_picture(const MenuTarget *t, const ImVec4 &c) {
+    char v[4][64];
+    snprintf(v[0], sizeof v[0], "%u \xc3\x97 %u", t->width, t->height);
+    snprintf(v[1], sizeof v[1], "%d \xc3\x97 %d", t->image_w, t->image_h);
+    snprintf(v[2], sizeof v[2], "%s", t->scaler == 2 ? "FSR 1" : t->scaler ? "bilinear" : "none");
+    const char *pm = present_name(gfx_window_present_mode());
+    snprintf(v[3], sizeof v[3], "%s", pm ? pm : "-");
+    static const char *const labels[4] = {"Window", "Game image", "Scaling", "Presentation"};
+    if (!ImGui::BeginTable("##perfp", 2, ImGuiTableFlags_SizingFixedFit)) return;
+    float vw = 0;
+    for (auto &s : v) vw = fmaxf(vw, ImGui::CalcTextSize(s).x);
+    ImGui::TableSetupColumn("##p0", ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableSetupColumn("##p1", ImGuiTableColumnFlags_WidthFixed, vw);
+    for (int i = 0; i < 4; i++) {
+        perf_label(labels[i], c);
+        ImGui::TableNextColumn();
+        perf_right(v[i], false);
+    }
+    ImGui::EndTable();
+}
+
+#define DEG_C "\xc2\xb0" "C"   // U+00B0, the degree sign
+
+static void perf_full_draw(const MenuTarget *t, float scale) {
+    float w = (float)t->width;
+    PerfStats s;
+    perfmon_snapshot(&s);
+    ImGui::SetNextWindowPos(ImVec2(w - 12 * scale, 12 * scale), ImGuiCond_Always, ImVec2(1, 0));
+    ImGui::SetNextWindowBgAlpha(0.6f);
+    ImGui::Begin("##perf", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                        ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                                        ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings);
+    // under the menu while it is open (the settings stay readable), else over everything
+    if (g_open.load(std::memory_order_relaxed)) ImGui::BringWindowToDisplayBack(ImGui::GetCurrentWindow());
+    else ImGui::BringWindowToDisplayFront(ImGui::GetCurrentWindow());
+    ImGui::SetWindowFontScale(0.72f);
+    const ImVec4 gpu_c(0.55f, 0.83f, 0.31f, 1), cpu_c(0.18f, 0.59f, 0.80f, 1), ram_c(0.80f, 0.45f, 0.70f, 1),
+        fps_c(0.95f, 0.95f, 0.95f, 1), wait_c(0.93f, 0.76f, 0.33f, 1), pic_c(0.62f, 0.70f, 0.95f, 1);
+    ImGui::TextDisabled("MLB The Show 26 native %s, game 1.0.15", rt_port_version);
+    if (ImGui::BeginTable("##perft", 4, ImGuiTableFlags_SizingFixedFit)) {
+        static const char *const labels[] = {"GPU", "VRAM", "CPU", "RAM", "FPS", "Frame"};
+        static const PerfCol c1[] = {{"%.0f%%", 100}, {"%.1f GB", 888.8f}, {"%.0f", 888}, {"%.1f ms", 888.8f}};
+        static const PerfCol c2[] = {{"%.0f " DEG_C, 188}, {"of %.1f GB", 888.8f}, {"1%% low %.0f", 888},
+                                     {"max %.1f ms", 8888.8f}};
+        static const PerfCol c3[] = {{"%.0f W", 888}, {"%.0f MHz", 8888}, {"game %.0f%%", 100}, {"game %.1f GB", 888.8f},
+                                     {"0.1%% low %.0f", 888}};
+        perf_column("##c0", nullptr, 0, labels, 6);
+        perf_column("##c1", c1, 4);
+        perf_column("##c2", c2, 4);
+        perf_column("##c3", c3, 5);
+        perf_label("GPU", gpu_c);
+        perf_cell("%.0f%%", s.gpu_pct);
+        perf_cell("%.0f " DEG_C, s.gpu_temp_c);
+        perf_cell("%.0f W", s.gpu_power_w);
+        perf_label("VRAM", gpu_c);
+        perf_cell("%.1f GB", perf_gb(s.vram_used_mb));
+        perf_cell("of %.1f GB", perf_gb(s.vram_total_mb));
+        perf_cell("%.0f MHz", s.gpu_clock_mhz);
+        perf_label("CPU", cpu_c);
+        perf_cell("%.0f%%", s.cpu_total_pct);
+        perf_cell("%.0f " DEG_C, s.cpu_temp_c);
+        perf_cell("game %.0f%%", s.cpu_game_pct);
+        perf_label("RAM", ram_c);
+        perf_cell("%.1f GB", perf_gb(s.ram_used_mb));
+        perf_cell("of %.1f GB", perf_gb(s.ram_total_mb));
+        perf_cell("game %.1f GB", perf_gb(s.ram_game_mb));
+        ImGui::TableNextRow(ImGuiTableRowFlags_None, 6 * scale);   // a gap between the machine and the frames
+        // the frames: the rate over the last second with the lows over the last ten seconds, then the frame times
+        perf_label("FPS", fps_c);
+        perf_cell("%.0f", s.fps);
+        perf_cell("1%% low %.0f", s.low1_fps);
+        perf_cell("0.1%% low %.0f", s.low01_fps);
+        perf_label("Frame", fps_c);
+        perf_cell("%.1f ms", s.frame_ms_avg);
+        perf_cell("max %.1f ms", s.frame_ms_max);
+        ImGui::TableNextColumn();
+        ImGui::EndTable();
+    }
+    float top = s.frame_ms_max > 50 ? s.frame_ms_max : 50;
+    // as wide as the panel the tables size; the plot does not count toward that width, so the panel can still shrink
+    ImGuiWindow *win = ImGui::GetCurrentWindow();
+    float max_x = win->DC.CursorMaxPos.x;
+    ImGui::PlotLines("##ft", s.frame_ms, PERF_HISTORY, 0, nullptr, 0, top, ImVec2(-FLT_MIN, 48 * scale));
+    win->DC.CursorMaxPos.x = max_x;
+    // per frame, averaged over the last half second
+    if (ImGui::BeginTable("##perfw", 2, ImGuiTableFlags_SizingFixedFit)) {
+        static const PerfCol c1[] = {{"%.2f ms", 888.88f}, {"%.1f / frame", 888.8f}};
+        ImGui::TableSetupColumn("##w0", ImGuiTableColumnFlags_WidthStretch);
+        perf_column("##w1", c1, 2);
+        perf_label("GPU frame prep", wait_c);
+        perf_cell("%.2f ms", s.replay_ms);
+        perf_label("GPU time", wait_c);
+        perf_cell("%.2f ms", s.gpu_ms);
+        perf_label("Pipeline wait", wait_c);
+        perf_cell("%.2f ms", s.pipe_wait_ms);
+        perf_label("Shader wait", wait_c);
+        perf_cell("%.2f ms", s.xlate_ms);
+        perf_label("Texture uploads", wait_c);
+        perf_cell("%.1f / frame", s.tex_uploads);
+        ImGui::EndTable();
+    }
+    perf_picture(t, pic_c);
+    if (s.gpu_name[0]) ImGui::TextDisabled("%s", s.gpu_name);
+    if (s.cpu_name[0]) ImGui::TextDisabled("%s", s.cpu_name);
+    ImGui::End();
+}
+
+static void perf_draw(const MenuTarget *t, float scale) {
+    if (g_perf_mode == 2) return perf_full_draw(t, scale);
+    float w = (float)t->width;
+    if (!g_perf_mode || !g_perf_text[0]) return;
+    // with the menu open: under its window, over the dimming layout_menu drew before
+    ImDrawList *dl = g_open.load(std::memory_order_relaxed) ? ImGui::GetBackgroundDrawList() : ImGui::GetForegroundDrawList();
+    ImVec2 sz = ImGui::CalcTextSize(g_perf_text);
+    float pad = 6 * scale;
+    ImVec2 p(w - 12 * scale - sz.x - pad * 2, 12 * scale);
+    dl->AddRectFilled(p, ImVec2(p.x + sz.x + pad * 2, p.y + sz.y + pad * 2), IM_COL32(0, 0, 0, 150), 4 * scale);
+    dl->AddText(ImVec2(p.x + pad, p.y + pad), IM_COL32(255, 255, 255, 235), g_perf_text);
+}
 
 // mlbts-native: MLB presents sRGB images, so the swapchain is sRGB (gfx_present.c create_swapchain) and the hardware
 // encodes what the menu writes. ImGui's colours are already sRGB values: written as they are, they came out encoded
@@ -493,9 +1084,14 @@ static void linear_colours(ImDrawData *dd) {
         }
 }
 
+static uint64_t g_cost_ns, g_cost_frames;   // the menu's own CPU time on frames it draws, logged every 600 of them
+
 extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot) {
     *shot = NULL;
     mlb_capture_tick(frame, shot);   // F12 / MLB_SHOT: this frame's picture to a file
+    if (g_n_restart_keys < 0) note_start_values();
+    if (g_perf_save.exchange(0)) cfg_save();
+    perf_tick(plat_now_ns(), t);
     bool open = g_open.load(std::memory_order_relaxed);
     if (!open) {
         if (g_save_pending) g_save_pending = opt_save_tick(1);   // closed: the last change goes to mlb.cfg now
@@ -507,14 +1103,18 @@ extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const cha
             test_at = e && *e ? strtol(e, &end, 10) : -1;
             if (test_at >= 0 && *end == ':') g_tab_request = atoi(end + 1) % TAB_COUNT;
         }
-        if (test_at < 0 || frame != (uint64_t)test_at) return 0;
-        change_open(1);
-        open = true;
+        if (test_at >= 0 && frame == (uint64_t)test_at) {
+            change_open(1);
+            open = true;
+        } else if (!g_perf_mode) {
+            return 0;
+        }
     }
     if (g_failed.load(std::memory_order_relaxed)) {
         change_open(0);
         return 0;
     }
+    uint64_t t0 = plat_now_ns();
     if (!g_ctx_ok) make_context();
     float scale = menu_scale(t->height);
     if (!vk_up(t) || (g_font_scale != scale && !fonts_up(scale))) {
@@ -528,6 +1128,7 @@ extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const cha
         ImGui::GetStyle().ScaleAllSizes(scale);
         g_style_scale = scale;
     }
+    list_gpus(t->instance);
     ImGuiIO &io = ImGui::GetIO();
     int reset = g_reset.exchange(0);
     if (reset) {
@@ -535,22 +1136,34 @@ extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const cha
         io.ClearInputMouse();
         g_last_ns = 0;
         g_focus_page = g_tab_request >= 0 ? g_tab_request : g_tab;   // opening: the first row has the cursor
-        if (GImGui->OpenPopupStack.Size) ImGui::ClosePopupToLevel(0, false);
+        if (GImGui->OpenPopupStack.Size) ImGui::ClosePopupToLevel(0, false);   // a confirmation left open on closing
+        g_modal = false;
     }
-    uint64_t t0 = plat_now_ns();
     io.DisplaySize = ImVec2((float)t->width, (float)t->height);
     double dt = g_last_ns ? (t0 - g_last_ns) / 1e9 : 1 / 60.0;
     io.DeltaTime = (float)(dt < 1e-4 ? 1e-4 : dt > 0.1 ? 0.1 : dt);
     g_last_ns = t0;
-    drain_events(io);
-    pad_events(io, reset);
+    if (open) {   // closed with the overlay on: no input reaches ImGui
+        drain_events(io);
+        pad_events(io, reset);
+    }
     ImGui_ImplVulkan_NewFrame();
     ImGui::NewFrame();
-    layout_menu(t->width, t->height, scale);
+    if (open) layout_menu(t->width, t->height, scale);
+    perf_draw(t, scale);
     ImGui::Render();
     if (srgb_format(t->format)) linear_colours(ImGui::GetDrawData());
-    g_save_pending = opt_save_tick(0);
+    if (open) g_save_pending = opt_save_tick(0);
+    g_cost_ns += plat_now_ns() - t0;
     return ImGui::GetDrawData()->TotalVtxCount > 0;
 }
 
-extern "C" void menu_overlay_draw(VkCommandBuffer cb) { ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cb); }
+extern "C" void menu_overlay_draw(VkCommandBuffer cb) {
+    uint64_t t0 = plat_now_ns();
+    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cb);
+    g_cost_ns += plat_now_ns() - t0;
+    if (++g_cost_frames == 600) {
+        rt_log("menu: %.3f ms CPU per drawn frame (layout and recording, mean of 600)", g_cost_ns / 600 / 1e6);
+        g_cost_ns = g_cost_frames = 0;
+    }
+}

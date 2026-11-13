@@ -17,6 +17,14 @@ int cfg_is_set(const char *name);
 void cfg_set_saved(const char *name, const char *value);
 int cfg_save(void);
 int cfg_from_env(const char *name);
+int cfg_last_save_ok(void);                 // the last cfg_save wrote mlb.cfg (1 before any)
+// Every key given that the environment does not set back to its table default, as a menu change (cfg_save writes
+// them); the number reset.
+int cfg_reset(const char *const *keys, int n);
+const CfgMeta *cfg_meta_at(int i);          // the table's rows in order; NULL past the last
+// Every setting with a value (mlb.cfg, the menu, the environment), for the system info text: fn(key without prefix,
+// value, set by the environment, ctx).
+void cfg_each_active(void (*fn)(const char *key, const char *value, int from_env, void *ctx), void *ctx);
 int cfg_load_file(void);                    // mlbts-native: <exe dir>/mlb.cfg into cfg_set; the settings it applied
 const CfgMeta *cfg_meta(const char *key);
 const char *cfg_value(const char *name);    // cfg_get, else the table's default; fatal for a key without a row

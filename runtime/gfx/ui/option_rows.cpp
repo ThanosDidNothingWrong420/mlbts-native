@@ -33,6 +33,7 @@ static float g_scale = 1;
 static bool g_focus_req, g_take_first;   // opt_focus_first: requested / this page's first row takes it
 static bool g_held;                      // the last row's left / right has been held a while (steppers go faster)
 static float g_bottom;                   // opt_reserve_bottom: kept free under the panes
+static char g_focus_key[64];             // opt_focus_key: the row that takes the cursor when it is next drawn
 
 // The description pane: this frame's hovered and selected rows, the page's first row, and the last one shown.
 struct Desc { char text[1024]; };
@@ -48,6 +49,7 @@ static void desc_set(Desc &d, const char *desc, const char *key, const CfgMeta *
 }
 
 void opt_focus_first(void) { g_focus_req = true; }
+void opt_focus_key(const char *key) { snprintf(g_focus_key, sizeof g_focus_key, "%s", key); }
 void opt_reserve_bottom(float h) { g_bottom = h; }
 
 void opt_begin(const char *id, float scale) {
@@ -108,11 +110,14 @@ static int row(const char *key, const char *label, const char *desc, const RowVi
     ImGui::PushStyleColor(ImGuiCol_NavCursor, ImVec4(0, 0, 0, 0));   // the row's own border shows the selection
     bool clicked = ImGui::InvisibleButton("##row", ImVec2(w, h), ImGuiButtonFlags_EnableNav);
     ImGui::PopStyleColor();
-    if (g_take_first) {
+    bool to_key = g_focus_key[0] && !strcmp(key, g_focus_key);
+    if (g_take_first || to_key) {
         ImGui::SetFocusID(ImGui::GetItemID(), ImGui::GetCurrentWindow());
         ImGui::SetNavCursorVisible(true);
-        ImGui::SetScrollY(0);   // the page's top: text and a heading above the first row show
+        if (g_take_first) ImGui::SetScrollY(0);   // the page's top: text and a heading above the first row show
+        else ImGui::ScrollToItem(ImGuiScrollFlags_KeepVisibleEdgeY);   // as a cursor move would (the last row whole)
         g_take_first = false;
+        if (to_key) g_focus_key[0] = 0;
     }
     bool hov = ImGui::IsItemHovered(), foc = ImGui::IsItemFocused() && ImGui::GetCurrentContext()->NavCursorVisible;
     int step = clicked && !off ? 2 : 0;
@@ -181,9 +186,11 @@ static int row(const char *key, const char *label, const char *desc, const RowVi
 static uint64_t g_save_at;   // plat_now_ns deadline of the pending write; 0 none
 static bool g_save_logged;
 
+void opt_save_soon(void) { g_save_at = plat_now_ns() + 400000000ull; }
+
 static void apply(const char *key, const char *value) {
     cfg_set_saved(key, value);
-    g_save_at = plat_now_ns() + 400000000ull;
+    opt_save_soon();
 }
 
 int opt_save_tick(int force) {
@@ -265,9 +272,14 @@ bool opt_choice(const char *key, const char *label, const char *const *names, in
 }
 
 bool opt_slider(const char *key, const char *label, float lo, float hi, const char *desc, float step, const char *fmt,
-                const char *note) {
-    const CfgMeta *m = cfg_meta(key);
-    double v = cfg_double(key), def = m && m->def[0] ? strtod(m->def, NULL) : lo;
+                const char *note, const char *fallback) {
+    const char *set = cfg_get(key);
+    const char *src = fallback && !(set && *set) ? fallback : key;   // unset: show the value in effect, the fallback's
+    const CfgMeta *m = cfg_meta(src);
+    // A key without a table default of its own (the per-stick dead zones) defaults to its fallback: the "default" mark
+    // follows the fallback's default, not 0, even once the key is set.
+    if (fallback && m && !m->def[0]) m = cfg_meta(fallback);
+    double v = cfg_double(src), def = m && m->def[0] ? strtod(m->def, NULL) : lo;
     char shown[48];
     snprintf(shown, sizeof shown, fmt, v);
     RowView rv = {shown, fabs(v - def) < step * 0.01, true, note};
@@ -281,6 +293,7 @@ bool opt_slider(const char *key, const char *label, float lo, float hi, const ch
     char out[32];
     if (step >= 1) snprintf(out, sizeof out, "%d", (int)lround(n));
     else snprintf(out, sizeof out, "%g", round(n / step) * step);
-    apply(key, out);
+    // Landing on the fallback's value unsets the key, so the row follows the fallback again.
+    apply(key, fallback && fabs(n - cfg_double(fallback)) < step * 0.01 ? "" : out);
     return true;
 }

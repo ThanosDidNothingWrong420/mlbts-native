@@ -116,6 +116,14 @@ Each step ends with a run, a log, and a commit; the boot progress in docs/runtim
   `mlb.cfg` (`cfg_save`: a `MLB_X=` line is updated in place, a missing one added under a heading; comments stay).
   While it is open the game keeps running and `hid.c` gives it an idle controller. `MLB_MENU_TEST=<frame>[:<tab>]`
   opens it at a frame (with `MLB_SHOT`, a picture of it).
+- **Menu, second round (2026-11-13).** Pages as TotK's, less its TotK-only rows: Graphics (antialiasing, texture
+  filtering, colour), Display (window, presentation, aspect, graphics card, performance overlay), Game (frame queue,
+  running out of focus, play time), Sound (volume), Controls (face buttons, vibration and its strength, per-stick dead
+  zones with the stick's live deflection), Advanced (TotK's troubleshooting switches that MLB reads, open log folder,
+  copy system info, reset all). "Restart now" appears once a setting read at start changed. F10 cycles TotK's
+  performance overlay (`perfmon.c`; off costs one branch per present). Not offered: TotK's speaker setting (MLB's
+  `audout` always folds 5.1 to stereo), the frame limiter, motion and mouse rows (nothing here reads them), key
+  rebinding (hid.c has a fixed table).
 - **Antialiasing (`MLB_AA=fxaa`, default; `off`).** MLB renders its 3D scene into one 1440x810 B10G11R11 image
   (`0x154ea0000`) without any antialiasing, draws the HUD into a separate 1920x1080 layer, and one full-screen draw
   (fragment shader `daf10a59`, `1d3e4d6b` on some menus) tone-maps and scales the scene and lays the HUD over it

@@ -19,6 +19,10 @@ void opt_end(void);
 void opt_reserve_bottom(float h);
 // The next page's first row takes the controller's cursor (opening the menu, switching tabs).
 void opt_focus_first(void);
+// The row of this key (or button id) takes the cursor when it is next drawn (back from a confirmation).
+void opt_focus_key(const char *key);
+// mlb.cfg is written a moment from now, as after a row's change (a change made outside the rows: reset).
+void opt_save_soon(void);
 
 // Page text that is not a row: a group heading in the accent colour, a wrapped paragraph (warn: the warning colour).
 void opt_group(const char *title);
@@ -38,8 +42,10 @@ bool opt_choice_list(const char *key, const char *label, const char *const *valu
 // on the right ("" none).
 bool opt_button(const char *id, const char *label, const char *desc, const char *value = "");
 // lo..hi in steps of step (left and right held for a second go ten times as fast); fmt formats the value ("%.0f %%").
+// fallback: a key whose value the row shows while key is unset (the per-stick dead zones fall back to both sticks'
+// one); landing on the fallback's value unsets key again.
 bool opt_slider(const char *key, const char *label, float lo, float hi, const char *desc, float step = 1,
-                const char *fmt = "%g", const char *note = nullptr);
+                const char *fmt = "%g", const char *note = nullptr, const char *fallback = nullptr);
 
 // mlb.cfg is written a moment after the last change (a held slider would rewrite it every frame) and when the menu
 // closes. opt_save_tick: on every frame the menu lays out; force: write now if anything is pending. 1 while a write is
