@@ -173,6 +173,14 @@ linker. `tools/shader_smoke.py` translates a sample of MLB's FXB shaders offline
     gamepad through SDL3 (Xbox and PlayStation pads: DualSense, DualSense Edge, DualShock 4; merged) and the keyboard
     (map in the file header; `MLB_PAD_MAP`, `MLB_RUMBLE`). `MLB_PAD_DRIVER=xinput`, or no `SDL3.dll` beside the exe,
     falls back to XInput (Xbox pads only). ✔
+    The game's button prompts show the controller in use (`runtime/mlb/prompts.c`, `MLB_PROMPTS=auto|nintendo|xbox|
+    playstation`, the *Button icons* row of the Controls tab). MLB draws every prompt button from one 1024x1024 BC7
+    texture (the `symbols` entry of `NSW/UI/ART/FONTS/FONTS.TEX`), which has only Switch buttons; the RomFS has no Xbox
+    or PlayStation art (`PS4/` and `PS5/` hold animation, stadium and subtitle files). `tools/make_prompts.py` draws
+    Xbox and PlayStation icons in the game's style (Bahnschrift letters, drawn symbols) and compresses them to BC7
+    (`work/gen/prompt_icons.h`, run by `build.py`); `vk_texture.c` copies them over that texture's image after each
+    upload, and uploads it again when the controller kind or the setting changes. `--check <png>` checks the cells
+    against the texture exported from a capture and writes previews.
 17. More offline services: `ssl`, `csrng` (host random bytes), `ngc:u` (no word list, nothing flagged), `friend:u`
     (an empty notification queue whose event never fires), `nim:eca`, `nsd:u` (environment `lp1`, `ResolveEx`), and
     `pctl`'s free-communication commands (permitted). The SDK's own `nn::account` user lists are overridden too

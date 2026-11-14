@@ -126,6 +126,12 @@ def main():
             shutil.copyfile(sdl_src, sdl_dst)
         except OSError as e:
             print(f'warning: {sdl_dst} not updated ({e})')
+    # runtime/mlb/prompts.c: the Xbox and PlayStation button icons, drawn and compressed by tools/make_prompts.py (about
+    # half a minute), again only when that script changed
+    icons, icon_tool = gen / 'prompt_icons.h', ROOT / 'tools' / 'make_prompts.py'
+    if not icons.is_file() or icons.stat().st_mtime < icon_tool.stat().st_mtime:
+        if subprocess.run([sys.executable, '-I', str(icon_tool), '--out', str(icons)], cwd=ROOT).returncode:
+            raise SystemExit('tools/make_prompts.py failed')
     inc_rt = ['-I', 'runtime/mlb', '-I', 'runtime/core', '-I', 'runtime/gfx', '-I', rel(gen), '-I', rel(DEPS / 'include'),
               '-I', rel(DEPS / 'include' / 'vma'), '-I', 'runtime/third_party/imgui']
     inc_gen = ['-I', 'runtime/core', '-I', rel(gen)]

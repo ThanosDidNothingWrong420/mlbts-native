@@ -29,6 +29,7 @@
 #include "vk_dlaa.h"
 #include "vk_exec.h"
 #include "platform/platform.h"
+#include "prompts.h"   // mlbts-native: runtime/mlb, the controller's button icons
 
 typedef struct {
     uint64_t addr;
@@ -67,6 +68,8 @@ typedef struct Tex {
     uint64_t use_seq;             // order of the last creation or take-back among all entries
     uint64_t rel_seq;             // while released: use_seq of the newest entry placed before this release; an entry
                                   // with a later use_seq on overlapping storage replaced this one's bytes
+    uint8_t prompts;              // mlbts-native: the game's button icons (prompts_apply)
+    int8_t prompts_set;           // mlbts-native: the icon set copied over them at the last upload, -1 none
 } Tex;
 
 // A slot keeps what vk_texture_by_id resolved for it, so a draw binding skips the key lookup and the address chain: the
@@ -1191,6 +1194,52 @@ static int upload_gpu(Tex *e) {
 
 // Copies the whole storage into the image (every level and layer the image has): on the GPU where it can
 // (upload_gpu), else on the CPU.
+// mlbts-native: the controller's button icons over the game's Switch ones (runtime/mlb/prompts.c). MLB draws every
+// button of its prompts from one 1024x1024 BC7 texture; after each upload of a texture of that shape whose storage is
+// that texture, the blocks of the icon set in use are copied over the image (the storage keeps the Switch icons).
+// prompts_fresh uploads it again when the set changed: another kind of controller used, or the settings menu.
+static void prompts_apply(Tex *e) {
+    e->prompts = (uint8_t)mlb_prompts_is_icons(e->pub.addr, e->t.mem, e->t.L.size);
+    e->prompts_set = -1;
+    if (!e->prompts) return;
+    int set = mlb_prompts_set(), nblocks = 0;
+    const MlbPromptRun *runs = NULL;
+    int n = mlb_prompts_runs(set, &runs, &nblocks);
+    e->prompts_set = (int8_t)set;
+    if (!n) return;
+    VkBufferImageCopy *rg = calloc((size_t)n, sizeof *rg);
+    if (!rg) rt_fatal("vk: out of memory for the button icons");
+    VkCommandBuffer cb = vk_upload_begin();
+    VkBuffer sb;
+    uint8_t *stg = vk_staging((VkDeviceSize)nblocks * 16, &sb, NULL);
+    VkDeviceSize off = 0;
+    for (int i = 0; i < n; i++) {
+        memcpy(stg + off, runs[i].blocks, (size_t)runs[i].n * 16);
+        rg[i] = (VkBufferImageCopy){.bufferOffset = off, .bufferRowLength = runs[i].n * 4u, .bufferImageHeight = 4,
+                                    .imageSubresource = {e->pub.aspect, 0, 0, 1},
+                                    .imageOffset = {runs[i].bx * 4, runs[i].by * 4, 0},
+                                    .imageExtent = {runs[i].n * 4u, 4, 1}};
+        off += (VkDeviceSize)runs[i].n * 16;
+    }
+    barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    vkCmdCopyBufferToImage(cb, sb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)n, rg);
+    barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
+    vk_upload_end();
+    free(rg);
+    static int logged = -2;
+    if (logged != set) {
+        logged = set;
+        rt_log("prompts: texture %#llx: button icon set %d (%d blocks)", (unsigned long long)e->pub.addr, set, nblocks);
+    }
+}
+
+static void upload(Tex *e);
+// The icon set changed since the last upload: the storage's Switch icons again, and the new set over them. One byte
+// compare for every other texture.
+static inline void prompts_fresh(Tex *e) {
+    if (__builtin_expect(e->prompts, 0) && e->uploaded && e->prompts_set != mlb_prompts_set()) upload(e);
+}
+
 static void upload(Tex *e) {
     const tex_t *t = &e->t;
     const nvn_texdesc *d = &t->d;
@@ -1207,6 +1256,7 @@ static void upload(Tex *e) {
     uint64_t p0 = perf_begin(), u0 = kern_now_ns();
     int why = UP_GPU;
     if (!upload_gpu(e)) why = up_why, upload_cpu(e);
+    if (mlb_prompts_shape((int)d->format, d->width, d->height, umax(d->levels, 1))) prompts_apply(e);
     uint64_t dt = kern_now_ns() - u0;
     up_n[why]++, up_bytes[why] += t->L.size, up_ns[why] += dt;
     if (e->uploaded) {
@@ -1261,6 +1311,7 @@ static int storage_rewritten(const Tex *e, uint32_t since, uint32_t *now) {
 static int cpu_rewrite_refresh(Tex *e);   // mlbts-native, below
 static void make_fresh(Tex *e) {
     if (!e->pub.mirrored) return;
+    prompts_fresh(e);   // mlbts-native
     if (e->pub.gpu_owned) {   // mlbts-native: CPU data written over its GPU content (cpu_rewrite_refresh)
         cpu_rewrite_refresh(e);
         return;
@@ -1347,6 +1398,7 @@ static void make_fresh_snap(Tex *e) {
                    (unsigned long long)e->pub.addr, (unsigned)e->t.d.format, e->pub.width, e->pub.height);
         return;
     }
+    prompts_fresh(e);   // mlbts-native
     if (!e->pub.gpu_owned && vk_watch_hit(e->pub.addr, e->t.L.size)) {   // mlbts-native diagnosis
         uint32_t now;
         int ch = vk_mem_changed_snap(e->pub.addr, e->t.L.size, e->uploaded ? e->wgen : 0, submit_epoch, &now);

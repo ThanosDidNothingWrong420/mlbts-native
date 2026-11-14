@@ -27,12 +27,14 @@
 
 #include <math.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <SDL3/SDL.h>   // types and constants only: the functions come from SDL3.dll (sdl_load)
 
 #include "cfg.h"
 #include "host.h"
 #include "platform/platform.h"
+#include "prompts.h"
 int menu_is_open(void);   // ui/menu.cpp (ui/menu.h pulls in Vulkan)
 void menu_toggle(void);
 
@@ -183,6 +185,7 @@ typedef struct {
     SDL_Gamepad *g;
     SDL_JoystickID id;
     int face_label[4];   // the Switch button of the south, east, west, north button by its label, -1 unknown
+    int kind;            // mlbts-native: for the button icons (prompts.h hid_prompt_kind): 1 Xbox, 2 PlayStation, 0 other
 } SdlPad;
 static PlatMutex sdl_lock = PLAT_MUTEX_INIT;
 static PlatOnce sdl_once = PLAT_ONCE_INIT;
@@ -261,6 +264,30 @@ static int switch_of_label(SDL_GamepadButtonLabel l) {
 static const SDL_GamepadButton face_sdl[4] = {SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_EAST,
                                               SDL_GAMEPAD_BUTTON_WEST, SDL_GAMEPAD_BUTTON_NORTH};
 
+// mlbts-native: the kind of controller whose buttons the game's prompts show (prompts.c, MLB_PROMPTS=auto): the one
+// used last (a button pressed or a stick pushed past half way), else the one connected first; 0 without a controller.
+// A pad of a type SDL does not name goes by its south button's label (A: Xbox-like, cross: PlayStation); Nintendo pads
+// keep the game's own icons.
+static volatile int prompt_kind;
+int hid_prompt_kind(void) { return __atomic_load_n(&prompt_kind, __ATOMIC_RELAXED); }
+
+static void prompt_kind_set(int kind) {
+    if (__atomic_exchange_n(&prompt_kind, kind, __ATOMIC_RELAXED) != kind)
+        rt_log("hid: button icons for %s", kind == 1 ? "Xbox" : kind == 2 ? "PlayStation" : "Nintendo (the game's own)");
+}
+
+static int pad_kind(SDL_Gamepad *g) {
+    switch (p_SDL_GetGamepadType(g)) {
+    case SDL_GAMEPAD_TYPE_XBOX360: case SDL_GAMEPAD_TYPE_XBOXONE: return 1;
+    case SDL_GAMEPAD_TYPE_PS3: case SDL_GAMEPAD_TYPE_PS4: case SDL_GAMEPAD_TYPE_PS5: return 2;
+    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO: case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
+    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT: case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR: return 0;
+    default: break;
+    }
+    SDL_GamepadButtonLabel l = p_SDL_GetGamepadButtonLabel(g, SDL_GAMEPAD_BUTTON_SOUTH);
+    return l == SDL_GAMEPAD_BUTTON_LABEL_A ? 1 : l == SDL_GAMEPAD_BUTTON_LABEL_CROSS ? 2 : 0;
+}
+
 // Under sdl_lock: drop the pads that went away; once a second open the ones that arrived. Logs each change.
 static void sdl_scan(void) {
     for (int i = 0; i < npads;)
@@ -269,6 +296,7 @@ static void sdl_scan(void) {
             rt_log("hid: controller %u disconnected", (unsigned)pads[i].id);
             p_SDL_CloseGamepad(pads[i].g);
             pads[i] = pads[--npads];
+            prompt_kind_set(npads ? pads[0].kind : 0);   // mlbts-native: a pad still there, until another is used
         }
     uint64_t now = plat_now_ns();
     if (now < next_scan) return;
@@ -284,6 +312,8 @@ static void sdl_scan(void) {
         SdlPad *p = &pads[npads++];
         p->g = g, p->id = ids[k];
         for (int f = 0; f < 4; f++) p->face_label[f] = switch_of_label(p_SDL_GetGamepadButtonLabel(g, face_sdl[f]));
+        p->kind = pad_kind(g);
+        if (npads == 1) prompt_kind_set(p->kind);   // mlbts-native: the first pad, until another is used
         int rumble = p_SDL_GetBooleanProperty(p_SDL_GetGamepadProperties(g), SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
         const char *name = p_SDL_GetGamepadName(g);
         rt_log("hid: controller %u \"%s\" connected (%s layout, %s)", (unsigned)p->id, name ? name : "?",
@@ -330,7 +360,11 @@ static int pad_read(PadIn *in) {
     plat_once(&sdl_once, sdl_load, NULL);
     if (!sdl_ok) {
         XPad p;
-        if (!xinput_read(&p)) return 0;
+        if (!xinput_read(&p)) {
+            if (prompt_kind) prompt_kind_set(0);
+            return 0;
+        }
+        if (prompt_kind != 1) prompt_kind_set(1);   // mlbts-native: XInput pads are Xbox pads (button icons)
         in->buttons = pad_bits(&p);
         in->lx = clamp_stick(p.lx), in->ly = clamp_stick(p.ly), in->rx = clamp_stick(p.rx), in->ry = clamp_stick(p.ry);
         return 1;
@@ -345,11 +379,18 @@ static int pad_read(PadIn *in) {
     }
     for (int i = 0; i < npads; i++) {
         SDL_Gamepad *g = pads[i].g;
-        in->buttons |= sdl_bits(&pads[i], label, &in->guide);
-        take_stick(&in->lx, &in->ly, clamp_stick(p_SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFTX)),
-                   clamp_stick(-(int32_t)p_SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFTY)));
-        take_stick(&in->rx, &in->ry, clamp_stick(p_SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHTX)),
-                   clamp_stick(-(int32_t)p_SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHTY)));
+        uint64_t b = sdl_bits(&pads[i], label, &in->guide);
+        int32_t lx = clamp_stick(p_SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFTX));
+        int32_t ly = clamp_stick(-(int32_t)p_SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFTY));
+        int32_t rx = clamp_stick(p_SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHTX));
+        int32_t ry = clamp_stick(-(int32_t)p_SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHTY));
+        in->buttons |= b;
+        take_stick(&in->lx, &in->ly, lx, ly);
+        take_stick(&in->rx, &in->ry, rx, ry);
+        // mlbts-native: this pad is the one in use (button icons, prompt_kind)
+        if (npads > 1 && pads[i].kind != prompt_kind &&
+            (b || abs(lx) > STICK_DIR || abs(ly) > STICK_DIR || abs(rx) > STICK_DIR || abs(ry) > STICK_DIR))
+            prompt_kind_set(pads[i].kind);
     }
     int have = npads > 0;
     plat_mutex_unlock(&sdl_lock);

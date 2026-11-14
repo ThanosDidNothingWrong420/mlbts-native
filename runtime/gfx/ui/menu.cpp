@@ -286,7 +286,7 @@ static bool g_modal;            // a confirmation is open: B and Esc close it, n
 static const char *const kMenuKeys[] = {
     "RENDER_SCALE", "UPSCALER", "SHARPNESS", "DLSS", "DLSS_PRESET", "AA", "AA_STRENGTH", "ANISO", "COLOR_PRESET", "COLOR_BRIGHTNESS", "COLOR_CONTRAST", "COLOR_SATURATION",
     "COLOR_GAMMA", "FULLSCREEN", "WINDOW_SIZE", "VK_PRESENT", "ASPECT", "GPU_INDEX", "PERF_OVERLAY", "FRAME_QUEUE",
-    "ASSUME_FOCUS", "VOLUME", "PAD_MAP", "RUMBLE", "RUMBLE_STRENGTH", "STICK_DEADZONE", "LSTICK_DEADZONE",
+    "ASSUME_FOCUS", "VOLUME", "PAD_MAP", "PROMPTS", "RUMBLE", "RUMBLE_STRENGTH", "STICK_DEADZONE", "LSTICK_DEADZONE",
     "RSTICK_DEADZONE", "ASYNC_PREEMPT", "REPLAY_ASYNC", "PIPE_WAIT", "PIPE_SKIP", "LIB_PREBUILD",
     "LIB_PREBUILD_THREADS", "PIPE_PREBUILD", "PREWARM_XLATE", "GPL", "ASTC", "MEMORY", "TEX_ALIAS",
     "TEX_VRAM_PRESSURE", "ASTC_BC", "LOD_GUARD", "FIX_C0", "FIX_ZERO", "BIND_SKIP", "SHADER_MEMO", "PIPE_MEMO",
@@ -592,6 +592,11 @@ static void tab_controls(float scale) {
                "is Switch A (confirm), B or circle is B, X or square is X, Y or triangle is Y. By position: the "
                "buttons work by where they sit, as on a Switch controller, so the east button (Xbox B, circle) "
                "confirms.");
+    static const char *const prompts[] = {"Automatic", "Nintendo", "Xbox", "PlayStation"};
+    opt_choice("PROMPTS", "Button icons", prompts, 4,
+               "Whose buttons the game's prompts show.\n\nAutomatic: the controller you used last (Xbox or "
+               "PlayStation; the game's own Switch icons with a Nintendo controller, or with none). The face buttons "
+               "follow the Face buttons row, so each prompt names the button to press.");
     opt_toggle("RUMBLE", "Vibration", "Controller rumble when the game asks for it.");
     opt_slider("RUMBLE_STRENGTH", "Vibration strength", 0, 300,
                "How strongly the controller vibrates. 100 % is the strength the game asks for; above it, weak "
