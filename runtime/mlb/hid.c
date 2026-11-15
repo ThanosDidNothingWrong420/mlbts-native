@@ -44,6 +44,7 @@
 #include "host.h"
 #include "platform/platform.h"
 #include "prompts.h"
+#include "swkbd.h"
 int menu_is_open(void);   // ui/menu.cpp (ui/menu.h pulls in Vulkan)
 void menu_toggle(void);
 
@@ -531,6 +532,10 @@ int hid_stick_percent(double now[2]) {
     return 1;
 }
 
+// mlbts-native: the software keyboard's window is open (swkbd.c): the game reads an idle controller (poll).
+static volatile int text_entry_open;
+void input_block(int on) { __atomic_store_n(&text_entry_open, on ? 1 : 0, __ATOMIC_RELEASE); }
+
 // The merged controller state: buttons and sticks.
 static void poll(NpadState *st) {
     uint64_t b = 0;
@@ -569,12 +574,15 @@ static void poll(NpadState *st) {
     // Xbox pad, Share / Create and Options on a PlayStation pad) or the guide button (Xbox, PS) open or close it; while
     // it is open the game gets an idle controller. Buttons held when it closes stay hidden from the game until
     // released: the B that closed the menu would otherwise also go "back" in the game.
+    // The software keyboard's window (swkbd.c, input_block) blocks the game's controller the same way, so the Enter or
+    // A that confirmed the text does not also press A in the game.
     static uint64_t prev, hidden;
     static int was_open, prev_guide;
     const uint64_t combo = BIT(B_MINUS) | BIT(B_PLUS);
-    if (((b & combo) == combo && (prev & combo) != combo) || (guide && !prev_guide)) menu_toggle();
+    int typing = __atomic_load_n(&text_entry_open, __ATOMIC_ACQUIRE);
+    if (!typing && (((b & combo) == combo && (prev & combo) != combo) || (guide && !prev_guide))) menu_toggle();
     prev = b, prev_guide = guide;
-    int open = menu_is_open();
+    int open = menu_is_open() || typing;
     if (open) hidden = ~0ull;
     else if (was_open) hidden = b;
     was_open = open;

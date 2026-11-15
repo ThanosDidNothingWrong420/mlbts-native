@@ -151,7 +151,13 @@ static void self_controller(IpcSession *s, const IpcRequest *rq, IpcResponse *rs
     case 0: rt_log("am: the application asked to exit"); fflush(NULL); exit(0);   // Exit
     case 1: case 2: return;   // LockExit, UnlockExit
     case 3: case 4: return;   // EnterFatalSection, LeaveFatalSection
-    case 9: COPY_EVENT(rs, &launchable); return;   // GetLibraryAppletLaunchableEvent
+    case 9:   // GetLibraryAppletLaunchableEvent: signalled, as Horizon does (and Ryujinx) for a foreground application.
+        // mlbts-native: left unsignalled, the SDK waited on it forever before starting a library applet (the game froze
+        // at its keyboard screen). The keyboard is swkbd.c's now; another applet stops at ILibraryAppletCreator's
+        // named fatal instead of hanging.
+        COPY_EVENT(rs, &launchable);
+        kern_event_signal(launchable.w);
+        return;
     case 10:   // SetScreenShotPermission(u32)
     case 11:   // SetOperationModeChangedNotification(bool)
     case 12:   // SetPerformanceModeChangedNotification(bool)
