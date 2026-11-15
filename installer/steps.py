@@ -1,0 +1,489 @@
+"""The setup's steps, and the bookkeeping that makes a fresh install, a resume and an update one rule.
+
+    check    always: the setup folder, the PC (AVX2, Vulkan), the game files and keys, free space
+    exefs    the update's code (main, sdk, rtld, main.npdm) into <dest>/game/exefs, checked against the 1.0.15 hashes
+    romfs    the game's data (base + update, about 37 GB) into <dest>/game/romfs (tools/romfs_dump.py; resumable)
+    build    lift the code to C (recomp/gen.py) and compile it with the prebuilt runtime (tools/build.py) into mlb.exe
+    finish   always: mlb.cfg, the shader translator, DLSS (optional), shortcuts, a Ryujinx save (optional), clean up
+
+mlbts-install.json in the install folder records each finished step with a key: a fingerprint of what its output
+depends on. A step whose recorded key matches and whose output is still there is skipped. So a cancelled setup resumes
+where it stopped, and a newer release on an existing folder only rebuilds mlb.exe (its key holds the release version):
+the game files are not needed again. Nothing of the keys file is ever stored, logged or shown; only its path is passed
+to the tools.
+
+After TotK Recomp installer/steps.py and runner.py @ v0.4.0 (MIT).
+"""
+import datetime
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import traceback
+import urllib.request
+from pathlib import Path
+
+from . import detect
+
+STATE = 'mlbts-install.json'
+GIB = 1 << 30
+ROMFS_BYTES = 37_408_746_675   # the 1.0.15 RomFS (84,634 files), tools/romfs_dump.py
+SPACE_SLACK = 2 * GIB          # mlb.exe, the shader and pipeline caches, saves
+TEMP_BYTES = 2 * GIB           # the generated C (about 600 MB) and its objects (about 200 MB), with room
+
+DLSS_DLL = 'nvngx_dlss.dll'    # NVIDIA's DLSS library: NVIDIA RTX SDK license, downloaded, never shipped
+DLSS_VERSION = '310.9.1'
+DLSS_URL = f'https://raw.githubusercontent.com/NVIDIA/DLSS/v{DLSS_VERSION}/lib/Windows_x86_64/rel/{DLSS_DLL}'
+DLSS_SIZE = 58956912
+DLSS_SHA256 = '3975567b8943c53acce397f2b72380092f84f162d00b0d2c7d08a1025c563983'
+
+PLAYER_CFG = """# mlb.cfg - settings of MLB The Show 26 (PC port), one KEY=VALUE per line. A line starting with # is ignored.
+# Most settings are in the in-game menu (F1), which writes its changes into this file.
+# Environment variables with the same name (MLB_...) win over this file.
+
+# The sampling profiler is a developer tool; it costs frame time while it runs.
+MLB_SAMPLER=off
+"""
+
+
+class InstallError(Exception):
+    """A failure the player can act on: the message says what happened and what to do."""
+
+
+class Cancelled(Exception):
+    pass
+
+
+def fingerprint(*parts):
+    return hashlib.sha256('\0'.join(str(p) for p in parts).encode()).hexdigest()[:16]
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for block in iter(lambda: f.read(1 << 20), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def now_utc():
+    return datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def gib(n):
+    return f'{n / GIB:.1f} GB'
+
+
+class Context:
+    def __init__(self, layout, dest, reporter, options):
+        self.layout, self.dest, self.reporter, self.options = layout, dest, reporter, options
+        self.temp = layout.temp / ('install-' + fingerprint(str(dest).lower())[:8])
+        self.game = dest / 'game'
+        self.expected = json.loads(layout.expected.read_text(encoding='utf-8'))
+        self.state = self.load_state()
+
+    def load_state(self):
+        p = self.dest / STATE
+        if p.is_file():
+            try:
+                data = json.loads(p.read_text(encoding='utf-8'))
+                if isinstance(data, dict) and isinstance(data.get('steps'), dict):
+                    return data
+            except (OSError, ValueError):
+                pass
+        return {'format': 1, 'release': None, 'steps': {}}
+
+    def save_state(self):
+        self.dest.mkdir(parents=True, exist_ok=True)
+        p = self.dest / STATE
+        tmp = p.with_name(STATE + '.tmp')
+        tmp.write_text(json.dumps(self.state, indent=1) + '\n', encoding='utf-8')
+        os.replace(tmp, p)
+
+    def run_tool(self, step, cmd, on_line=None):
+        """Run a tool of the setup folder, its output to the log (and on_line), from the setup folder. A tool that fails
+        raises InstallError with its last lines."""
+        rep = self.reporter
+        rep.log('run: ' + ' '.join(str(c) for c in cmd))
+        flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        tail = []
+        p = subprocess.Popen([str(c) for c in cmd], cwd=self.layout.root, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, creationflags=flags)
+        try:
+            for raw in p.stdout:
+                line = raw.decode('utf-8', 'replace').rstrip()
+                if not line:
+                    continue
+                if not (on_line and on_line(line)):
+                    rep.log('  ' + line)
+                tail = (tail + [line])[-12:]
+            code = p.wait()
+        except KeyboardInterrupt:
+            p.kill()
+            p.wait()
+            raise
+        if code:
+            name = next((Path(str(c)).name for c in cmd if str(c).endswith('.py')), Path(str(cmd[0])).name)
+            raise InstallError(f'{name} failed (exit code {code}):\n' + '\n'.join(tail[-8:]))
+
+
+class Step:
+    id = ''
+    title = ''
+    always = False
+
+    def key(self, ctx):
+        return ''
+
+    def current(self, ctx, record):
+        return True
+
+    def run(self, ctx):
+        return {}
+
+
+# ---- check ----------------------------------------------------------------------------------------------------------
+
+class Check(Step):
+    id, title, always = 'check', 'Check the PC and the game files', True
+
+    def run(self, ctx):
+        rep, lay, opt = ctx.reporter, ctx.layout, ctx.options
+        missing = lay.missing()
+        if missing:
+            raise InstallError('The setup folder is incomplete (' + missing[0] + ' is missing). Unpack the whole '
+                               'download again, into an empty folder.')
+        if not detect.avx2():
+            raise InstallError('This CPU has no AVX2. The port needs a CPU from about 2013 or later (Intel Haswell, '
+                               'AMD Zen or newer).')
+        if not detect.vulkan():
+            raise InstallError('No Vulkan driver found (vulkan-1.dll). Install the latest driver for your graphics card.')
+        if not lay.dev and (ctx.dest == lay.root or lay.root in ctx.dest.parents):
+            raise InstallError('Pick an install folder outside the setup folder: the setup folder can be deleted after '
+                               'the install.')
+        needs_files = ctx.plan_runs('exefs') or ctx.plan_runs('romfs')
+        if needs_files:
+            self.check_files(ctx)
+        else:
+            rep.log('check: game files not needed, the extracted ones are complete')
+        # space: what is left of the RomFS to write, plus the build's output in the install folder
+        have = 0
+        romfs = ctx.game / 'romfs'
+        if ctx.plan_runs('romfs') and romfs.is_dir():
+            have = sum(f.stat().st_size for f in romfs.rglob('*') if f.is_file() and not f.name.endswith('.part'))
+        need = (max(ROMFS_BYTES - have, 0) if ctx.plan_runs('romfs') else 0) + SPACE_SLACK
+        free = detect.free_bytes(ctx.dest)
+        rep.log(f'space: install disk needs {gib(need)}, {gib(free)} free')
+        if free < need:
+            raise InstallError(f'Not enough free space for the install folder: it needs {gib(need)}, the disk has '
+                               f'{gib(free)} free. Free some space or pick a folder on another disk.')
+        if ctx.plan_runs('build'):
+            tfree = detect.free_bytes(lay.temp)
+            if tfree < TEMP_BYTES:
+                raise InstallError(f'Not enough free space next to the setup for the build: it needs {gib(TEMP_BYTES)}'
+                                   f', the disk has {gib(tfree)} free. Move the setup folder to a disk with more space.')
+        return {}
+
+    def check_files(self, ctx):
+        opt = ctx.options
+        for what, p in (('base game', opt.base), ('update', opt.update), ('keys', opt.keys)):
+            if not p:
+                raise InstallError(f'Pick the {what} file.')
+            if not Path(p).is_file():
+                raise InstallError(f'The {what} file was not found: {p}')
+        ids = {}
+        for name in ('base', 'update'):
+            info = detect.identify(getattr(opt, name))
+            if info is None:
+                raise InstallError(f'{getattr(opt, name)} is not an NSP file. The setup takes the game and its update '
+                                   'as NSP files dumped from your own Switch.')
+            ids[name] = info
+        if ids['base']['kind'] == 'update' and ids['update']['kind'] == 'base':   # picked the other way round
+            opt.base, opt.update = opt.update, opt.base
+            ids['base'], ids['update'] = ids['update'], ids['base']
+            ctx.reporter.log('check: the base game and the update were swapped; using them the right way round')
+        if ids['base']['kind'] != 'base':
+            raise InstallError(f'{Path(opt.base).name} is not MLB The Show 26 (title {ids["base"]["title"]:016X}); '
+                               'pick the base game NSP (title 0100AA7024094000).')
+        if ids['update']['kind'] != 'update':
+            raise InstallError(f'{Path(opt.update).name} is not an MLB The Show 26 update; pick the 1.0.15 update NSP '
+                               '(title 0100AA7024094800, version 983040).')
+        ver = ids['update']['version']
+        if ver is not None and ver != detect.UPDATE_VERSION:
+            raise InstallError(f'This update is version {ver}, not 1.0.15 (983040). The port runs only on game version '
+                               '1.0.15: dump that update from your Switch.')
+        text = Path(opt.keys).read_text(encoding='utf-8', errors='replace')
+        if not re.search(r'^\s*header_key\s*=', text, re.M):
+            raise InstallError(f'{opt.keys} does not look like a prod.keys file (it has no header_key).')
+        if not opt.titlekeys:
+            opt.titlekeys = detect.title_keys_for(opt.keys)
+
+
+# ---- exefs ----------------------------------------------------------------------------------------------------------
+
+class ExeFS(Step):
+    id, title = 'exefs', "Extract the game's code"
+
+    def key(self, ctx):
+        return fingerprint('exefs-1', json.dumps(ctx.expected['exefs_sha256'], sort_keys=True))
+
+    def current(self, ctx, record):
+        ex = ctx.game / 'exefs'
+        return all((ex / n).is_file() for n in ctx.expected['exefs_sha256'])
+
+    def run(self, ctx):
+        sys.path.insert(0, str(ctx.layout.tools))
+        import nxextract as nx    # numpy and the Windows AES of swcrypto: the bundled Python has them
+        from romfs_dump import open_program
+        opt, rep = ctx.options, ctx.reporter
+        rep.progress(self.id, 'Reading the update')
+        keys = nx.load_keys(str(opt.keys))
+        tk = nx.load_keys(str(opt.titlekeys)) if opt.titlekeys else {}
+        try:
+            nca, _ = open_program(str(opt.update), keys, tk)
+        except (SystemExit, KeyError, ValueError) as e:
+            raise InstallError(f'The update could not be opened with these keys ({e}). The keys must come from a '
+                               'Switch whose system version is at least the one the update needs.') from None
+        if nca.key is None:
+            raise InstallError('The update could not be decrypted with these keys: dump prod.keys again from a '
+                               'Switch on a recent system version.')
+        sec = next((s for s in nca.sections if s['fs_type'] == 1 and s['index'] == 0), None)
+        if sec is None:
+            raise InstallError('The update holds no program code (ExeFS); it is not the 1.0.15 update.')
+        rd = nca.section_reader(sec)
+        want = ctx.expected['exefs_sha256']
+        out = ctx.game / 'exefs'
+        out.mkdir(parents=True, exist_ok=True)
+        got = {}
+        for name, off, size in nx.parse_pfs0(rd, nca.pfs0_offset(sec)):
+            data = rd(off, size)
+            got[name] = hashlib.sha256(data).hexdigest()
+            if name in want:
+                tmp = out / (name + '.tmp')
+                tmp.write_bytes(data)
+                os.replace(tmp, out / name)
+        bad = [n for n in want if got.get(n) != want[n]]
+        if bad:
+            raise InstallError(f'The update\'s code is not the 1.0.15 code ({", ".join(bad)} differ). The port runs '
+                               'only on game version 1.0.15.')
+        return {}
+
+
+# ---- romfs ----------------------------------------------------------------------------------------------------------
+
+class RomFS(Step):
+    id, title = 'romfs', "Extract the game's data (about 37 GB)"
+
+    def key(self, ctx):
+        return fingerprint('romfs-1', ctx.expected['title_id'], ctx.expected['update_version'])
+
+    def current(self, ctx, record):
+        return (ctx.game / 'romfs.complete').is_file() and (ctx.game / 'romfs').is_dir()
+
+    def run(self, ctx):
+        opt, lay, rep = ctx.options, ctx.layout, ctx.reporter
+        ctx.game.mkdir(parents=True, exist_ok=True)
+        cmd = [lay.python, '-I', '-X', 'utf8', lay.tools / 'romfs_dump.py', '--keys', opt.keys]
+        if opt.titlekeys:
+            cmd += ['--titlekeys', opt.titlekeys]
+        cmd += [opt.base, opt.update, ctx.game, '--extract-all', '--progress']
+        rep.progress(self.id, 'Checking the game files')
+        t0, done0 = time.monotonic(), None
+
+        def line(text):
+            nonlocal done0
+            m = re.match(r'progress (\d+) (\d+)$', text)
+            if not m:
+                return False
+            done, total = int(m.group(1)), int(m.group(2))
+            if done0 is None:
+                done0 = done
+            rate = (done - done0) / max(time.monotonic() - t0, 1e-3)
+            left = f', about {int((total - done) / rate / 60) + 1} min left' if rate > 1e6 and done < total else ''
+            rep.progress(self.id, f'{gib(done)} of {gib(total)}{left}', done, total, 'bytes')
+            return True
+
+        try:
+            ctx.run_tool(self.id, cmd, line)
+        except InstallError as e:
+            if 'IVFC verify failed' in str(e):
+                raise InstallError('The game files failed their integrity check: one of the NSP files is damaged or '
+                                   'incomplete, or the base game and the update do not belong together. Copy or dump '
+                                   'them again.') from None
+            raise
+        return {}
+
+
+# ---- build ----------------------------------------------------------------------------------------------------------
+
+class Build(Step):
+    id, title = 'build', 'Build the game for this PC (a few minutes)'
+
+    def key(self, ctx):
+        return fingerprint('build-1', ctx.layout.release, json.dumps(ctx.expected['exefs_sha256'], sort_keys=True))
+
+    def current(self, ctx, record):
+        return (ctx.dest / 'mlb.exe').is_file()
+
+    def run(self, ctx):
+        lay, rep = ctx.layout, ctx.reporter
+        gen, out = ctx.temp / 'gen', ctx.temp / 'build'
+        py = [lay.python, '-I', '-X', 'utf8']
+
+        def lift_line(text):
+            m = re.match(r'emitted (\d+)/(\d+) chunks', text)
+            if m:
+                rep.progress(self.id, 'Translating the code to C', int(m.group(1)), int(m.group(2)), 'chunks')
+            return False
+
+        rep.progress(self.id, 'Translating the code to C', force=True)
+        ctx.run_tool(self.id, py + [lay.recomp / 'gen.py', '--exefs', ctx.game / 'exefs', '--out', gen,
+                                   '--modules', 'main,sdk'], lift_line)
+
+        def build_line(text):
+            m = re.match(r'\[(\d+)/(\d+)\]', text)
+            if m:
+                rep.progress(self.id, 'Compiling', int(m.group(1)), int(m.group(2)), 'files')
+                return True
+            return False
+
+        rep.progress(self.id, 'Compiling', force=True)
+        ctx.run_tool(self.id, py + [lay.tools / 'build.py', '--toolchain', lay.llvm, '--deps', lay.deps,
+                                   '--ninja', lay.ninja, '--runtime-lib', lay.runtime_lib, '--portable',
+                                   '--gen', gen, '--out', out], build_line)
+        rep.progress(self.id, 'Copying the game into the install folder', force=True)
+        for src in (out / 'mlb.exe', out / 'SDL3.dll', lay.xlate, lay.xlate.with_suffix('.id')):
+            dst = ctx.dest / src.name
+            tmp = dst.with_name(dst.name + '.new')
+            shutil.copy2(src, tmp)
+            try:
+                os.replace(tmp, dst)
+            except PermissionError:
+                os.remove(tmp)
+                raise InstallError(f'{dst} is in use: close the game and run the setup again.') from None
+        return {}
+
+
+# ---- finish ---------------------------------------------------------------------------------------------------------
+
+class Finish(Step):
+    id, title, always = 'finish', 'Finish', True
+
+    def run(self, ctx):
+        rep, opt, dest = ctx.reporter, ctx.options, ctx.dest
+        cfg = dest / 'mlb.cfg'
+        if not cfg.is_file():
+            cfg.write_text(PLAYER_CFG, encoding='utf-8')
+        if opt.dlss:
+            self.dlss(ctx)
+        if opt.shortcut:
+            rep.progress(self.id, 'Making shortcuts', force=True)
+            shortcuts(dest / 'mlb.exe')
+        if opt.import_save:
+            rep.progress(self.id, 'Copying your Ryujinx save', force=True)
+            r = subprocess.run([str(dest / 'mlb.exe'), '--import-save'], cwd=dest, capture_output=True,
+                               creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+            text = (r.stdout + r.stderr).decode('utf-8', 'replace').strip()
+            rep.log('import-save: ' + text.replace('\n', '\n  '))
+            if r.returncode:
+                rep.warning('Your Ryujinx save could not be copied (the setup log says why). The game starts with a '
+                            'new save; you can copy it later with "Import Ryujinx save".')
+        rep.progress(self.id, 'Cleaning up', force=True)
+        shutil.rmtree(ctx.temp, ignore_errors=True)
+        return {}
+
+    def dlss(self, ctx):
+        rep, target = ctx.reporter, ctx.dest / DLSS_DLL
+        if target.is_file():
+            return   # this setup's copy, or a newer one the player put there
+        part = ctx.temp / (DLSS_DLL + '.part')
+        rep.log(f'dlss: {DLSS_URL} (NVIDIA RTX SDK license)')
+        try:
+            part.parent.mkdir(parents=True, exist_ok=True)
+            h, done = hashlib.sha256(), 0
+            with urllib.request.urlopen(DLSS_URL, timeout=60) as r, open(part, 'wb') as f:
+                while block := r.read(1 << 20):
+                    f.write(block)
+                    h.update(block)
+                    done += len(block)
+                    rep.progress(self.id, "Downloading NVIDIA DLSS", min(done, DLSS_SIZE), DLSS_SIZE, 'bytes')
+            if done != DLSS_SIZE or h.hexdigest() != DLSS_SHA256:
+                raise OSError(f'{done} bytes, not the expected file')
+            os.replace(part, target)
+        except Exception as e:   # urllib's errors, a cut connection, a bad file: the game runs without DLSS
+            if isinstance(e, KeyboardInterrupt):
+                raise
+            part.unlink(missing_ok=True)
+            rep.warning(f'NVIDIA DLSS could not be downloaded ({str(e)[:200]}). The game runs without it; run the '
+                        'setup again to retry.')
+
+
+def shortcuts(exe):
+    """'MLB The Show 26' on the desktop and in the Start menu, through the Windows shell (WScript.Shell)."""
+    script = ("$w = New-Object -ComObject WScript.Shell; "
+              "foreach ($d in @([Environment]::GetFolderPath('Desktop'), [Environment]::GetFolderPath('Programs'))) { "
+              "$s = $w.CreateShortcut((Join-Path $d 'MLB The Show 26.lnk')); $s.TargetPath = $env:MLBTS_EXE; "
+              "$s.WorkingDirectory = (Split-Path $env:MLBTS_EXE); $s.IconLocation = $env:MLBTS_EXE + ',0'; "
+              "$s.Description = 'MLB The Show 26 (PC port)'; $s.Save() }")
+    subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+                   env=dict(os.environ, MLBTS_EXE=str(exe)), capture_output=True,
+                   creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+
+
+STEPS = (Check, ExeFS, RomFS, Build, Finish)
+
+
+def all_steps():
+    return [s() for s in STEPS]
+
+
+def plan(ctx, steps):
+    """Which steps run: always ones, and those without a matching record or whose output is gone."""
+    ctx.keys = {s.id: s.key(ctx) for s in steps}
+    runs = {}
+    for s in steps:
+        rec = ctx.state['steps'].get(s.id)
+        runs[s.id] = s.always or not (rec and rec.get('key') == ctx.keys[s.id] and s.current(ctx, rec))
+    if runs['exefs']:   # new code means a new build
+        runs['build'] = True
+    ctx.plan_runs = lambda step_id: runs.get(step_id, False)
+    return runs
+
+
+def run_steps(ctx, steps):
+    """Run the plan. Returns 'ok', 'failed' or 'cancelled'; the events and the log say why."""
+    rep, current = ctx.reporter, None
+    try:
+        runs = plan(ctx, steps)
+        for s in steps:
+            if not runs[s.id]:
+                rep.step(s.id, 'skipped', reason='already done')
+                continue
+            current = s.id
+            rep.step(s.id, 'started')
+            t0 = rep.elapsed()
+            fields = s.run(ctx) or {}
+            seconds = round(rep.elapsed() - t0, 1)
+            if not s.always:
+                ctx.state['steps'][s.id] = {'key': ctx.keys[s.id], 'release': ctx.layout.release,
+                                            'finished': now_utc(), 'seconds': seconds, **fields}
+                ctx.save_state()
+            rep.step(s.id, 'done', seconds=seconds)
+            current = None
+        ctx.state['release'] = ctx.layout.release
+        ctx.save_state()
+        return 'ok'
+    except InstallError as e:
+        rep.error(str(e), step=current)
+        return 'failed'
+    except KeyboardInterrupt:
+        rep.log(f'cancelled during {current}')
+        return 'cancelled'
+    except Exception as e:
+        rep.log(traceback.format_exc())
+        rep.error(f'Unexpected error: {type(e).__name__}: {e}. The setup log has the details.', step=current)
+        return 'failed'

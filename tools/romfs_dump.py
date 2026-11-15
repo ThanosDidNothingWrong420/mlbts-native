@@ -81,6 +81,9 @@ def main():
     ap.add_argument("--verify", type=int, default=64)
     ap.add_argument("--extract", nargs="*", default=[])
     ap.add_argument("--extract-all", action="store_true")
+    ap.add_argument("--progress", action="store_true",
+                    help="print 'progress <bytes done> <bytes total>' lines (files already complete count as done) for "
+                         "the setup (installer/steps.py), at most twice a second")
     a = ap.parse_args()
     keys = nx.load_keys(a.keys)
     tk = nx.load_keys(a.titlekeys) if a.titlekeys else {}
@@ -92,6 +95,9 @@ def main():
     f = ns.fsh_fields(upd_sec["fsh"])
     checked, fails = verify_ivfc(info, a.verify, f["ivfc_master_hash"])
     print(f"IVFC verify: {checked} blocks, {fails} failures")
+    if fails:   # a damaged or cut game file, or the wrong base for this update: extracting it would give a broken game
+        raise SystemExit(f"IVFC verify failed on {fails} of {checked} blocks: the game files are damaged or do not "
+                         "belong together")
     hdr = romfs.read(0, 0x50)
     files = nx.parse_romfs(romfs.read, 0)
     rep = {k: v for k, v in info.items() if k not in ("ivfc", "levels")}
@@ -108,12 +114,24 @@ def main():
         done = skipped = 0
         written = 0
         t0 = time.monotonic()
+        total = sum(s for _, _, s in files)
+        progress_done, progress_at = 0, 0.0
+
+        def progress(force=False):
+            nonlocal progress_at
+            now = time.monotonic()
+            if a.progress and (force or now - progress_at >= 0.5):
+                progress_at = now
+                print(f"progress {progress_done} {total}", flush=True)
+
         for p, off, size in sorted(files, key=lambda x: x[1]):
             if not a.extract_all and not any(fnmatch.fnmatch(p.lower(), g.lower()) for g in pats):
                 continue
             dst = out / "romfs" / p.lstrip("/")
             if dst.exists() and dst.stat().st_size == size:
                 skipped += 1
+                progress_done += size
+                progress()
                 continue
             dst.parent.mkdir(parents=True, exist_ok=True)
             part = dst.with_name(dst.name + ".part")
@@ -123,6 +141,8 @@ def main():
                     n = min(16 << 20, size - pos)
                     w.write(romfs.read(off + pos, n))
                     pos += n
+                    progress_done += n
+                    progress()
             os.replace(part, dst)
             done += 1
             written += size
@@ -130,6 +150,7 @@ def main():
                 rate = written / max(time.monotonic() - t0, 1e-3) / 2**20
                 print(f"extracted {done} files ({skipped} already there), {written / 2**30:.1f} GiB, {rate:.0f} MiB/s",
                       flush=True)
+        progress(force=True)
         print("extracted", done, "files;", skipped, "were already complete")
         if a.extract_all:   # the runtime mounts the directory only once this marker is there (fs_host.c mount_rom)
             def complete(p, size):

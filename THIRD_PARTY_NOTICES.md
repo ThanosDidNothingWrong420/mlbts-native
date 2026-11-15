@@ -29,3 +29,17 @@ rows are in TotK Recomp's own `THIRD_PARTY_NOTICES.md` at the commit below, and 
 | Dear ImGui 1.91.9 (core and Vulkan back end, unmodified), as vendored by TotK Recomp | https://github.com/ocornut/imgui, via TotK Recomp `runtime/third_party/imgui/` at the same commit, Copyright (c) 2014-2025 Omar Cornut | MIT | `runtime/third_party/imgui/` (licence in `LICENSE.txt` there) |
 | Roboto Medium font (Dear ImGui's `misc/fonts/Roboto-Medium.ttf`, unmodified) | https://fonts.google.com/specimen/Roboto, via TotK Recomp `runtime/ui/fonts/` at the same commit, Copyright 2011 Google Inc. | Apache-2.0 | `runtime/gfx/ui/fonts/Roboto-Medium.ttf` (licence text in `runtime/gfx/ui/fonts/LICENSE-Roboto.txt`), embedded by `runtime/gfx/ui/menu.cpp` |
 | glslang 16.6.0 (shader compiler, used by `tools/build_shaders.py` only; not shipped) | https://github.com/KhronosGroup/glslang/releases/tag/16.6.0 | BSD-3-Clause and others | the committed `runtime/gfx/fxaa_spv.h` (compiled from our `runtime/shaders/fxaa.comp`) |
+
+## In the setup release (docs/release.md)
+
+The release zip carries these besides the repository's own code; their licence texts are in its `licenses/` folder or
+inside the bundled packages. NVIDIA's `nvngx_dlss.dll` is never bundled: the setup downloads it from NVIDIA's DLSS
+repository when the player ticks the box.
+
+| Component | Source and version | License | Used in |
+|---|---|---|---|
+| TotK Recomp setup: command line with JSON progress events, step keys and resume, the Tk window over it, the launcher exe, the release script's pinned downloads and Tcl/Tk extraction | https://github.com/valentderah/totk-pc-recomp @ v0.4.0, Copyright (c) 2026 Valiantsin Dzerakh | MIT | `installer/` (rewritten for MLB, English only), `installer/launcher/`, `tools/make_release.py` |
+| llvm-mingw 20261020 (clang, lld, mingw-w64 headers and libraries, libc++), x86_64 subset | https://github.com/mstorsjo/llvm-mingw/releases/tag/20261020 | Apache-2.0 with LLVM exception; mingw-w64: ZPL and other permissive licences | `llvm/` of the release: compiles and links `mlb.exe` on the player's PC |
+| Python 3.14.9, Windows embeddable package, and Tcl/Tk 9.0 with tkinter from the python.org installer | https://www.python.org/downloads/release/python-3149/ | PSF License; Tcl/Tk: BSD-style | `python/` of the release: runs the setup and its tools |
+| NumPy 2.5.4, lz4 4.4.5 (Python wheels) | https://pypi.org/project/numpy/, https://pypi.org/project/lz4/ | BSD-3-Clause | `python/Lib/site-packages` of the release |
+| Ninja 1.13.2 | https://github.com/ninja-build/ninja/releases/tag/v1.13.2 | Apache-2.0 | `bin/ninja.exe` of the release |

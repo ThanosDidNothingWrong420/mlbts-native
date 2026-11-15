@@ -1,0 +1,4 @@
+# Packages of the release's bundled Python 3.14.9 (tools/make_release.py): what the setup's steps import.
+# numpy: recomp/gen.py, tools/ncastorage.py, tools/swcrypto.py. lz4: recomp/nso.py, tools/ncastorage.py.
+numpy==2.5.4
+lz4==4.4.5

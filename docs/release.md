@@ -1,0 +1,112 @@
+# Releases: the setup and launcher
+
+A release is a setup, not the game. It turns the player's own game files into a playable folder on their PC, the way
+TotK Recomp, Astral Chain Recomp, Super Odyssey and Savage Wind publish theirs. **The release holds no game code,
+data or assets, and no file built from them**: no `mlb.exe`, no generated C or its objects, no shader translations.
+`mlb.exe` contains the recompiled game code, so only the player's PC ever builds it, from their files.
+
+## What the player does
+
+1. Downloads `MLBTS-Setup-<version>-windows.zip` from GitHub Releases, unpacks it anywhere and starts
+   `MLBTS-Setup.exe`.
+2. The window is already filled in when it can be: `prod.keys` from Ryujinx's or yuzu's (and forks') folder, the base
+   game and 1.0.15 update NSPs from the emulators' game folders, Downloads, Desktop, Documents, `~/Games` or the folder
+   around the setup (`installer/detect.py`), and an install folder on the disk with the most free space. They check
+   it, change what is wrong and press **Install**. Options: shortcuts (on), NVIDIA DLSS (on with an RTX card),
+   copy the Ryujinx save (on when Ryujinx has one and the install has none).
+3. Waits about 10 minutes (on the dev PC: 4 for the 37 GB of game data, 1 to lift, 3 to compile).
+4. Presses **Play**. Next time, the desktop shortcut starts the game; starting the setup again opens its launcher
+   screen (Play, Update, Repair, Import Ryujinx save, Open install folder).
+
+The base and update can be picked the wrong way round: the setup swaps them. Updating the port: download the new
+setup, start it, press **Update**. It rebuilds `mlb.exe` with the new release in a few minutes and keeps the game
+files, saves and settings; the game files are not needed again.
+
+## The install folder
+
+```
+<install folder>/
+  mlb.exe, SDL3.dll              the game, built on this PC (tools/build.py --portable: paths beside the exe)
+  totk_xlate.exe, totk_xlate.id  the shader translator
+  nvngx_dlss.dll                 NVIDIA DLSS, downloaded from NVIDIA's DLSS repository when the box is ticked
+  mlb.cfg                        settings; the setup writes MLB_SAMPLER=off (the profiler is a developer tool)
+  game/exefs/, game/romfs/       extracted from the player's NSPs (+ romfs_list.tsv, romfs_info.json, romfs.complete)
+  profile/                       saves, account
+  logs/                          mlb.log of the last run
+  shader-cache/, pipeline-cache.bin   made while playing
+  mlbts-install.json             what built the folder: release, finished steps
+```
+
+## Setup steps
+
+`python -m installer` (`installer/cli.py`, `installer/steps.py`) prints one JSON event per line; the window
+(`installer/gui.py`) runs it as a child process and draws its events. Each step records a key in
+`mlbts-install.json`; a step with the same key and its output in place is skipped, so a cancelled setup resumes and an
+update only rebuilds.
+
+1. **Check**: the setup folder is complete; the CPU has AVX2 (the game is built for x86-64-v3); a Vulkan driver is
+   installed; the NSPs are MLB The Show 26 and its 1.0.15 update (`cnmt.xml` in the NSP, else the ticket's name);
+   `prod.keys` has a `header_key`; free space (37 GB less what is already extracted, plus 2 GB; 2 GB next to the
+   setup for the build).
+2. **ExeFS**: the update's code into `game/exefs`, checked against `tools/data/expected-1.0.15.json`.
+3. **RomFS**: `tools/romfs_dump.py --extract-all --progress`: base plus update, IVFC-checked (a failure stops the
+   setup: damaged files), resumable.
+4. **Build**: `recomp/gen.py` into the setup's `temp/`, then `tools/build.py --toolchain llvm --runtime-lib
+   runtime/libmlbrt.a --portable`; `mlb.exe`, `SDL3.dll` and the translator are copied into the install folder.
+5. **Finish**: `mlb.cfg` (when missing), DLSS, shortcuts (PowerShell's `WScript.Shell`), `mlb.exe --import-save`,
+   and `temp/` deleted.
+
+Logs: `logs/setup-<time>.log` in the setup folder. The keys file's path is passed to the tools; its contents are never
+logged, stored or shown.
+
+## Why llvm-mingw
+
+The dev build targets MSVC and links Visual Studio's libraries, which may not be given to players. The release ships
+llvm-mingw (Apache-2.0 with LLVM exception; mingw-w64's permissive licences), which compiles and links on the
+player's PC with nothing installed. `tools/build.py --toolchain <llvm-mingw>` builds the same sources for
+`x86_64-w64-mingw32`; libc++, libunwind and winpthread are linked statically. Measured on the dev PC (Ryzen 5 5600X,
+RTX 3060 Ti), boot to the menus: 60 fps in both builds, same render and replay times. Only `prof_win.c` needed a change:
+llvm-mingw has no `__try`, so its two guarded unwind calls use a vectored handler there (`GUARDED`).
+
+## Release layout
+
+```
+MLBTS-Setup.exe     installer/launcher/launcher.c: starts python\pythonw.exe -m installer.gui, no console
+python/             python.org embeddable 3.14.9, numpy, lz4 (tools/requirements-release.txt), tkinter
+llvm/               llvm-mingw 20261020, x86_64 subset
+runtime/            libmlbrt.a (the runtime, built with llvm/), every runtime header, deps/ (Vulkan headers, VMA, SDL3
+                    headers, lib/vulkan-1.lib, bin/SDL3.dll)
+bin/                ninja.exe, totk_xlate.exe (+ .id)
+recomp/, tools/     the lifter; build.py, romfs_dump.py and its imports, data/expected-1.0.15.json
+installer/          the setup
+licenses/, LICENSE, THIRD_PARTY_NOTICES.md, README.txt, VERSION (VERSION plus the commit)
+```
+
+## Making a release
+
+Once per machine: `tools/fetch_deps.py`, `tools/build_xlate.py`, and `recomp/gen.py` (the runtime library reads the
+shared headers of `work/gen`, never its C). Set `VERSION`, commit, then:
+
+```
+.venv/Scripts/python -I tools/make_release.py
+```
+
+It builds from a clean export of the last commit (`git archive HEAD` into `work/release-src`): uncommitted work is
+never in a release and the working tree is left alone (`--from-worktree` builds from it instead, for tests only). It
+downloads the pinned files (TotK Recomp's pins, SHA-256 checked, cached in `work/toolchain/release-dl`), builds
+`libmlbrt.a` and `MLBTS-Setup.exe` with the release's own llvm-mingw, and refuses the folder if any file carries game
+data, the generated-code marker, key lines, or is an executable outside the tools it lists. Then the folder's own Python
+imports the setup, the window builds every screen (`--selftest`), and a setup run without game files must stop asking
+for them. The zip is `work/release/MLBTS-Setup-<version>-windows.zip`.
+
+Before publishing, install from the unpacked release folder once (the setup's full path with the real files), play a
+little and check `logs/mlb.log`. Publishing: a GitHub release with a `v<version>` tag, the zip as its asset, and notes
+that say no game files are included (`docs/release-notes-<version>.md`).
+
+## Not yet
+
+- XCI and NSZ input: `tools/romfs_dump.py` reads NSP files only.
+- A CPU without AVX2: the runtime library and the game are built for x86-64-v3 only.
+- Preparing the shaders at install: the game translates them while playing, so the first matches stutter while the
+  cache fills.
+- One language (English) in the setup window.

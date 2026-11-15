@@ -21,10 +21,23 @@ Dynasty are out of scope.
 **Known problems:** current work is graphics correctness (some wrong or missing images, lighting) and performance.
 Only version 1.0.15 is supported; do not use another version.
 
+## Playing it
+
+1. Download `MLBTS-Setup-<version>-windows.zip` from [Releases](https://github.com/sam110411/mlbts-native/releases),
+   unpack it anywhere and start **`MLBTS-Setup.exe`**.
+2. The setup looks for your game files and keys by itself (Ryujinx's and yuzu's folders, Downloads, Desktop, ...).
+   Check what it found, pick anything missing, and press **Install**.
+3. After about 10 minutes, press **Play**. From then on, use the "MLB The Show 26" shortcut.
+
+The download contains no part of the game. The setup builds the game on your PC from your own files: the base game and
+the 1.0.15 update as NSP files dumped from your Switch, and your `prod.keys`. It needs about 40 GB free. To update the
+port, start a newer setup and press **Update**; your game files, saves and settings stay. How the setup works and how a
+release is made: [docs/release.md](docs/release.md).
+
 ## Features
 
 - Native Windows executable, Vulkan 1.3 renderer. Switch shaders are translated at run time.
-- Switch saves are used as they are: a Ryujinx save can be imported with `mlb.exe --import-save`.
+- Switch saves are used as they are: a Ryujinx save can be imported (the setup offers it, or `mlb.exe --import-save`).
 - Xbox and PlayStation controllers (through SDL3) with rumble. The game's button prompts follow the controller in use.
 - Keyboard and mouse.
 - Resolution options: output size, render scale, FSR 1, and NVIDIA DLSS / DLAA (the DLSS library is downloaded
@@ -34,8 +47,8 @@ Only version 1.0.15 is supported; do not use another version.
 - Software-mixed 5.1 audio output through WASAPI.
 - Built-in diagnostics for graphics bugs: frame capture (F12), draw logs, RenderDoc support.
 
-Every setting is a `KEY=VALUE` line in `work/build/mlb.cfg` (or an environment variable named `MLB_<KEY>`). The full
-list is the table in [`runtime/mlb/cfg.c`](runtime/mlb/cfg.c).
+Every setting is a `KEY=VALUE` line in `mlb.cfg` next to `mlb.exe` (or an environment variable named `MLB_<KEY>`). The
+full list is the table in [`runtime/mlb/cfg.c`](runtime/mlb/cfg.c).
 
 ## System requirements
 
@@ -57,7 +70,9 @@ Nothing from the game is included. You need:
 
 Dumps, extracted data and builds live in `gamefiles/` and `work/`, which are git-ignored. Never commit them.
 
-## Building
+## Building from source
+
+This section is for development. To play, use the setup above.
 
 Requirements: LLVM clang with lld, Ninja and Python (a `.venv` in the repository), .NET 10 with Visual Studio 2022's
 linker (for the shader translator). Always run Python as `.venv/Scripts/python -I <script>`; `-I` keeps user

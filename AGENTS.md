@@ -34,6 +34,7 @@ Windows 11). Most current work is graphics correctness (wrong or missing images,
 | `runtime/mlb/` | MLB layer: `main.c` (log, crash reporter), `boot.c`, `cfg.c` (all settings), `services.c`, `hid.c` (input) |
 | `runtime/gfx/` | NVN front end and Vulkan back end (from TotK), present, window, RenderDoc support (`rdoc.c`) |
 | `tools/` | Build, extraction and analysis scripts (below) |
+| `installer/` | The player's setup and launcher (`MLBTS-Setup.exe`): extracts their files, builds `mlb.exe` on their PC (`docs/release.md`) |
 | `docs/` | `recon-report.md` (binary facts), `runtime-port.md` (build and boot), `graphics-plan.md` |
 | `work/` (ignored) | `gen/` generated C, `build/` exe and logs, `profile/` saves and captures, `romfs/`, `scratch/` |
 | `refs/` (ignored) | Reference checkouts: TotK Recomp (primary), Astral Chain Recomp, Power Moon Recomp |
@@ -62,6 +63,16 @@ With async replay, the NVN command replay runs on its own thread, and a recorder
 
 For edits across several files, a small script in `work/scratch/edit_*.py` using exact-match
 replace-and-assert is reliable.
+
+## Releases
+
+A release is a setup, never the game: **no `mlb.exe`, generated C, objects or anything else built from the game's code
+or data** goes into it. The player's PC extracts their own NSPs and builds `mlb.exe` with the bundled llvm-mingw and the
+prebuilt runtime library `libmlbrt.a` (`tools/build.py --toolchain ... --make-runtime-lib`, which contains no game
+code). `tools/make_release.py` builds from `git archive HEAD` (uncommitted work never ships) and refuses a folder that
+fails the content check. The dev build stays MSVC; runtime code must also compile with llvm-mingw (no `__try`, no
+MSVC-only APIs): check with `tools/build.py --toolchain work/toolchain/llvm-mingw-20261020-ucrt-x86_64 --out
+work/build-mingw`. Details: `docs/release.md`.
 
 ## Logs and crash reports
 
