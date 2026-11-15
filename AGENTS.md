@@ -12,7 +12,9 @@ Windows 11). Most current work is graphics correctness (wrong or missing images,
 - **Performance comes first.** The user notices any fps loss. Diagnostics must cost nothing during normal play: gate
   them behind F12, a cfg knob or RenderDoc. Remove test code that slows the game once it has done its job.
 - They want real fixes backed by evidence, not rounds of guesses. Trace the cause (RenderDoc, logs), then fix.
-- Commits stay local (no push). End each commit message with the `Co-Authored-By:` line the session gives.
+- Commit to `main` and push it to GitHub (`origin`, https://github.com/sam110411/mlbts-native). Commit only the
+  files of the task; the user may have uncommitted work of their own in the tree. End each commit message with the
+  `Co-Authored-By:` line the session gives.
 - Write explanations in plain language. The user is not a graphics programmer.
 
 ## Repository and asset safety (never break)
@@ -73,6 +75,12 @@ code). `tools/make_release.py` builds from `git archive HEAD` (uncommitted work 
 fails the content check. The dev build stays MSVC; runtime code must also compile with llvm-mingw (no `__try`, no
 MSVC-only APIs): check with `tools/build.py --toolchain work/toolchain/llvm-mingw-20261020-ucrt-x86_64 --out
 work/build-mingw`. Details: `docs/release.md`.
+
+Publishing a version: bump `VERSION`, write `docs/release-notes-<version>.md`, commit and push, run
+`tools/make_release.py`, then `gh release create v<version> work/release/MLBTS-Setup-<version>-windows.zip --target
+<full commit SHA> --title "MLB The Show 26 for PC <version>" --notes-file docs/release-notes-<version>.md` (a short SHA
+is refused). Players' launchers (0.1.1 and later) find the newest release through GitHub's API and update from it
+(`installer/update.py`): the asset must keep the name `MLBTS-Setup-<version>-windows.zip`.
 
 ## Logs and crash reports
 
