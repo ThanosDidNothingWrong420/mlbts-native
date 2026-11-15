@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Embedded by mlb.rc. From TotK Recomp runtime/totk.manifest @ ae30a61 (MIT).
+     activeCodePage makes UTF-8 the process code page (Windows 10 1903 and later): the narrow file functions (fopen,
+     CreateFileA) and getenv then carry UTF-8, the encoding platform/win32.c and fs_host.c convert with, so an install
+     folder or Windows user name with non-ASCII letters works (fs_host.c serves the game's fopen of its audio streams).
+     dpiAwareness PerMonitorV2: window and monitor sizes are physical pixels and the swapchain matches the screen. A
+     DPI-unaware process gets them divided by the display scale and its picture stretched back up by Windows, blurred
+     (TotK measured it: 4K at 150% presented a 2560x1440 picture). gfx_window_win.c follows a change of the window's DPI (WM_DPICHANGED). -->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>
+    </windowsSettings>
+  </application>
+</assembly>

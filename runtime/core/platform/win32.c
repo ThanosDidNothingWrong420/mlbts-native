@@ -879,6 +879,19 @@ __attribute__((constructor)) static void pgo_flush_start(void) {
 }
 #endif
 
+// mlbts-native: an installed game is a windowed program, so a fatal error that only went to stderr and the log would
+// end it without a word. Topmost, because the game's full-screen window may still cover the screen.
+void plat_fatal_notice(const char *what) {
+    static volatile LONG shown;
+    if (GetConsoleWindow() || InterlockedExchange(&shown, 1)) return;
+    char text[1200];
+    snprintf(text, sizeof text, "The game stopped because of an error:\n\n%.700s\n\nThe details are in the log file, "
+             "logs\\mlb.log next to the game. Please attach it when you report the problem.", what);
+    wchar_t w[1200];
+    if (!MultiByteToWideChar(CP_UTF8, 0, text, -1, w, 1200)) return;
+    MessageBoxW(NULL, w, L"Error", MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
+}
+
 void plat_exit(int code) {
 #ifdef TOTK_PGO_GEN
     __llvm_profile_dump();

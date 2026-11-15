@@ -41,12 +41,16 @@ static struct { uint64_t addr; GuestFn fn; } g_host[HOST_CAP];
 static uint64_t g_nhost;
 
 void rt_fatal(const char *fmt, ...) {
-    va_list ap;
+    va_list ap, again;
     va_start(ap, fmt);
+    va_copy(again, ap);
     rt_log_raw("FATAL: ", 7);
     rt_vlogf(fmt, ap);
     rt_log_raw("\n", 1);
     va_end(ap);
+    char what[800];   // mlbts-native: the same line for the player, when the game runs without a console
+    vsnprintf(what, sizeof what, fmt, again);
+    va_end(again);
     // A failed allocation (malloc, realloc, VirtualAlloc) means the commit limit was reached: this line tells a leak of
     // ours (process private bytes near the limit) from a machine short of page file.
     double proc, used, limit;
@@ -55,6 +59,7 @@ void rt_fatal(const char *fmt, ...) {
     kern_free_cores_note();
     fflush(stdout);
     fflush(stderr);
+    plat_fatal_notice(what);
     _Exit(70);
 }
 

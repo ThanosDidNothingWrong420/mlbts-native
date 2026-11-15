@@ -1,11 +1,20 @@
 """Build mlb.exe: the generated C (recomp/gen.py output) plus the host runtime, with LLVM clang + lld through Ninja.
 
     python -I tools/build.py [--gen work/gen] [--out work/build] [--clang PATH] [--jobs N] [--version 1.0.15]
+    python -I tools/build.py --toolchain <llvm-mingw> --out work/build-mingw          # the release's toolchain
+    python -I tools/build.py --toolchain <llvm-mingw> --make-runtime-lib --out DIR    # DIR/libmlbrt.a, no game code
+    python -I tools/build.py --toolchain <llvm-mingw> --runtime-lib libmlbrt.a --portable --gen G --out O   # an install
 
 Inputs: --gen holds layout.json/layout.h/patches.h and one directory per module (main, sdk) from recomp/gen.py.
 Writes --out/modules.c (layout table, linked modules, expected ExeFS hashes from tools/data/expected-<version>.json,
 default paths, version), --out/build.ninja, objects under --out/obj, and --out/mlb.exe. Everything under --out is
-derived from game code and stays out of git (work/ is ignored).
+derived from game code and stays out of git (work/ is ignored), except libmlbrt.a of --make-runtime-lib: the runtime
+alone, which the release ships (docs/release.md). It reads only the shared headers of --gen (layout.h, patches.h) and
+the button icons of tools/make_prompts.py.
+
+The default target is MSVC (LLVM clang in Program Files, Visual Studio's libraries), the dev build. --toolchain builds
+for x86_64-w64-mingw32 with llvm-mingw, whose libraries may be redistributed: the release ships it, and the setup
+compiles the player's game code with it.
 """
 import argparse
 import json
@@ -97,60 +106,110 @@ def main():
     ap.add_argument('--clang', default=os.environ.get('CLANG', DEFAULT_CLANG))
     ap.add_argument('--jobs', type=int, default=0)
     ap.add_argument('--version', default='1.0.15')
+    ap.add_argument('--toolchain', type=Path, help='an llvm-mingw folder (bin/clang.exe): build for x86_64-w64-mingw32, '
+                                                  'as the release does, instead of the MSVC target')
+    ap.add_argument('--deps', type=Path, default=DEPS, help='Vulkan, VMA and SDL3 headers, lib/vulkan-1.lib and '
+                                                           'bin/SDL3.dll (tools/fetch_deps.py)')
+    ap.add_argument('--ninja', type=Path, help='ninja.exe (default: on PATH, else beside this Python)')
+    ap.add_argument('--make-runtime-lib', action='store_true',
+                    help='build only <out>/libmlbrt.a: the runtime objects and the icon/manifest resource, no game code '
+                         '(the release ships it; docs/release.md)')
+    ap.add_argument('--runtime-lib', type=Path, help='link this prebuilt libmlbrt.a instead of compiling the runtime')
+    ap.add_argument('--portable', action='store_true', help="default paths beside mlb.exe (game/exefs, game/romfs, "
+                                                           "profile) instead of the repository's work/ folders")
     a = ap.parse_args()
+    mingw = a.toolchain is not None
+    if mingw:
+        a.clang = str(a.toolchain.resolve() / 'bin' / 'clang.exe')
+    if (a.make_runtime_lib or a.runtime_lib) and not mingw:
+        raise SystemExit('--make-runtime-lib and --runtime-lib need --toolchain (releases are built with llvm-mingw)')
+    deps = a.deps.resolve()
     gen, out = a.gen.resolve(), a.out.resolve()
     layout = json.loads((gen / 'layout.json').read_text())
     linked = [m['name'] for m in layout if (gen / m['name'] / f'{m["name"]}_table.c').exists()]
-    if not linked:
+    if not linked and not a.make_runtime_lib:
         raise SystemExit(f'no generated modules under {gen}: run recomp/gen.py first')
     expected = json.loads((ROOT / 'tools' / 'data' / f'expected-{a.version}.json').read_text())
     port_version = (ROOT / 'VERSION').read_text().strip()
-    paths = {'exefs': (ROOT / 'work' / 'update' / 'exefs').as_posix(), 'romfs': (ROOT / 'work' / 'romfs' / 'romfs').as_posix(),
-             'profile': (ROOT / 'work' / 'profile').as_posix()}
+    if a.portable:   # main.c beside_exe takes them beside mlb.exe
+        paths = {'exefs': 'game/exefs', 'romfs': 'game/romfs', 'profile': 'profile'}
+    else:
+        paths = {'exefs': (ROOT / 'work' / 'update' / 'exefs').as_posix(),
+                 'romfs': (ROOT / 'work' / 'romfs' / 'romfs').as_posix(), 'profile': (ROOT / 'work' / 'profile').as_posix()}
     out.mkdir(parents=True, exist_ok=True)
     glue = out / 'modules.c'
     text = module_glue(layout, linked, expected['exefs_sha256'], paths, port_version)
-    if not glue.exists() or glue.read_text() != text:
+    if not a.make_runtime_lib and (not glue.exists() or glue.read_text() != text):
         glue.write_text(text)
 
-    rt_srcs = sorted({p for pat in RUNTIME_SOURCES for p in ROOT.glob(pat)}) + [glue]
-    gen_srcs = sorted(p for name in linked for p in (gen / name).glob('*.c'))
-    if not (DEPS / 'lib' / 'vulkan-1.lib').is_file():
-        raise SystemExit(f'{DEPS} is missing the Vulkan headers and import library: run tools/fetch_deps.py')
-    if not (DEPS / 'include' / 'SDL3' / 'SDL.h').is_file() or not (DEPS / 'bin' / 'SDL3.dll').is_file():
-        raise SystemExit(f'{DEPS} is missing SDL3 (controllers): run tools/fetch_deps.py')
+    if a.runtime_lib:   # modules.c is per install: the layout, the linked modules, the default paths, the version
+        rt_srcs = [glue]
+    else:
+        rt_srcs = sorted({p for pat in RUNTIME_SOURCES for p in ROOT.glob(pat)})
+        if not a.make_runtime_lib:
+            rt_srcs.append(glue)
+    gen_srcs = [] if a.make_runtime_lib else sorted(p for name in linked for p in (gen / name).glob('*.c'))
+    if not (deps / 'lib' / 'vulkan-1.lib').is_file():
+        raise SystemExit(f'{deps} is missing the Vulkan headers and import library: run tools/fetch_deps.py')
+    if not (deps / 'include' / 'SDL3' / 'SDL.h').is_file() or not (deps / 'bin' / 'SDL3.dll').is_file():
+        raise SystemExit(f'{deps} is missing SDL3 (controllers): run tools/fetch_deps.py')
     # runtime/mlb/hid.c loads SDL3.dll from mlb.exe's folder at run time. A running game holds it: keep the old copy then.
-    sdl_src, sdl_dst = DEPS / 'bin' / 'SDL3.dll', out / 'SDL3.dll'
-    if not sdl_dst.is_file() or sdl_dst.read_bytes() != sdl_src.read_bytes():
+    sdl_src, sdl_dst = deps / 'bin' / 'SDL3.dll', out / 'SDL3.dll'
+    if not a.make_runtime_lib and (not sdl_dst.is_file() or sdl_dst.read_bytes() != sdl_src.read_bytes()):
         try:
             shutil.copyfile(sdl_src, sdl_dst)
         except OSError as e:
             print(f'warning: {sdl_dst} not updated ({e})')
     # runtime/mlb/prompts.c: the Xbox and PlayStation button icons, drawn and compressed by tools/make_prompts.py (about
-    # half a minute), again only when that script changed
+    # half a minute), again only when that script changed. A prebuilt runtime library holds them already.
     icons, icon_tool = gen / 'prompt_icons.h', ROOT / 'tools' / 'make_prompts.py'
-    if not icons.is_file() or icons.stat().st_mtime < icon_tool.stat().st_mtime:
+    if not a.runtime_lib and (not icons.is_file() or icons.stat().st_mtime < icon_tool.stat().st_mtime):
         if subprocess.run([sys.executable, '-I', str(icon_tool), '--out', str(icons)], cwd=ROOT).returncode:
             raise SystemExit('tools/make_prompts.py failed')
-    inc_rt = ['-I', 'runtime/mlb', '-I', 'runtime/core', '-I', 'runtime/gfx', '-I', rel(gen), '-I', rel(DEPS / 'include'),
-              '-I', rel(DEPS / 'include' / 'vma'), '-I', 'runtime/third_party/imgui']
+    inc_rt = ['-I', 'runtime/mlb', '-I', 'runtime/core', '-I', 'runtime/gfx', '-I', rel(gen), '-I', rel(deps / 'include'),
+              '-I', rel(deps / 'include' / 'vma'), '-I', 'runtime/third_party/imgui']
     inc_gen = ['-I', 'runtime/core', '-I', rel(gen)]
-    for d in (rel(gen), rel(out)):
+    for d in (rel(gen), rel(out), rel(deps)):
         if ' ' in d:
-            raise SystemExit(f'{d}: keep --gen and --out inside the repository, without spaces')
+            raise SystemExit(f'{d}: keep --gen, --out and --deps inside the repository (or the release folder), '
+                             'without spaces')
     exe = out / 'mlb.exe'
+    bin_dir = Path(a.clang).parent
+    rt_flags, cxx_flags = list(RT_FLAGS), list(CXX_FLAGS)
+    vulkan = rel(deps / 'lib' / 'vulkan-1.lib')
+    if mingw:
+        # llvm-mingw: Windows 10 API level (its headers default lower); libc++, libunwind and winpthread linked
+        # statically (-static), so mlb.exe needs only the system DLLs and the UCRT. A prebuilt runtime library is linked
+        # whole: the game code alone references little of it (not main(), not the resources).
+        rt_flags.append('-D_WIN32_WINNT=0x0A00')
+        cxx_flags.append('-D_WIN32_WINNT=0x0A00')
+        whole = f'-Wl,--whole-archive {rel(a.runtime_lib)} -Wl,--no-whole-archive ' if a.runtime_lib else ''
+        # an installed game is a windowed program: no console window of log lines beside it (the log file stays;
+        # plat_fatal_notice shows a fatal error in a message box instead)
+        whole += '-mwindows ' if a.portable else ''
+        link = (f'"{(bin_dir / "clang++.exe").as_posix()}" -fuse-ld=lld -g -static @$out.rsp {whole}-o $out '
+                f'{" ".join("-l" + l for l in LIBS)} {vulkan} -Wl,--stack,8388608 -Wl,-Map={rel(out)}/mlb.map')
+        rc = f'"{(bin_dir / "llvm-windres.exe").as_posix()}" -I runtime/mlb -O coff $in -o $out'
+    else:
+        link = (f'$cc -fuse-ld=lld -g @$out.rsp -o $out {" ".join("-l" + l for l in LIBS)} '
+                f'"{compiler_rt(a.clang)}" {vulkan} '
+                f'-Wl,/STACK:8388608 -Wl,/errorlimit:0 -Wl,/MAP:{rel(out)}/mlb.map')
+        rc = f'"{(bin_dir / "llvm-rc.exe").as_posix()}" /nologo /I runtime/mlb /FO $out $in'
+    ar = f'"{(bin_dir / "llvm-ar.exe").as_posix()}"'
     lines = [f'# {GENERATED_MARKER}: written by tools/build.py', f'builddir = {rel(out)}', f'cc = "{Path(a.clang).as_posix()}"',
              f'genflags = {" ".join(GEN_FLAGS)} {" ".join(inc_gen)}',
-             f'rtflags = {" ".join(RT_FLAGS)} {" ".join(inc_rt)}',
+             f'rtflags = {" ".join(rt_flags)} {" ".join(inc_rt)}',
              'rule cc_gen', '  command = $cc $genflags -c $in -o $out', '  description = CC $in',
              'rule cc_rt', '  command = $cc $rtflags -MD -MF $out.d -c $in -o $out', '  depfile = $out.d',
              '  deps = gcc', '  description = CC $in',
-             f'cxxflags = {" ".join(CXX_FLAGS)} {" ".join(inc_rt)}',
+             f'cxxflags = {" ".join(cxx_flags)} {" ".join(inc_rt)}',
              'rule cxx_rt', '  command = $cc -x c++ $cxxflags -MD -MF $out.d -c $in -o $out', '  depfile = $out.d',
              '  deps = gcc', '  description = CXX $in',
-             'rule link', f'  command = $cc -fuse-ld=lld -g @$out.rsp -o $out {" ".join("-l" + l for l in LIBS)} '
-                          f'"{compiler_rt(a.clang)}" {rel(DEPS / "lib" / "vulkan-1.lib")} '
-                          f'-Wl,/STACK:8388608 -Wl,/errorlimit:0 -Wl,/MAP:{rel(out)}/mlb.map', '  rspfile = $out.rsp', '  rspfile_content = $in',
+             'rule rc', f'  command = {rc}', '  description = RC $in',
+             # a fresh archive each time, so a removed source leaves no stale member
+             'rule ar', f'  command = cmd /c del /q "$out" 2>nul & {ar} rcs $out @$out.rsp', '  rspfile = $out.rsp',
+             '  rspfile_content = $in', '  description = AR $out',
+             'rule link', f'  command = {link}', '  rspfile = $out.rsp', '  rspfile_content = $in',
              '  description = LINK $out', '']
     objs = []
     for s in rt_srcs:
@@ -158,15 +217,25 @@ def main():
         o = out / "obj" / "rt" / sub.with_suffix(".o")
         lines.append(f'build {ninja_path(o)}: {"cxx_rt" if s.suffix == ".cpp" else "cc_rt"} {ninja_path(s)}')
         objs.append(o)
+    if not a.runtime_lib:   # the icon and the manifest (runtime/mlb/mlb.rc); a prebuilt library holds them
+        res = out / 'obj' / 'rt' / ('mlb.res.o' if mingw else 'mlb.res')
+        lines.append(f'build {ninja_path(res)}: rc runtime/mlb/mlb.rc | runtime/mlb/mlb.manifest runtime/mlb/mlb.ico')
+        objs.append(res)
     for s in gen_srcs:
         o = out / 'obj' / 'gen' / s.parent.name / (s.stem + '.o')
         lines.append(f'build {ninja_path(o)}: cc_gen {ninja_path(s)}')
         objs.append(o)
-    lines.append(f'build {ninja_path(exe)}: link {" ".join(ninja_path(o) for o in objs)}')
-    lines.append(f'default {ninja_path(exe)}')
+    if a.make_runtime_lib:
+        target = out / 'libmlbrt.a'
+        lines.append(f'build {ninja_path(target)}: ar {" ".join(ninja_path(o) for o in objs)}')
+    else:
+        target = exe
+        implicit = f' | {ninja_path(a.runtime_lib)}' if a.runtime_lib else ''
+        lines.append(f'build {ninja_path(exe)}: link {" ".join(ninja_path(o) for o in objs)}{implicit}')
+    lines.append(f'default {ninja_path(target)}')
     nf = out / 'build.ninja'
     nf.write_text('\n'.join(lines) + '\n')
-    ninja = shutil.which('ninja') or str(Path(sys.executable).parent / 'ninja.exe')
+    ninja = str(a.ninja) if a.ninja else shutil.which('ninja') or str(Path(sys.executable).parent / 'ninja.exe')
     cmd = [ninja, '-f', rel(nf), '-k', '0'] + (['-j', str(a.jobs)] if a.jobs else [])   # every failure, not the first
     sys.exit(subprocess.run(cmd, cwd=ROOT).returncode)
 

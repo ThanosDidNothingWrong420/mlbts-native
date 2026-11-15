@@ -4,8 +4,9 @@
 // resolution hooks and the graphics modes.
 //
 // mlb.exe [--exefs DIR] [--romfs DIR] [--profile DIR] [--boot | --probe-fs]
-// Without arguments the paths come from MLB_EXEFS / MLB_ROMFS / MLB_PROFILE, else work/update/exefs, work/romfs/romfs
-// and work/profile under the current directory.
+// Without arguments the paths come from MLB_EXEFS / MLB_ROMFS / MLB_PROFILE, else the defaults tools/build.py bakes in:
+// the repository's work/update/exefs, work/romfs/romfs and work/profile for a dev build, game/exefs, game/romfs and
+// profile beside mlb.exe for an installed one (--portable, docs/release.md).
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -325,6 +326,10 @@ static void crash_handler(const PlatCrash *x) {
         rt_logf("  not on a guest thread\n");
     }
     fflush(stderr);
+    char what[200];   // an installed (windowed) game tells the player; the log has the frames
+    snprintf(what, sizeof what, "%s (%#x) at %s+%#llx", x->what, x->code, x->module && *x->module ? x->module : "mlb",
+             (unsigned long long)x->offset);
+    plat_fatal_notice(what);
     plat_exit(71);
 }
 
@@ -332,6 +337,21 @@ static int usage(const char *argv0) {
     fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--boot | --probe-fs | --import-save "
             "[ryujinx | FOLDER]]\n", argv0);
     return 2;
+}
+
+// A relative default path (an installed folder: tools/build.py --portable bakes game/exefs, game/romfs and profile) is
+// taken beside mlb.exe, so the folder works wherever the player put it and whatever the working directory.
+static const char *beside_exe(const char *p) {
+    static char bufs[3][PLAT_PATH_MAX];
+    static int used;
+    char exe[PLAT_PATH_MAX];
+    if (!p[0] || p[0] == '/' || p[0] == '\\' || p[1] == ':' || used == 3 || !plat_exe_path(exe, sizeof exe)) return p;
+    char *cut = plat_last_sep(exe);
+    if (!cut) return p;
+    *cut = 0;
+    char *b = bufs[used++];
+    snprintf(b, sizeof bufs[0], "%s/%s", exe, p);
+    return b;
 }
 
 int main(int argc, char **argv) {
@@ -349,9 +369,9 @@ int main(int argc, char **argv) {
     // defaults in the table)
     parse_trace();
     parse_fntrace();
-    cfg = (RtConfig){.exefs = cfg_get("MLB_EXEFS") ? cfg_get("MLB_EXEFS") : rt_default_exefs,
-                     .romfs = cfg_get("MLB_ROMFS") ? cfg_get("MLB_ROMFS") : rt_default_romfs,
-                     .profile = cfg_get("MLB_PROFILE") ? cfg_get("MLB_PROFILE") : rt_default_profile,
+    cfg = (RtConfig){.exefs = cfg_get("MLB_EXEFS") ? cfg_get("MLB_EXEFS") : beside_exe(rt_default_exefs),
+                     .romfs = cfg_get("MLB_ROMFS") ? cfg_get("MLB_ROMFS") : beside_exe(rt_default_romfs),
+                     .profile = cfg_get("MLB_PROFILE") ? cfg_get("MLB_PROFILE") : beside_exe(rt_default_profile),
                      .gpu = cfg_value("MLB_GPU")};
     int probe = 0, import = 0;
     const char *import_from = NULL;

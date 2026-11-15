@@ -106,6 +106,38 @@ static void count_stack(const uint64_t *rip, uint32_t depth) {
     stacks_dropped++;
 }
 
+// GUARDED(stmt, failed): runs stmt and sets failed when it faults, for the two unwind calls below that read memory
+// another thread may be changing.
+#ifdef _MSC_VER
+#define GUARDED(stmt, failed) __try { stmt; } __except (EXCEPTION_EXECUTE_HANDLER) { failed = 1; }
+#else
+// mlbts-native: llvm-mingw (the release toolchain, docs/release.md) has no __try. A vectored handler, first in the
+// chain, takes a fault of the sampler thread while it is inside a guarded call and resumes at the context captured
+// before the call, which then reads guard_fault set. Only the sampler thread arms it, only with MLB_SAMPLER.
+static CONTEXT guard_ctx;
+static volatile DWORD guard_tid;      // the sampler thread while a guarded call runs, else 0
+static volatile int guard_fault;
+
+static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
+    if (!guard_tid || guard_tid != GetCurrentThreadId()) return EXCEPTION_CONTINUE_SEARCH;
+    guard_tid = 0;
+    guard_fault = 1;
+    DWORD flags = ep->ContextRecord->ContextFlags;
+    memcpy(ep->ContextRecord, &guard_ctx, sizeof guard_ctx);
+    ep->ContextRecord->ContextFlags = guard_ctx.ContextFlags & flags;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+#define GUARDED(stmt, failed) do { \
+        static int added; \
+        if (!added) added = AddVectoredExceptionHandler(1, guard_veh) != NULL; \
+        guard_fault = 0; \
+        RtlCaptureContext(&guard_ctx); \
+        if (!guard_fault) { guard_tid = GetCurrentThreadId(); stmt; guard_tid = 0; } \
+        else failed = 1; \
+    } while (0)
+#endif
+
 // Unwinds the stack copied to stk_buf from real address lo (n bytes). Registers that point into the copied range are
 // moved into the copy, so frame-pointer frames read the copy too. Returns the number of frames.
 static uint32_t unwind_copy(CONTEXT *c, uintptr_t lo, size_t n, uint64_t *rip) {
@@ -118,7 +150,12 @@ static uint32_t unwind_copy(CONTEXT *c, uintptr_t lo, size_t n, uint64_t *rip) {
     while (d < PROF_DEPTH && c->Rip && c->Rsp >= buf && c->Rsp + 8 <= end) {
         rip[d++] = c->Rip;
         DWORD64 base;
-        PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(c->Rip, &base, NULL);
+        // mlbts-native: the lookup faults too when the return address is in a module being unloaded at that moment
+        // (startup, while the DLSS and driver DLLs load and unload: reading 0x7ffe03890a38 in ntdll ended two runs)
+        PRUNTIME_FUNCTION volatile f = NULL;
+        volatile int gone = 0;
+        GUARDED(f = RtlLookupFunctionEntry(c->Rip, &base, NULL), gone);
+        if (gone) break;
         if (f) {
             void *hd;
             DWORD64 est;
@@ -126,12 +163,8 @@ static uint32_t unwind_copy(CONTEXT *c, uintptr_t lo, size_t n, uint64_t *rip) {
             // suspended thread held for something else); that fault, in ntdll, ended the game in an RTTS cutscene
             // (reading 0x898). The chain ends at that frame instead. The fault is raised inside the call, which clang's
             // SEH catches without -fasync-exceptions; crash_veh leaves faults outside this executable alone.
-            int bad = 0;
-            __try {
-                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c->Rip, f, c, &hd, &est, NULL);
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                bad = 1;
-            }
+            volatile int bad = 0;
+            GUARDED(RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c->Rip, f, c, &hd, &est, NULL), bad);
             if (bad) break;
         } else {   // a leaf function: the return address is on top
             c->Rip = *(DWORD64 *)c->Rsp;
