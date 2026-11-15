@@ -32,7 +32,7 @@ def main(argv=None):
     ap = Parser(prog='python -m installer', description=__doc__.splitlines()[0])
     ap.add_argument('--dest', type=Path, required=True, help='install folder')
     ap.add_argument('--base', type=Path, help='the base game NSP')
-    ap.add_argument('--update', type=Path, help='the 1.0.15 update NSP')
+    ap.add_argument('--update', type=Path, help='the update NSP: 1.0.20 or 1.0.15')
     ap.add_argument('--keys', type=Path, help='prod.keys')
     ap.add_argument('--titlekeys', type=Path, help='title.keys (only when the NSPs lack their tickets)')
     ap.add_argument('--root', type=Path, help='the setup folder or a repository (default: the folder above installer/)')

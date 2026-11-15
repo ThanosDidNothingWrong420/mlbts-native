@@ -330,7 +330,8 @@ static void application_functions(IpcSession *s, const IpcRequest *rq, IpcRespon
     }
     case 22: note(s, rq, "(terminate result)"); return;   // SetTerminateResult(u32)
     case 23: {   // GetDisplayVersion -> char[0x10]: the update's NACP display version
-        char v[0x10] = "1.0.15";
+        char v[0x10] = {0};
+        snprintf(v, sizeof v, "%s", rt_game_build);
         IPC_OUT(rs, v);
         return;
     }

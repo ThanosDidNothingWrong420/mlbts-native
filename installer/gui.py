@@ -179,7 +179,7 @@ class App:
     def show_form(self):
         b = self.screen()
         ttk.Label(b, text='This setup builds the game on your PC from your own game files. No game files are included '
-                          'in this download: you need MLB The Show 26 and its 1.0.15 update as NSP files dumped from '
+                          'in this download: you need MLB The Show 26 and its 1.0.20 (or 1.0.15) update as NSP files dumped from '
                           'your Switch, and your Switch\'s prod.keys.', wraplength=700, style='Muted.TLabel').pack(
             anchor='w', pady=(0, 12))
         grid = ttk.Frame(b)
@@ -189,7 +189,7 @@ class App:
         self.vars = {k: tk.StringVar(value=s.get(k, '')) for k in ('base', 'update', 'keys', 'dest')}
         self.notes = {}
         rows = [('base', 'Base game (NSP)', [('NSP files', '*.nsp')]),
-                ('update', 'Update 1.0.15 (NSP)', [('NSP files', '*.nsp')]),
+                ('update', 'Update 1.0.20 (NSP)', [('NSP files', '*.nsp')]),
                 ('keys', 'Keys (prod.keys)', [('Keys', '*.keys'), ('All files', '*.*')]),
                 ('dest', 'Install folder', None)]
         for i, (key, label, types) in enumerate(rows):
@@ -301,10 +301,13 @@ class App:
             note.configure(text='Not MLB The Show 26', style='Bad.TLabel')
         elif info['kind'] != key:
             note.configure(text=f'This is the {info["kind"]} file; the setup will use it as such', style='Muted.TLabel')
-        elif key == 'update' and info['version'] not in (None, detect.UPDATE_VERSION):
-            note.configure(text=f'Update version {info["version"]}: the port needs 1.0.15 (983040)', style='Bad.TLabel')
+        elif key == 'update' and info['version'] not in (None, *detect.UPDATE_VERSIONS):
+            note.configure(text=f'Update version {info["version"]}: the port needs 1.0.20 (1310720) or 1.0.15 (983040)',
+                           style='Bad.TLabel')
         elif str(note.cget('style')) != 'Ok.TLabel':
-            note.configure(text='MLB The Show 26' + (' 1.0.15 update' if key == 'update' else ''), style='Ok.TLabel')
+            v = detect.UPDATE_VERSIONS.get(info['version'])
+            note.configure(text='MLB The Show 26' + ((f' {v} update' if v else ' update') if key == 'update' else ''),
+                           style='Ok.TLabel')
 
     def browse(self, key, types):
         cur = self.vars[key].get()

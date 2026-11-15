@@ -20,7 +20,7 @@
 ## Checklist
 
 - [ ] PR title uses Conventional Commits (`feat:`, `fix:`, `perf:`, `docs:`, `refactor:`, `chore:`)
-- [ ] Targets Switch version **1.0.15** and offline scope only
+- [ ] Works on Switch versions **1.0.20** and **1.0.15**, offline scope only
 - [ ] No copyrighted game files, extracted assets, keys, or `work/` / `gamefiles/` artifacts included
 - [ ] `runtime/core/` remains generic (MLB-specific code stays in `runtime/mlb/`)
 - [ ] Changes to vendored files (`runtime/core/`, `runtime/gfx/`) are marked `mlbts-native` with a comment explaining the observed case

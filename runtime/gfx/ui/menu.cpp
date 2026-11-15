@@ -36,7 +36,7 @@ extern "C" {
 void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void vk_queue_lock(void);
 void vk_queue_unlock(void);
-extern const char rt_port_version[];
+extern const char rt_port_version[], rt_game_build[];   // host.h (modules.c)
 int hid_menu_pad(uint64_t *buttons, int32_t *lx, int32_t *ly);   // mlb/hid.c
 int vk_aa_status(void);                                          // vk_aa.c
 int mlb_capture_tick(uint64_t frame, const char **shot);         // gfx_stubs.c: F12 / MLB_SHOT captures
@@ -825,7 +825,7 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
                                         ImGuiWindowFlags_NoSavedSettings);
     ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "Settings");
     char version[96];   // right-aligned on the title line
-    snprintf(version, sizeof version, "MLB The Show 26 native %s, game 1.0.15", rt_port_version);
+    snprintf(version, sizeof version, "MLB The Show 26 native %s, game %s", rt_port_version, rt_game_build);
     ImGui::SameLine(ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x - ImGui::CalcTextSize(version).x);
     ImGui::TextDisabled("%s", version);
 
@@ -1052,7 +1052,7 @@ static void perf_full_draw(const MenuTarget *t, float scale) {
     ImGui::SetWindowFontScale(0.72f);
     const ImVec4 gpu_c(0.55f, 0.83f, 0.31f, 1), cpu_c(0.18f, 0.59f, 0.80f, 1), ram_c(0.80f, 0.45f, 0.70f, 1),
         fps_c(0.95f, 0.95f, 0.95f, 1), wait_c(0.93f, 0.76f, 0.33f, 1), pic_c(0.62f, 0.70f, 0.95f, 1);
-    ImGui::TextDisabled("MLB The Show 26 native %s, game 1.0.15", rt_port_version);
+    ImGui::TextDisabled("MLB The Show 26 native %s, game %s", rt_port_version, rt_game_build);
     if (ImGui::BeginTable("##perft", 4, ImGuiTableFlags_SizingFixedFit)) {
         static const char *const labels[] = {"GPU", "VRAM", "CPU", "RAM", "FPS", "Frame"};
         static const PerfCol c1[] = {{"%.0f%%", 100}, {"%.1f GB", 888.8f}, {"%.0f", 888}, {"%.1f ms", 888.8f}};

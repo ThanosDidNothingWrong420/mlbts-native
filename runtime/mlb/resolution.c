@@ -9,6 +9,8 @@
 // and f_70005a4634 resizes the scene's render targets (f_70005a4b88: colour, depth and a third target, all 1440x810
 // on the TV) to it. Docked, the game picks level 3, 1440x810: 75 % of the output on each side. Its output size comes
 // from a second table at 0x7001d81890 (1280x720 handheld, 1920x1080 docked), left alone here.
+// 1.0.20 moved them (tools/addrmap.py, checked in the disassembly): f_70005a5388 loads the table's address from
+// 0x7002284df0, and the table sits at 0x7001d82910.
 //
 // MLB_RENDER_SCALE = "game" (default: the table as shipped) or a percentage of the 1920x1080 output. Every entry is
 // scaled by that percentage over the game's 75 %, so the level the game picks keeps its place (100: 1920x1080, 150:
@@ -25,7 +27,9 @@
 #include "host.h"
 #include "platform/platform.h"
 
-#define SCENE_TABLE_PTR 0x7002283d80ull   // main: the address f_70005a5368 loads the table's address from
+// main: the address the scene size function loads the table's address from, per game version
+static const struct { const char *build; uint64_t ptr; } table_ptrs[] = {{"1.0.15", 0x7002283d80ull},
+                                                                         {"1.0.20", 0x7002284df0ull}};
 #define SCENE_LEVELS 5
 #define GAME_PCT 75.0                     // the docked level's share of the 1920x1080 output, per side
 #define SCENE_MAX 4096                    // per side
@@ -73,9 +77,16 @@ void res_apply(void) {
         rt_log("res: MLB_RENDER_SCALE=%s is not \"game\" or a percentage from 25 to 300; the game's own sizes stay", v);
         return;
     }
-    uint32_t *t = (uint32_t *)(uintptr_t)*(const uint64_t *)(uintptr_t)SCENE_TABLE_PTR;
+    uint64_t ptr = 0;
+    for (size_t i = 0; i < sizeof table_ptrs / sizeof table_ptrs[0]; i++)
+        if (!strcmp(rt_game_build, table_ptrs[i].build)) ptr = table_ptrs[i].ptr;
+    if (!ptr) {
+        rt_log("res: no scene size table known for game %s; MLB_RENDER_SCALE is ignored", rt_game_build);
+        return;
+    }
+    uint32_t *t = (uint32_t *)(uintptr_t)*(const uint64_t *)(uintptr_t)ptr;
     if (memcmp(t, shipped, sizeof shipped)) {
-        rt_log("res: the scene size table at %p is not 1.0.15's; MLB_RENDER_SCALE is ignored", (void *)t);
+        rt_log("res: the scene size table at %p is not the shipped one; MLB_RENDER_SCALE is ignored", (void *)t);
         return;
     }
     uint64_t page = (uint64_t)(uintptr_t)t & ~0xfffull, n = ((uint64_t)(uintptr_t)(t + 2 * SCENE_LEVELS) - page + 0xfff) & ~0xfffull;

@@ -11,7 +11,8 @@ How `mlb.exe` is built from the game's code and TotK Recomp's runtime, and how f
 | `runtime/mlb/` | MLB layer: `main.c` (log, crash reporter, runtime services of the generated code), `boot.c` (rtld replacement, `nn::init::Start`, NPDM service list), `cfg.c` (environment settings), `services.c` (service table; lm, apm, ectx:aw, pctl), `am.c` (appletOE), `aoc.c` (aoc:u), `time.c` (time:u), `game.c` (NACP figures for fs), `account.c` (local user id), `stubs.c` (named stubs) | ours (main/boot/cfg adapted from TotK, attributed in headers) |
 | `runtime/gfx/` | TotK's graphics stack: NVN front end, Vulkan back end, present and Win32 window, shader client (docs/graphics-plan.md); `gfx_stubs.c` switches off the TotK-only features; `nvn_api_more.c` has NVN procs TotK never implemented | TotK Recomp `ae30a61`; changes marked `mlbts-native` |
 | `tools/build.py` | Writes `work/build/modules.c` and `build.ninja`, compiles with LLVM clang, links `work/build/mlb.exe` with lld | ours |
-| `tools/data/expected-1.0.15.json` | ExeFS hashes the loader checks | ours |
+| `tools/data/expected-<version>.json` | per game version (1.0.15, 1.0.20): ExeFS hashes the loader checks, main's image size, RomFS size | ours |
+| `tools/addrmap.py` | finds a 1.0.15 address of `main` in 1.0.20 (masked instruction or data match) | ours |
 
 The generic/game split follows AGENTS.md: `runtime/core` holds nothing MLB-specific, and `runtime/mlb` holds nothing
 that another title couldn't replace.
@@ -65,7 +66,12 @@ that another title couldn't replace.
 work/build/mlb.exe
 ```
 
-The game's RomFS must be extracted first (37.4 GB, 84,634 files; about 3.5 minutes at 190 MiB/s). Extraction is
+`tools/build.py` takes the game version from the SHA-256 of `work/update/exefs/main` (or `--exefs DIR`) and stops
+when `work/gen` was generated from another version's `main`. The dev tree runs 1.0.20; 1.0.15's files are in
+`work/update-1.0.15` and `work/romfs-1.0.15` (AGENTS.md, "Game versions").
+
+The game's RomFS must be extracted first (1.0.20: 37.9 GB, 86,235 files; 1.0.15: 37.4 GB, 84,634 files; about 3.5
+minutes at 150-190 MiB/s). Extraction is
 resumable, and it writes `work/romfs/romfs.complete` only once every listed file is there at its size; `MountRom`
 refuses to start without that marker:
 
@@ -119,7 +125,7 @@ The first fetches the pinned Vulkan headers, VMA and SDL 3.4.18 (headers and `SD
 `mlb.exe`. The second builds the shader translator `work/xlate/totk_xlate.exe` with .NET 10 NativeAOT; it needs VS 2022's
 linker. `tools/shader_smoke.py` translates a sample of MLB's FXB shaders offline: 66 of 66 translate.
 
-## Boot progress (1.0.15)
+## Boot progress (1.0.15; 1.0.20 boots the same way)
 
 1. `mem_init` reserves the guest address space; the loader verifies the ExeFS hashes and maps `main`
    (0x7000000000) and `sdk` (0x7004c00000). It applies 122,737 + 33,849 relocations and binds `main`'s 765

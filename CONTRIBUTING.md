@@ -1,10 +1,11 @@
 # Contributing to mlbts-native
 
-Thank you for your interest in contributing to the native Windows port of **MLB The Show 26** (Nintendo Switch, version **1.0.15**).
+Thank you for your interest in contributing to the native Windows port of **MLB The Show 26** (Nintendo Switch, version **1.0.20**; 1.0.15 is still supported).
 
 ## Scope
 
-- **Supported version:** Only Switch version **1.0.15** is supported. Do not target or switch to other versions.
+- **Supported versions:** Switch versions **1.0.20** (primary) and **1.0.15**. A change that touches game addresses
+  must work on both (`tools/addrmap.py` finds a 1.0.15 address in 1.0.20). Do not target other versions.
 - **Playable scope:** Offline play only (Exhibition, Road to the Show, Franchise, menus, and local saves). Online play and Diamond Dynasty are out of scope.
 - **Current focus:** Graphics correctness (missing/wrong images, lighting) and performance.
 

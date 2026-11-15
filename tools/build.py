@@ -1,6 +1,6 @@
 """Build mlb.exe: the generated C (recomp/gen.py output) plus the host runtime, with LLVM clang + lld through Ninja.
 
-    python -I tools/build.py [--gen work/gen] [--out work/build] [--clang PATH] [--jobs N] [--version 1.0.15]
+    python -I tools/build.py [--gen work/gen] [--out work/build] [--clang PATH] [--jobs N] [--exefs DIR] [--version auto|1.0.20]
     python -I tools/build.py --toolchain <llvm-mingw> --out work/build-mingw          # the release's toolchain
     python -I tools/build.py --toolchain <llvm-mingw> --make-runtime-lib --out DIR    # DIR/libmlbrt.a, no game code
     python -I tools/build.py --toolchain <llvm-mingw> --runtime-lib libmlbrt.a --portable --gen G --out O   # an install
@@ -12,11 +12,16 @@ derived from game code and stays out of git (work/ is ignored), except libmlbrt.
 alone, which the release ships (docs/release.md). It reads only the shared headers of --gen (layout.h, patches.h) and
 the button icons of tools/make_prompts.py.
 
+Game versions: each supported one has tools/data/expected-<version>.json (1.0.15, 1.0.20). --version auto (the default)
+takes the one whose main has the SHA-256 of --exefs/main (default: the dev ExeFS, work/update/exefs) and checks that
+--gen was generated from that main (its image size), so an exe never pairs one version's code with another's checks.
+
 The default target is MSVC (LLVM clang in Program Files, Visual Studio's libraries), the dev build. --toolchain builds
 for x86_64-w64-mingw32 with llvm-mingw, whose libraries may be redistributed: the release ships it, and the setup
 compiles the player's game code with it.
 """
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -50,7 +55,29 @@ def c_string(s):
     return '"' + s.replace('\\', '\\\\').replace('"', '\\"') + '"'
 
 
-def module_glue(layout, linked, hashes, paths, version):
+def game_version(want, exefs, layout):
+    """The expected-<version>.json for --version (auto: the one matching exefs/main), checked against --gen's main."""
+    data = ROOT / 'tools' / 'data'
+    if want != 'auto':
+        e = json.loads((data / f'expected-{want}.json').read_text())
+    else:
+        main = exefs / 'main'
+        if not main.is_file():
+            raise SystemExit(f'{main} is missing: pass --exefs (the ExeFS recomp/gen.py read) or --version')
+        h = hashlib.sha256(main.read_bytes()).hexdigest()
+        e = next((j for p in sorted(data.glob('expected-*.json')) for j in [json.loads(p.read_text())]
+                  if j['exefs_sha256']['main'] == h), None)
+        if e is None:
+            known = ', '.join(p.stem[9:] for p in sorted(data.glob('expected-*.json')))
+            raise SystemExit(f'{main} is not the code of a supported game version ({known})')
+    size = next((int(m['size'], 16) for m in layout if m['name'] == 'main'), None)
+    if size is not None and size != int(e['main_image_size'], 16):
+        raise SystemExit(f'--gen holds main of another game version ({size:#x} bytes, {e["display_version"]} has '
+                         f'{e["main_image_size"]}): run recomp/gen.py on the {e["display_version"]} ExeFS again')
+    return e
+
+
+def module_glue(layout, linked, hashes, paths, version, game):
     """modules.c: the layout table, the linked modules' function tables (dispatch.h), expected ExeFS hashes, the
     default game paths and the version strings (host.h). After TotK Recomp tools/build_game.py module_glue."""
     out = [f'// Module glue written by tools/build.py; do not edit. {GENERATED_MARKER}',
@@ -76,7 +103,8 @@ def module_glue(layout, linked, hashes, paths, version):
     for name in ('exefs', 'romfs', 'profile'):
         out.append(f'const char rt_default_{name}[] = {c_string(paths[name])};')
     out += ['// 0: not a TotK build. Only TotK self-test probes (loader.c, ipc.c) read it.',
-            'const int rt_game_version = 0;', f'const char rt_port_version[] = {c_string(version)};', '']
+            'const int rt_game_version = 0;', f'const char rt_port_version[] = {c_string(version)};',
+            f'const char rt_game_build[] = {c_string(game)};', '']
     return '\n'.join(out)
 
 
@@ -105,7 +133,10 @@ def main():
     ap.add_argument('--out', type=Path, default=ROOT / 'work' / 'build')
     ap.add_argument('--clang', default=os.environ.get('CLANG', DEFAULT_CLANG))
     ap.add_argument('--jobs', type=int, default=0)
-    ap.add_argument('--version', default='1.0.15')
+    ap.add_argument('--version', default='auto', help='the game version (tools/data/expected-<version>.json); auto: '
+                                                       'the one whose main is --exefs/main')
+    ap.add_argument('--exefs', type=Path, help='the ExeFS --gen was generated from, for --version auto (default: '
+                                               'work/update/exefs)')
     ap.add_argument('--toolchain', type=Path, help='an llvm-mingw folder (bin/clang.exe): build for x86_64-w64-mingw32, '
                                                   'as the release does, instead of the MSVC target')
     ap.add_argument('--deps', type=Path, default=DEPS, help='Vulkan, VMA and SDL3 headers, lib/vulkan-1.lib and '
@@ -129,7 +160,9 @@ def main():
     linked = [m['name'] for m in layout if (gen / m['name'] / f'{m["name"]}_table.c').exists()]
     if not linked and not a.make_runtime_lib:
         raise SystemExit(f'no generated modules under {gen}: run recomp/gen.py first')
-    expected = json.loads((ROOT / 'tools' / 'data' / f'expected-{a.version}.json').read_text())
+    # the runtime library holds no game code and no version (modules.c, written per install, has it)
+    expected = (json.loads((ROOT / 'tools' / 'data' / 'expected-1.0.20.json').read_text()) if a.make_runtime_lib else
+                game_version(a.version, (a.exefs or ROOT / 'work' / 'update' / 'exefs').resolve(), layout))
     port_version = (ROOT / 'VERSION').read_text().strip()
     if a.portable:   # main.c beside_exe takes them beside mlb.exe
         paths = {'exefs': 'game/exefs', 'romfs': 'game/romfs', 'profile': 'profile'}
@@ -138,7 +171,7 @@ def main():
                  'romfs': (ROOT / 'work' / 'romfs' / 'romfs').as_posix(), 'profile': (ROOT / 'work' / 'profile').as_posix()}
     out.mkdir(parents=True, exist_ok=True)
     glue = out / 'modules.c'
-    text = module_glue(layout, linked, expected['exefs_sha256'], paths, port_version)
+    text = module_glue(layout, linked, expected['exefs_sha256'], paths, port_version, expected['display_version'])
     if not a.make_runtime_lib and (not glue.exists() or glue.read_text() != text):
         glue.write_text(text)
 

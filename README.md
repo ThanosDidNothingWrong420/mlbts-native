@@ -1,6 +1,6 @@
 # MLB The Show 26: native Windows port
 
-A static recompilation of **MLB The Show 26** (Nintendo Switch, version **1.0.15**) into a native Windows x86-64
+A static recompilation of **MLB The Show 26** (Nintendo Switch, version **1.0.20**; 1.0.15 also works) into a native Windows x86-64
 program. The game's ARM64 code is translated to C ahead of time, compiled with clang, and linked against a small
 host runtime that stands in for the Switch's operating system, GPU API and audio.
 
@@ -19,7 +19,7 @@ development machine (Ryzen 5 5600X, RTX 3060 Ti, Windows 11).
 Dynasty are out of scope.
 
 **Known problems:** current work is graphics correctness (some wrong or missing images, lighting) and performance.
-Only version 1.0.15 is supported; do not use another version.
+Game versions 1.0.20 (the latest) and 1.0.15 are supported; other versions are not.
 
 ## Playing it
 
@@ -30,7 +30,7 @@ Only version 1.0.15 is supported; do not use another version.
 3. After about 10 minutes, press **Play**. From then on, use the "MLB The Show 26" shortcut.
 
 The download contains no part of the game. The setup builds the game on your PC from your own files: the base game and
-the 1.0.15 update as NSP files dumped from your Switch, and your `prod.keys`. It needs about 40 GB free. To update the
+the 1.0.20 update (or 1.0.15) as NSP files dumped from your Switch, and your `prod.keys`. It needs about 40 GB free. To update the
 port, start a newer setup and press **Update**; your game files, saves and settings stay. How the setup works and how a
 release is made: [docs/release.md](docs/release.md).
 
@@ -64,7 +64,7 @@ full list is the table in [`runtime/mlb/cfg.c`](runtime/mlb/cfg.c).
 
 Nothing from the game is included. You need:
 
-- the base game and the 1.0.15 update, dumped from your own Switch (`.nsp` files), and
+- the base game and the 1.0.20 update (or 1.0.15), dumped from your own Switch (`.nsp` files), and
 - your own `prod.keys` and `title.keys`. By default the tools read them from `%APPDATA%/Ryujinx/system/`. They are
   passed by path and never printed or copied.
 

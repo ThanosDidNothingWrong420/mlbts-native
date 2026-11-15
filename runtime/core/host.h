@@ -201,6 +201,9 @@ extern const int rt_exefs_sha256_count;
 extern const char rt_default_exefs[], rt_default_romfs[], rt_default_profile[];
 extern const int rt_game_version;                          // the game build: 110 (1.1.0), 121 (1.2.1) or 143 (1.4.3)
 extern const char rt_port_version[];                       // VERSION at the build's root: 0.1.0, 0.1.0+973c626 in a release
+// mlbts-native: the game version this exe was built for ("1.0.15", "1.0.20"): tools/data/expected-<version>.json,
+// which tools/build.py picks by the hash of the ExeFS's main. TotK's rt_game_version stays 0 (its probes only).
+extern const char rt_game_build[];
 #define RT_V110 (rt_game_version == 110)                    // 1.1.0: its own boot constants and data slots
 #define RT_V143 (rt_game_version >= 143)
 

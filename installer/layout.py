@@ -20,7 +20,9 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-GAME_VERSION = '1.0.15'
+# The game versions the port builds, newest first: each has tools/data/expected-<version>.json (ExeFS hashes, RomFS
+# size). A setup builds the version of the update NSP it is given (steps.Context.pick_version).
+GAME_VERSIONS = ('1.0.20', '1.0.15')
 
 
 @dataclass(frozen=True)
@@ -38,15 +40,15 @@ class Layout:
     xlate: Path          # totk_xlate.exe; the totk_xlate.id beside it is copied too
     temp: Path
 
-    @property
-    def expected(self):
-        return self.tools / 'data' / f'expected-{GAME_VERSION}.json'
+    def expected(self, version):
+        return self.tools / 'data' / f'expected-{version}.json'
 
     def missing(self):
         """Paths the steps need that do not exist."""
         need = [self.python, self.tools / 'build.py', self.tools / 'romfs_dump.py', self.tools / 'nxextract.py',
                 self.recomp / 'gen.py', self.llvm / 'bin' / 'clang.exe', self.deps / 'lib' / 'vulkan-1.lib',
-                self.deps / 'bin' / 'SDL3.dll', self.runtime_lib, self.ninja, self.xlate, self.expected]
+                self.deps / 'bin' / 'SDL3.dll', self.runtime_lib, self.ninja, self.xlate]
+        need += [self.expected(v) for v in GAME_VERSIONS]
         return [str(p) for p in need if not p.exists()]
 
 

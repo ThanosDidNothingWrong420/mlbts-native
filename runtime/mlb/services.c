@@ -392,9 +392,23 @@ static void friend_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs)
 
 // ---- nim:eca: the eShop access server (nn::ec). Online only; the server object is handed out and its commands
 // are served as MLB uses them.
+// IShopServiceAccessServer: 1.0.20 asks the eShop for the game's consumables list
+// (/v1/applications/{applicationId}/consumables) when the game modes menu opens (main+0x152e844):
+// nn::ec::ShopServiceAccessor::Initialize, then Request, Wait, GetSize and Get. 1.0.15 never did. Offline there is no
+// shop: CreateAccessorInterface fails with nifm's "network communication disabled" (as nifm GetResult above), which
+// the SDK's ShopServiceAccessServer::ToResult passes through unchanged (only nim results are mapped; nim 0 aborts), and
+// the game takes its own failure path: "nn::ec::ShopServiceAccessor::Initialize failed : 110-1111" at a log level
+// that never reaches lm, and no list [C, disassembly; 1.0.20 smoke run to a match, 2026-11-15].
 static void eca_server_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
-    (void)rs;
-    ipc_unimplemented(s, rq);
+    switch (rq->cmd) {
+    case 0: {   // CreateAccessorInterface(u8 shop service) -> IShopServiceAccessor
+        static int said;
+        if (!said++) rt_log("nim: the game asks the eShop for its consumables; offline, refused (110-1111)");
+        rs->result = 0x8AE6Eu;
+        return;
+    }
+    default: ipc_unimplemented(s, rq);
+    }
 }
 
 static void eca_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {

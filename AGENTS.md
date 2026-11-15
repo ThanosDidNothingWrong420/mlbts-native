@@ -1,6 +1,7 @@
 # AGENTS.md — MLB The Show 26 native Windows port
 
-Native Windows x86-64 static recompilation of **MLB The Show 26 for Switch, version 1.0.15** (do not switch versions).
+Native Windows x86-64 static recompilation of **MLB The Show 26 for Switch, version 1.0.20** (the dev tree's version; 1.0.15 stays supported, see "Game
+versions" below; no other versions).
 Goal: offline play (exhibition, Road to the Show, Franchise, menus, local saves). Online and Diamond Dynasty are out of
 scope. Status: boots, menus, RTTS and full matches run at 60 fps on the dev machine (Ryzen 5 5600X, RTX 3060 Ti,
 Windows 11). Most current work is graphics correctness (wrong or missing images, lighting) and performance.
@@ -66,6 +67,21 @@ With async replay, the NVN command replay runs on its own thread, and a recorder
 For edits across several files, a small script in `work/scratch/edit_*.py` using exact-match
 replace-and-assert is reliable.
 
+## Game versions
+
+- Supported: **1.0.20** (update v1310720, the dev tree's: `work/update/exefs`, `work/romfs`) and **1.0.15** (v983040,
+  kept in `work/update-1.0.15/exefs` and `work/romfs-1.0.15`). Each has `tools/data/expected-<version>.json`.
+- One `mlb.exe` runs one version. `tools/build.py` picks it from the SHA-256 of `--exefs`'s `main` (default
+  `work/update/exefs`) and refuses `--gen` output of another version. The runtime reads it as `rt_game_build`
+  ("1.0.20"). To build 1.0.15: `recomp/gen.py --exefs work/update-1.0.15/exefs`, then `tools/build.py --exefs
+  work/update-1.0.15/exefs` and `MLB_EXEFS`/`MLB_ROMFS` pointing at the 1.0.15 folders.
+- 1.0.20 changed only `main` (sdk, rtld and the 765 imports are the same). Code addresses moved by +0x20 to +0x1500,
+  read-only data and data by about +0x1000 to +0x1070. Address comments in `runtime/` are 1.0.15's unless they say
+  otherwise; `tools/addrmap.py work/update-1.0.15/exefs work/update/exefs <addr>...` finds them in 1.0.20. Code that
+  uses a game address picks it per version (`resolution.c`).
+- New in 1.0.20: the game modes menu asks the eShop for consumables (`nim:IShopServiceAccessServer`, refused offline
+  in `services.c`). Its RomFS has 1,601 more files (rosters, heads, stadiums) and 189 of 468 shader banks rebuilt.
+
 ## Releases
 
 A release is a setup, never the game: **no `mlb.exe`, generated C, objects or anything else built from the game's code
@@ -113,7 +129,7 @@ is refused). Players' launchers (0.1.1 and later) find the newest release throug
     totals; with `MLB_FS_STACK=<path text>` also the game's call stack at each open, read and close of matching files.
   - `MLB_FNTRACE=<addr>,...` logs calls of game functions (caller, x0; x0 shown as text when it points at a string),
     `<lo>-<hi>` the first call of every function in a range; `MLB_FNTRACE_PEEK=<off>,...` logs a value behind x0
-    each time it changes (pointer chain, last read as 32 bits). The engine's print function `0x7001ad7bd0` shows its
+    each time it changes (pointer chain, last read as 32 bits). The engine's print function (1.0.20 `0x7001ad9090`, 1.0.15 `0x7001ad7bd0`) shows its
     messages this way. Function addresses are the `f_<addr>` names in `work/gen/main/*.c`.
 
 ## RenderDoc (the main graphics debugging tool)
@@ -181,7 +197,7 @@ title IDs and module layout differ.
 4. **Savage Wind Recomp**, https://github.com/Revivedx/SavageWindRecomp.
 
 Ask before running code from a reference repo, except TotK's lifter, which the user approved as a coverage oracle.
-Ryujinx runs 1.0.15 for the user and can be used as a correctness oracle.
+Ryujinx runs the game for the user and can be used as a correctness oracle.
 
 ## Engineering guidelines
 

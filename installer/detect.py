@@ -14,7 +14,8 @@ from pathlib import Path
 
 TITLE_BASE = 0x0100AA7024094000      # MLB The Show 26, the base game
 TITLE_UPDATE = TITLE_BASE + 0x800    # its update
-UPDATE_VERSION = 983040              # 1.0.15 (15 << 16)
+UPDATE_VERSIONS = {1310720: '1.0.20', 983040: '1.0.15'}   # the updates the port runs: CNMT version -> game version
+NEWEST_UPDATE = max(UPDATE_VERSIONS)
 
 APPDATA = Path(os.environ.get('APPDATA') or Path.home() / 'AppData' / 'Roaming')
 # Emulators keep the player's keys here; the setup reads the file it is given and nothing else of these folders
@@ -127,9 +128,12 @@ def game_dirs(extra=()):
 
 def find_game_files(extra_dirs=(), depth=2):
     """{'base': Path|None, 'update': Path|None}: the MLB The Show 26 NSPs found in game_dirs, the update preferring
-    1.0.15. Looks depth folder levels deep, NSP and NSZ names only (it reads 16 bytes plus the entry table of each)."""
+    the newest version the port runs (1.0.20, then 1.0.15). Looks depth folder levels deep, NSP and NSZ names only (it reads 16 bytes plus the entry table of each)."""
     found = {'base': None, 'update': None}
     update_ver = None
+
+    def rank(v):   # a version the port runs over any other, then the newer
+        return (v in UPDATE_VERSIONS, v or 0)
 
     def visit(d, level):
         nonlocal update_ver
@@ -145,7 +149,7 @@ def find_game_files(extra_dirs=(), depth=2):
                         continue
                     if info['kind'] == 'base' and not found['base']:
                         found['base'] = Path(e.path)
-                    elif info['kind'] == 'update' and (update_ver != UPDATE_VERSION):
+                    elif info['kind'] == 'update' and (not found['update'] or rank(info['version']) > rank(update_ver)):
                         found['update'], update_ver = Path(e.path), info['version']
                 elif e.is_dir() and level < depth and not e.name.startswith(('.', '$')):
                     visit(e.path, level + 1)
@@ -154,7 +158,7 @@ def find_game_files(extra_dirs=(), depth=2):
 
     for d in game_dirs(extra_dirs):
         visit(d, 0)
-        if found['base'] and update_ver == UPDATE_VERSION:
+        if found['base'] and update_ver == NEWEST_UPDATE:
             break
     return found
 

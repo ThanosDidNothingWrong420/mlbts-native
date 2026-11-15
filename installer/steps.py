@@ -1,7 +1,7 @@
 """The setup's steps, and the bookkeeping that makes a fresh install, a resume and an update one rule.
 
     check    always: the setup folder, the PC (AVX2, Vulkan), the game files and keys, free space
-    exefs    the update's code (main, sdk, rtld, main.npdm) into <dest>/game/exefs, checked against the 1.0.15 hashes
+    exefs    the update's code (main, sdk, rtld, main.npdm) into <dest>/game/exefs, checked against its version's hashes
     romfs    the game's data (base + update, about 37 GB) into <dest>/game/romfs (tools/romfs_dump.py; resumable)
     build    lift the code to C (recomp/gen.py) and compile it with the prebuilt runtime (tools/build.py) into mlb.exe
     finish   always: mlb.cfg, the shader translator, DLSS (optional), shortcuts, a Ryujinx save (optional), clean up
@@ -9,7 +9,12 @@
 mlbts-install.json in the install folder records each finished step with a key: a fingerprint of what its output
 depends on. A step whose recorded key matches and whose output is still there is skipped. So a cancelled setup resumes
 where it stopped, and a newer release on an existing folder only rebuilds mlb.exe (its key holds the release version):
-the game files are not needed again. Nothing of the keys file is ever stored, logged or shown; only its path is passed
+the game files are not needed again.
+
+The port runs game versions 1.0.20 and 1.0.15 (layout.GAME_VERSIONS). The version comes from the update NSP picked, else
+from the code already installed, else it is the newest. Another version on an existing folder extracts the code and the
+data again (the old version's data is removed first: a file of the same name and size may hold other bytes) and
+rebuilds. Nothing of the keys file is ever stored, logged or shown; only its path is passed
 to the tools.
 
 After TotK Recomp installer/steps.py and runner.py @ v0.4.0 (MIT).
@@ -28,10 +33,10 @@ import urllib.request
 from pathlib import Path
 
 from . import detect
+from .layout import GAME_VERSIONS
 
 STATE = 'mlbts-install.json'
 GIB = 1 << 30
-ROMFS_BYTES = 37_408_746_675   # the 1.0.15 RomFS (84,634 files), tools/romfs_dump.py
 SPACE_SLACK = 2 * GIB          # mlb.exe, the shader and pipeline caches, saves
 TEMP_BYTES = 2 * GIB           # the generated C (about 600 MB) and its objects (about 200 MB), with room
 
@@ -83,8 +88,35 @@ class Context:
         self.layout, self.dest, self.reporter, self.options = layout, dest, reporter, options
         self.temp = layout.temp / ('install-' + fingerprint(str(dest).lower())[:8])
         self.game = dest / 'game'
-        self.expected = json.loads(layout.expected.read_text(encoding='utf-8'))
+        self.expected = self.pick_version()
         self.state = self.load_state()
+
+    def pick_version(self):
+        """tools/data/expected-<version>.json of the game version this install builds: the picked update's, else the
+        installed code's, else the newest."""
+        known = {v: json.loads(self.layout.expected(v).read_text(encoding='utf-8')) for v in GAME_VERSIONS}
+        for p in (self.options.update, self.options.base):   # the check step swaps them when picked the other way round
+            info = detect.identify(p) if p and Path(p).is_file() else None
+            if info and info['kind'] == 'update' and info['version'] in detect.UPDATE_VERSIONS:
+                return known[detect.UPDATE_VERSIONS[info['version']]]
+        main = self.game / 'exefs' / 'main'
+        if main.is_file():
+            h = sha256_file(main)
+            for e in known.values():
+                if e['exefs_sha256']['main'] == h:
+                    return e
+        return known[GAME_VERSIONS[0]]
+
+    def romfs_version(self):
+        """The update version the extracted data in game/romfs belongs to, None when there is none. Installs from
+        before 1.0.20 support wrote no game/romfs.version: their data is 1.0.15's."""
+        mark = self.game / 'romfs.version'
+        if mark.is_file():
+            try:
+                return int(mark.read_text(encoding='utf-8').strip())
+            except (OSError, ValueError):
+                return -1
+        return 983040 if (self.game / 'romfs').is_dir() else None
 
     def load_state(self):
         p = self.dest / STATE
@@ -173,9 +205,9 @@ class Check(Step):
         # space: what is left of the RomFS to write, plus the build's output in the install folder
         have = 0
         romfs = ctx.game / 'romfs'
-        if ctx.plan_runs('romfs') and romfs.is_dir():
+        if ctx.plan_runs('romfs') and romfs.is_dir() and ctx.romfs_version() == ctx.expected['update_version']:
             have = sum(f.stat().st_size for f in romfs.rglob('*') if f.is_file() and not f.name.endswith('.part'))
-        need = (max(ROMFS_BYTES - have, 0) if ctx.plan_runs('romfs') else 0) + SPACE_SLACK
+        need = (max(ctx.expected['romfs_bytes'] - have, 0) if ctx.plan_runs('romfs') else 0) + SPACE_SLACK
         free = detect.free_bytes(ctx.dest)
         rep.log(f'space: install disk needs {gib(need)}, {gib(free)} free')
         if free < need:
@@ -210,12 +242,12 @@ class Check(Step):
             raise InstallError(f'{Path(opt.base).name} is not MLB The Show 26 (title {ids["base"]["title"]:016X}); '
                                'pick the base game NSP (title 0100AA7024094000).')
         if ids['update']['kind'] != 'update':
-            raise InstallError(f'{Path(opt.update).name} is not an MLB The Show 26 update; pick the 1.0.15 update NSP '
-                               '(title 0100AA7024094800, version 983040).')
+            raise InstallError(f'{Path(opt.update).name} is not an MLB The Show 26 update; pick the 1.0.20 update NSP '
+                               '(title 0100AA7024094800, version 1310720) or the 1.0.15 one (version 983040).')
         ver = ids['update']['version']
-        if ver is not None and ver != detect.UPDATE_VERSION:
-            raise InstallError(f'This update is version {ver}, not 1.0.15 (983040). The port runs only on game version '
-                               '1.0.15: dump that update from your Switch.')
+        if ver is not None and ver not in detect.UPDATE_VERSIONS:
+            raise InstallError(f'This update is version {ver}. The port runs on game versions 1.0.20 (1310720) and '
+                               '1.0.15 (983040): dump one of those updates from your Switch.')
         text = Path(opt.keys).read_text(encoding='utf-8', errors='replace')
         if not re.search(r'^\s*header_key\s*=', text, re.M):
             raise InstallError(f'{opt.keys} does not look like a prod.keys file (it has no header_key).')
@@ -253,7 +285,8 @@ class ExeFS(Step):
                                'Switch on a recent system version.')
         sec = next((s for s in nca.sections if s['fs_type'] == 1 and s['index'] == 0), None)
         if sec is None:
-            raise InstallError('The update holds no program code (ExeFS); it is not the 1.0.15 update.')
+            raise InstallError('The update holds no program code (ExeFS); it is not the '
+                               f'{ctx.expected["display_version"]} update.')
         rd = nca.section_reader(sec)
         want = ctx.expected['exefs_sha256']
         out = ctx.game / 'exefs'
@@ -268,8 +301,9 @@ class ExeFS(Step):
                 os.replace(tmp, out / name)
         bad = [n for n in want if got.get(n) != want[n]]
         if bad:
-            raise InstallError(f'The update\'s code is not the 1.0.15 code ({", ".join(bad)} differ). The port runs '
-                               'only on game version 1.0.15.')
+            v = ctx.expected['display_version']
+            raise InstallError(f'The update\'s code is not the {v} code ({", ".join(bad)} differ). The port runs on game '
+                               f'versions {" and ".join(GAME_VERSIONS)}: dump the update again from your Switch.')
         return {}
 
 
@@ -282,11 +316,24 @@ class RomFS(Step):
         return fingerprint('romfs-1', ctx.expected['title_id'], ctx.expected['update_version'])
 
     def current(self, ctx, record):
-        return (ctx.game / 'romfs.complete').is_file() and (ctx.game / 'romfs').is_dir()
+        return ((ctx.game / 'romfs.complete').is_file() and (ctx.game / 'romfs').is_dir() and
+                ctx.romfs_version() == ctx.expected['update_version'])
 
     def run(self, ctx):
         opt, lay, rep = ctx.options, ctx.layout, ctx.reporter
         ctx.game.mkdir(parents=True, exist_ok=True)
+        want, have = ctx.expected['update_version'], ctx.romfs_version()
+        if have is not None and have != want:
+            # another version's data: a file of the same name and size may hold other bytes, and the extraction skips
+            # files that are there at their size, so it starts from nothing
+            rep.progress(self.id, "Removing the other game version's data", force=True)
+            rep.log(f'romfs: the extracted data is version {have}, this install is {want}: removing it')
+            (ctx.game / 'romfs.complete').unlink(missing_ok=True)
+            shutil.rmtree(ctx.game / 'romfs', ignore_errors=True)
+            if (ctx.game / 'romfs').exists():
+                raise InstallError(f'{ctx.game / "romfs"} could not be removed (a file in it is in use): close the game '
+                                   'and run the setup again.')
+        (ctx.game / 'romfs.version').write_text(f'{want}\n', encoding='utf-8')
         cmd = [lay.python, '-I', '-X', 'utf8', lay.tools / 'romfs_dump.py', '--keys', opt.keys]
         if opt.titlekeys:
             cmd += ['--titlekeys', opt.titlekeys]
@@ -354,7 +401,7 @@ class Build(Step):
         rep.progress(self.id, 'Compiling', force=True)
         ctx.run_tool(self.id, py + [lay.tools / 'build.py', '--toolchain', lay.llvm, '--deps', lay.deps,
                                    '--ninja', lay.ninja, '--runtime-lib', lay.runtime_lib, '--portable',
-                                   '--gen', gen, '--out', out], build_line)
+                                   '--exefs', ctx.game / 'exefs', '--gen', gen, '--out', out], build_line)
         rep.progress(self.id, 'Copying the game into the install folder', force=True)
         for src in (out / 'mlb.exe', out / 'SDL3.dll', lay.xlate, lay.xlate.with_suffix('.id')):
             dst = ctx.dest / src.name

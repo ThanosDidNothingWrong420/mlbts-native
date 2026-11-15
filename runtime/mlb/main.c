@@ -189,8 +189,10 @@ void fnprof_hit(uint64_t addr, uint64_t lr, uint64_t x0) {
         }
         if (k <= 8 || k % 1000 == 0 || fresh) {
             char from[128];
-            // x0 into main's read-only data (0x7001c22000 + 0x539000, docs/recon-report.md): a message, shown as text
-            int text = x0 >= 0x7001c22000ull && x0 < 0x700215b000ull;
+            // x0 into main's read-only data (1.0.15: 0x7001c22000 + 0x539000, docs/recon-report.md; 1.0.20 starts
+            // 0x1000 later): a message, shown as text
+            const RtLoaded *m = ldr_module(0);
+            int text = m && x0 >= m->base + ((m->text_end + 0xfff) & ~0xfffull) && x0 < m->base + m->data_off;
             rt_log("fntrace: %#llx call %llu from %s, x0 %#llx%s%.160s%s", (unsigned long long)addr, (unsigned long long)k,
                    ldr_describe(lr, from, sizeof from), (unsigned long long)x0, text ? " \"" : "",
                    text ? (const char *)(uintptr_t)x0 : "", text ? "\"" : "");
@@ -356,7 +358,7 @@ static const char *beside_exe(const char *p) {
 
 int main(int argc, char **argv) {
     mem_init();   // first: claim the guest address space before anything else can land there
-    rt_log("version: mlbts-native %s, game %s", rt_port_version, "MLB The Show 26 1.0.15");
+    rt_log("version: mlbts-native %s, game MLB The Show 26 %s", rt_port_version, rt_game_build);
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
     plat_crash_hook(crash_handler);

@@ -10,7 +10,7 @@ data or assets, and no file built from them**: no `mlb.exe`, no generated C or i
 1. Downloads `MLBTS-Setup-<version>-windows.zip` from GitHub Releases, unpacks it anywhere and starts
    `MLBTS-Setup.exe`.
 2. The window is already filled in when it can be: `prod.keys` from Ryujinx's or yuzu's (and forks') folder, the base
-   game and 1.0.15 update NSPs from the emulators' game folders, Downloads, Desktop, Documents, `~/Games` or the folder
+   game and update NSPs (1.0.20 preferred, else 1.0.15) from the emulators' game folders, Downloads, Desktop, Documents, `~/Games` or the folder
    around the setup (`installer/detect.py`), and an install folder on the disk with the most free space. They check
    it, change what is wrong and press **Install**. Options: shortcuts (on), NVIDIA DLSS (on with an RTX card),
    copy the Ryujinx save (on when Ryujinx has one and the install has none).
@@ -52,14 +52,18 @@ setup, start it, press **Update**. Setup 0.1.0 has no updater, so its players up
 update only rebuilds.
 
 1. **Check**: the setup folder is complete; the CPU has AVX2 (the game is built for x86-64-v3); a Vulkan driver is
-   installed; the NSPs are MLB The Show 26 and its 1.0.15 update (`cnmt.xml` in the NSP, else the ticket's name);
+   installed; the NSPs are MLB The Show 26 and its 1.0.20 or 1.0.15 update (`cnmt.xml` in the NSP, else the
+   ticket's name);
    `prod.keys` has a `header_key`; free space (37 GB less what is already extracted, plus 2 GB; 2 GB next to the
    setup for the build).
-2. **ExeFS**: the update's code into `game/exefs`, checked against `tools/data/expected-1.0.15.json`.
+2. **ExeFS**: the update's code into `game/exefs`, checked against `tools/data/expected-<version>.json`. The
+   version is the picked update's, else the installed code's, else the newest (`Context.pick_version`).
 3. **RomFS**: `tools/romfs_dump.py --extract-all --progress`: base plus update, IVFC-checked (a failure stops the
-   setup: damaged files), resumable.
+   setup: damaged files), resumable. `game/romfs.version` names the update the data belongs to (none: 1.0.15, from
+   setups before 1.0.20 support); another version's data is removed first, because the extraction skips files that
+   are there at their size.
 4. **Build**: `recomp/gen.py` into the setup's `temp/`, then `tools/build.py --toolchain llvm --runtime-lib
-   runtime/libmlbrt.a --portable`; `mlb.exe`, `SDL3.dll` and the translator are copied into the install folder.
+   runtime/libmlbrt.a --portable --exefs game/exefs` (the game version comes from main's hash); `mlb.exe`, `SDL3.dll` and the translator are copied into the install folder.
 5. **Finish**: `mlb.cfg` (when missing), DLSS, shortcuts (PowerShell's `WScript.Shell`), `mlb.exe --import-save`,
    and `temp/` deleted.
 
@@ -84,7 +88,7 @@ llvm/               llvm-mingw 20261020, x86_64 subset
 runtime/            libmlbrt.a (the runtime, built with llvm/), every runtime header, deps/ (Vulkan headers, VMA, SDL3
                     headers, lib/vulkan-1.lib, bin/SDL3.dll)
 bin/                ninja.exe, totk_xlate.exe (+ .id)
-recomp/, tools/     the lifter; build.py, romfs_dump.py and its imports, data/expected-1.0.15.json
+recomp/, tools/     the lifter; build.py, romfs_dump.py and its imports, data/expected-1.0.15.json and -1.0.20.json
 installer/          the setup
 licenses/, LICENSE, THIRD_PARTY_NOTICES.md, README.txt, VERSION (VERSION plus the commit)
 ```

@@ -63,7 +63,7 @@ int sysinfo_text(char *buf, size_t n) {
     Out o = {buf, n, 0};
     buf[0] = 0;
     char s[256];
-    put(&o, "MLB The Show 26 native system info (game 1.0.15)\n");
+    put(&o, "MLB The Show 26 native system info (game %s)\n", rt_game_build);
     put(&o, "OS: %s\n", plat_os_version(s, sizeof s) ? s : "unknown");
     sysinfo_cpu_name(s, sizeof s);
     put(&o, "CPU: %s, %u logical processors\n", s[0] ? s : "unknown", plat_cpu_count());
