@@ -96,8 +96,9 @@ You need:
 No game files, keys or code of the game are in this download, and the setup never uploads anything. The game is
 built on your PC, from your files, for your own use: do not share the installed folder.
 
-After the install, start the game with the "MLB The Show 26" shortcut or mlb.exe in the install folder. To update,
-download the new setup and press Update: the game files are not needed again. Settings: F1 in the game.
+After the install, start the game with the "MLB The Show 26" shortcut or mlb.exe in the install folder. Start
+MLBTS-Setup.exe again to update: it checks GitHub for a new version and offers "Download and update" (the game files
+are not needed again). Settings: F1 in the game.
 
 Source, issues and help: https://github.com/sam110411/mlbts-native
 """

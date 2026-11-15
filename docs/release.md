@@ -18,9 +18,16 @@ data or assets, and no file built from them**: no `mlb.exe`, no generated C or i
 4. Presses **Play**. Next time, the desktop shortcut starts the game; starting the setup again opens its launcher
    screen (Play, Update, Repair, Import Ryujinx save, Open install folder).
 
-The base and update can be picked the wrong way round: the setup swaps them. Updating the port: download the new
-setup, start it, press **Update**. It rebuilds `mlb.exe` with the new release in a few minutes and keeps the game
-files, saves and settings; the game files are not needed again.
+The base and update can be picked the wrong way round: the setup swaps them.
+
+Updating the port (from 0.1.1): the launcher screen asks GitHub for the latest release when it opens
+(`installer/update.py`; one API request, nothing about the player is sent, a failure is silent). When that release is
+newer than the setup, it shows **Download and update**: the setup zip is downloaded, checked against the SHA-256
+GitHub lists for the asset, and unpacked next to the old setup folder as `MLBTS-Setup-<version>/` (or in
+`%LOCALAPPDATA%\MLBTS-Native\setups` when that folder is read-only). The new `MLBTS-Setup.exe` then starts with
+`--update <install folder>` (the launcher passes its arguments on to the window) and rebuilds `mlb.exe` at once. The
+game files, saves and settings stay; the game files are not needed again. The manual way still works: download the new
+setup, start it, press **Update**. Setup 0.1.0 has no updater, so its players update by hand once.
 
 ## The install folder
 

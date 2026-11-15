@@ -4,11 +4,28 @@
        llvm/bin/clang -O2 -mwindows launcher.c launcher_rc.o -o MLBTS-Setup.exe
    After TotK Recomp installer/launcher/launcher.c @ v0.4.0 (MIT), English only.
    System DPI aware, like the window's Python process (installer/gui.py): the error box is drawn at the display's
-   scale instead of stretched. */
+   scale instead of stretched.
+   Its own arguments are passed on to the window (installer/gui.py): the updater (installer/update.py) starts the new
+   setup with --update <install folder>. */
 #include <windows.h>
 #include <wchar.h>
 
 #define PATH_CHARS (MAX_PATH * 2)
+#define ARGS_CHARS 2048
+
+/* The command line after the program's own name (quoted or not), without the spaces before it. */
+static const wchar_t *own_args(void)
+{
+    const wchar_t *p = GetCommandLineW();
+    if (*p == L'"') {
+        for (p++; *p && *p != L'"'; p++) {}
+        if (*p) p++;
+    } else {
+        while (*p && *p != L' ' && *p != L'\t') p++;
+    }
+    while (*p == L' ' || *p == L'\t') p++;
+    return p;
+}
 
 static void fail(const wchar_t *what)
 {
@@ -21,7 +38,8 @@ static void fail(const wchar_t *what)
 
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line, int show)
 {
-    wchar_t folder[PATH_CHARS], python[PATH_CHARS], command[PATH_CHARS + 64];
+    wchar_t folder[PATH_CHARS], python[PATH_CHARS], command[PATH_CHARS + 64 + ARGS_CHARS];
+    const wchar_t *args = own_args();
     DWORD n = GetModuleFileNameW(NULL, folder, PATH_CHARS);
     STARTUPINFOW si = { sizeof si };
     PROCESS_INFORMATION pi;
@@ -32,7 +50,9 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line, i
     folder[n > 0 ? n - 1 : 0] = 0;
     if (swprintf(python, PATH_CHARS, L"%ls\\python\\pythonw.exe", folder) < 0 ||
         GetFileAttributesW(python) == INVALID_FILE_ATTRIBUTES) { fail(L"python\\pythonw.exe is missing"); return 1; }
-    if (swprintf(command, PATH_CHARS + 64, L"\"%ls\" -I -m installer.gui", python) < 0) { fail(L"path too long"); return 1; }
+    if (wcslen(args) >= ARGS_CHARS) args = L"";
+    if (swprintf(command, sizeof command / sizeof *command, L"\"%ls\" -I -m installer.gui%ls%ls", python,
+                 *args ? L" " : L"", args) < 0) { fail(L"path too long"); return 1; }
     if (!CreateProcessW(python, command, NULL, NULL, FALSE, 0, NULL, folder, &si, &pi)) {
         fail(L"python\\pythonw.exe did not start");
         return 1;

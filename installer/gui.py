@@ -5,12 +5,14 @@ One window, three screens:
   finds by itself (detect.py: the emulators' key and game folders, Downloads, Desktop, ...), and the options;
 - the progress screen: the steps of the command-line setup (installer/cli.py, run as a child process; its JSON events
   drive the screen), a progress bar, Cancel;
-- the launcher: Play, and Update when this setup is newer than the install, Import Ryujinx save, Open folder.
+- the launcher: Play, and Update when this setup is newer than the install, Import Ryujinx save, Open folder. It also
+  asks GitHub for a newer release (update.py) and offers "Download and update": the new setup is downloaded, unpacked
+  beside this one and started with --update <install folder>, which goes straight to the rebuild.
 
 The last install folder and the file paths are remembered in %LOCALAPPDATA%\\MLBTS-Native\\setup.json (paths only,
 never the keys' contents), so starting the setup again opens the launcher on that folder.
 
---selftest builds every screen and closes (tests).
+--selftest builds every screen and closes (tests; no network).
 """
 import json
 import os
@@ -24,6 +26,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from . import detect
 from . import layout as layouts
+from . import update
 from .steps import STATE
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -77,6 +80,20 @@ def inside_setup(dest):
     return d == ROOT or ROOT in d.parents
 
 
+def arg_after(flag):
+    """The command-line value after flag, or None."""
+    try:
+        i = sys.argv.index(flag)
+        return sys.argv[i + 1]
+    except (ValueError, IndexError):
+        return None
+
+
+def setup_newer_than(installed):
+    """This setup should rebuild an install of that release: it is newer, or the install's release is not known."""
+    return update.version_key(installed) is None or update.newer(LAYOUT.release, installed)
+
+
 def where(path):
     """A short phrase for where a file was found."""
     s = str(path).lower()
@@ -112,9 +129,16 @@ class App:
         self.body = None
         self.header()
         self.selftest = selftest
+        self.download_cancel = None   # a threading.Event while an update downloads
+        self.update_checked = False
         dest = self.settings.get('dest')
+        update_dest = arg_after('--update')   # started by the previous setup's updater
+        if update_dest and install_state(update_dest):
+            dest = update_dest
         if dest and install_state(dest):
             self.show_launcher(Path(dest))
+            if update_dest and setup_newer_than((install_state(dest) or {}).get('release')):
+                self.run_setup(['--dest', str(dest)], Path(dest))
         else:
             self.show_form()
         self.root.after(100, self.poll)
@@ -213,8 +237,8 @@ class App:
         self.events.put(('detected', info))
 
     def detected(self, info):
-        if not self.root.winfo_exists() or not hasattr(self, 'vars'):
-            return
+        if not self.root.winfo_exists() or not hasattr(self, 'vars') or not self.notes['base'].winfo_exists():
+            return   # the form is gone (another screen opened while the search ran)
         for k in ('base', 'update'):
             p = info['found'].get(k)
             if p and not self.vars[k].get():
@@ -366,6 +390,10 @@ class App:
                     self.on_event(data)
                 elif kind == 'exit':
                     self.finished(data)
+                elif kind == 'update':
+                    self.offer_update(data)
+                elif kind == 'download':
+                    self.download_event(*data)
         except queue.Empty:
             pass
         self.root.after(100, self.poll)   # one loop for the window's life, started in __init__
@@ -445,9 +473,10 @@ class App:
 
     def show_launcher(self, dest, just_installed=False):
         b = self.screen()
+        self.launcher_dest = Path(dest)
         state = install_state(dest) or {}
         installed = state.get('release') or 'unknown'
-        outdated = installed != LAYOUT.release
+        outdated = setup_newer_than(installed)
         ttk.Label(b, text='Installed! Ready to play.' if just_installed else 'Ready to play',
                   style='Title.TLabel').pack(anchor='w')
         ttk.Label(b, text=f'{dest}', style='Muted.TLabel').pack(anchor='w')
@@ -456,6 +485,11 @@ class App:
             ttk.Label(b, text=f'This setup is version {LAYOUT.release}. Update rebuilds the game with it in a few '
                               'minutes; your game files, saves and settings stay.', wraplength=700).pack(
                 anchor='w', pady=(0, 10))
+        elif update.newer(installed, LAYOUT.release):
+            ttk.Label(b, text=f'This setup (version {LAYOUT.release}) is older than the installed port: use the newer '
+                              'setup to repair it.', wraplength=700, style='Muted.TLabel').pack(anchor='w', pady=(0, 10))
+        self.update_box = ttk.Frame(b)   # filled by offer_update when GitHub has a newer release
+        self.update_box.pack(anchor='w', fill='x')
         if just_installed and getattr(self, 'warnings', None):
             ttk.Label(b, text='\n'.join('⚠ ' + w for w in self.warnings), wraplength=700,
                       style='Muted.TLabel', justify='left').pack(anchor='w', pady=(0, 10))
@@ -475,11 +509,95 @@ class App:
                 side='left')
         ttk.Button(more, text='Install somewhere else', command=self.show_form).pack(side='left', padx=8)
         tips = ('In the game: F1 opens the settings menu, F11 switches full screen. Controllers: Xbox and '
-                'PlayStation pads work; the keyboard works too.\nTo update later, download the new setup and press '
-                'Update; the game files are not needed again.')
+                'PlayStation pads work; the keyboard works too.\nThis window checks for new versions of the port '
+                'when it opens; an update keeps your game files, saves and settings.')
         ttk.Label(b, text=tips, wraplength=700, style='Muted.TLabel', justify='left').pack(side='bottom', anchor='w')
         self.settings['dest'] = str(dest)
         save_settings(self.settings)
+        if not self.selftest and not self.update_checked:
+            self.update_checked = True   # once per start
+            threading.Thread(target=self.check_update, daemon=True).start()
+        elif getattr(self, 'update_info', None):
+            self.offer_update(self.update_info)
+
+    # ---- updates (update.py) ----------------------------------------------------------------------------------------
+
+    def check_update(self):
+        """A thread: the latest release on GitHub; offered when newer than this setup. Failures stay quiet (offline)."""
+        try:
+            info = update.latest()
+        except Exception:   # noqa: BLE001 (no network, GitHub down, rate limit: the launcher works without it)
+            return
+        if info and update.newer(info['version'], LAYOUT.release):
+            self.events.put(('update', info))
+
+    def offer_update(self, info):
+        self.update_info = info
+        box = getattr(self, 'update_box', None)
+        if not box or not box.winfo_exists() or box.winfo_children():
+            return
+        ttk.Label(box, text=f'Version {info["version"]} of the port is available.', style='Section.TLabel').pack(
+            anchor='w')
+        row = ttk.Frame(box)
+        row.pack(anchor='w', pady=(4, 6))
+        ttk.Button(row, text='Download and update', command=lambda: self.start_download(info)).pack(side='left')
+        ttk.Button(row, text="What's new", command=lambda: os.startfile(info['page'])).pack(side='left', padx=8)
+        size = f'about {info["size"] >> 20} MB, ' if info.get('size') else ''
+        ttk.Label(box, text=f'Downloads the new setup ({size}from GitHub) next to this one, then rebuilds the game '
+                            'with it in a few minutes.', style='Muted.TLabel', wraplength=700).pack(anchor='w')
+
+    def start_download(self, info):
+        dest = self.launcher_dest
+        b = self.screen()
+        ttk.Label(b, text=f'Updating to version {info["version"]}', style='Title.TLabel').pack(anchor='w')
+        ttk.Label(b, text=f'for {dest}', style='Muted.TLabel').pack(anchor='w', pady=(0, 10))
+        self.now_text = ttk.Label(b, text='Connecting to GitHub...', wraplength=700)
+        self.now_text.pack(anchor='w', pady=(14, 4))
+        self.bar = ttk.Progressbar(b, mode='determinate', maximum=1000)
+        self.bar.pack(fill='x')
+        foot = ttk.Frame(b)
+        foot.pack(side='bottom', fill='x')
+        ttk.Button(foot, text='Cancel', command=lambda: self.download_cancel and self.download_cancel.set()).pack(
+            side='right')
+        ttk.Label(foot, text='After the download, the new setup opens and rebuilds the game.',
+                  style='Muted.TLabel').pack(side='left')
+        self.download_cancel = cancel = threading.Event()
+
+        def work():
+            def progress(text, done, total):
+                self.events.put(('download', ('progress', text, done, total)))
+            try:
+                folder = update.download(info, ROOT, progress, cancel.is_set)
+                self.events.put(('download', ('done', folder, dest, None)))
+            except update.Cancelled:
+                self.events.put(('download', ('cancelled', None, dest, None)))
+            except Exception as e:   # noqa: BLE001 (shown to the player)
+                self.events.put(('download', ('error', str(e) or type(e).__name__, dest, None)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def download_event(self, kind, a, b, c):
+        if kind == 'progress':
+            if self.now_text.winfo_exists():
+                self.now_text.configure(text=a)
+                if c:
+                    self.bar.configure(value=1000 * b / c)
+            return
+        self.download_cancel = None
+        if kind == 'done':
+            exe = Path(a) / 'MLBTS-Setup.exe'
+            try:
+                subprocess.Popen([str(exe), '--update', str(b)], cwd=a, close_fds=True)
+            except OSError as e:
+                messagebox.showerror('Update', f'The new setup could not start: {e}\n\nIt is in {a}.',
+                                     parent=self.root)
+                self.show_launcher(b)
+                return
+            self.root.after(300, self.root.destroy)
+            return
+        if kind == 'error':
+            messagebox.showerror('Update', f'The update could not be downloaded: {a}\n\nYou can try again later, or '
+                                 'download the new setup from GitHub yourself.', parent=self.root)
+        self.show_launcher(b)
 
     def play(self, dest):
         exe = Path(dest) / 'mlb.exe'
@@ -512,6 +630,8 @@ class App:
                 self.root.update()
                 self.show_launcher(Path(self.settings.get('dest') or ROOT))
                 self.root.update()
+                self.offer_update({'version': '99.0.0', 'url': '', 'size': 1 << 27, 'sha256': None, 'page': ''})
+                self.root.update()
                 self.root.destroy()
             self.root.after(300, tour)
         self.root.protocol('WM_DELETE_WINDOW', self.close)
@@ -540,6 +660,8 @@ class App:
         if self.proc:
             subprocess.run(['taskkill', '/T', '/F', '/PID', str(self.proc.pid)], capture_output=True,
                            creationflags=NO_WINDOW)
+        if self.download_cancel:   # the download thread stops at its next block; its partial file is removed
+            self.download_cancel.set()
         self.root.destroy()
 
 
