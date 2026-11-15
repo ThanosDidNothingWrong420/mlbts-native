@@ -1,0 +1,67 @@
+name: PR Checks
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  checks:
+    runs-on: windows-latest
+    outputs:
+      xlate: ${{ steps.changed.outputs.xlate }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Repo hygiene
+        run: python -I tools/check_content.py --all
+
+      - name: Python syntax
+        run: |
+          python -I -c "import glob, py_compile; files = sorted(glob.glob('recomp/*.py') + glob.glob('tools/*.py')); [py_compile.compile(f, doraise=True) for f in files]; print(f'py_compile OK: {len(files)} files')"
+
+      - name: Shader translator patch check
+        run: |
+          python -I -c "import sys; sys.path.insert(0, 'tools'); import build_xlate; build_xlate.prepare_sources()"
+
+      - name: Detect xlate changes
+        id: changed
+        shell: pwsh
+        run: |
+          $xlate = "false"
+          if ("${{ github.event_name }}" -eq "pull_request") {
+            $files = git diff --name-only HEAD^1 HEAD
+            if ($files | Where-Object { $_ -like "tools/xlate/*" -or $_ -like "tools/vendor/*" -or $_ -eq "tools/build_xlate.py" }) {
+              $xlate = "true"
+            }
+          }
+          "xlate=$xlate" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+  xlate:
+    needs: checks
+    if: github.event_name == 'workflow_dispatch' || needs.checks.outputs.xlate == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Build shader translator
+        run: python -I tools/build_xlate.py
+
+      - name: Verify xlate outputs
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "work/xlate/totk_xlate.exe")) { throw "Missing work/xlate/totk_xlate.exe" }
+          if (-not (Test-Path "work/xlate/totk_xlate.id")) { throw "Missing work/xlate/totk_xlate.id" }
