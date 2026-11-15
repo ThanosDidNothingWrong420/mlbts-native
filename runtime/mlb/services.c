@@ -285,7 +285,72 @@ static void ngc_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
         IPC_OUT(rs, v);
         return;
     }
+    case 1: {   // Check(u32 regions, ProfanityFilterOption, buffer 5 text) -> u32 mask of the regions that flag it
+        uint32_t v = 0;
+        IPC_OUT(rs, v);
+        return;
+    }
+    // Mask(u32 regions, ProfanityFilterOption, buffer 5 text in) -> (u32 masked words, buffer 6 text out).
+    // nn::ngc::ProfanityFilter::MaskProfanityWordsInText (sdk+0x3e8bd0) calls it through the proxy's vtable slot 0x30
+    // and copies the out buffer back over the player's text, so the text goes back unchanged. MLB filters the names
+    // typed in Road to the Show's player editor this way (a friend's 0.1.1 log: "Enter Last Name" -> crash).
+    case 2: {
+        const IpcBuffer *in = rq->na ? &rq->a[0] : NULL, *out = rq->nb ? &rq->b[0] : NULL;
+        if (!in || !out || !out->size) rt_fatal("ngc: Mask without its text buffers");
+        uint64_t n = in->size < out->size ? in->size : out->size;
+        char *dst = ipc_guest(out->addr, out->size);
+        if (n) memcpy(dst, ipc_guest(in->addr, n), n);
+        dst[n < out->size ? n : out->size - 1] = 0;
+        uint32_t masked = 0;
+        IPC_OUT(rs, masked);
+        return;
+    }
     case 3: return;   // Reload
+    default: ipc_unimplemented(s, rq);
+    }
+}
+
+// ---- set: nn::settings for applications (ISettingsServer). The language is MLB_LANGUAGE, as am's GetDesiredLanguage
+// answers; the region is America. nn::ngc's profanity filter asks for it (GetLanguageSetting, sdk+0x3e9780) when the
+// player confirms a typed name.
+static uint64_t set_language_code(void) {
+    char code[8] = {0};
+    const char *lang = cfg_value("MLB_LANGUAGE");
+    if (strlen(lang) >= sizeof code) rt_fatal("set: MLB_LANGUAGE=%s is not a language code", lang);
+    memcpy(code, lang, strlen(lang));
+    uint64_t v;
+    memcpy(&v, code, sizeof v);
+    return v;
+}
+
+static void set_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    switch (rq->cmd) {
+    case 0: {   // GetLanguageCode -> u64
+        uint64_t v = set_language_code();
+        IPC_OUT(rs, v);
+        return;
+    }
+    case 1: case 5: {   // GetAvailableLanguageCodes (buffer 0xA) / GetAvailableLanguageCodes2 (buffer 6) -> s32 count
+        const IpcBuffer *b = rq->cmd == 1 ? (rq->nc ? &rq->c[0] : NULL) : (rq->nb ? &rq->b[0] : NULL);
+        int32_t n = 0;
+        if (b && b->size >= 8) {
+            uint64_t v = set_language_code();
+            memcpy(ipc_guest(b->addr, 8), &v, 8);
+            n = 1;
+        }
+        IPC_OUT(rs, n);
+        return;
+    }
+    case 3: case 6: {   // GetAvailableLanguageCodeCount(2) -> s32
+        int32_t n = 1;
+        IPC_OUT(rs, n);
+        return;
+    }
+    case 4: {   // GetRegionCode -> s32: 1 = America
+        int32_t v = 1;
+        IPC_OUT(rs, v);
+        return;
+    }
     default: ipc_unimplemented(s, rq);
     }
 }
@@ -430,6 +495,7 @@ static const struct { const char *name; IpcHandler handler; } services[] = {
     {"ssl", ssl_handler},
     {"csrng", csrng_handler},
     {"ngc:u", ngc_handler},
+    {"set", set_handler},
     {"friend:u", friend_handler},
     {"nim:eca", eca_handler},
     {"nsd:u", nsd_handler},
