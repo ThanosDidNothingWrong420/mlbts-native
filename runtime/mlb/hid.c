@@ -10,9 +10,18 @@
 //     the pad pushed furthest, so an Xbox and a PlayStation pad can be connected at once. As in TotK, Astral Chain and
 //     Power Moon Recomp, which read their controllers through SDL3 too. MLB_PAD_DRIVER=xinput, or no SDL3.dll, reads
 //     the first XInput pad instead (xinput1_4.dll; Xbox and compatible pads only).
-//     MLB_PAD_MAP=label (default) maps the face buttons by label: Xbox A / PlayStation cross is Switch A (confirm),
-//     B / circle is B, X / square is X, Y / triangle is Y (a Nintendo-labelled pad's A is A). =position maps by place,
-//     as on the console: the east button (Xbox B, circle) is Switch A. Triggers past half way are ZL/ZR; View / Share /
+//     MLB_PAD_MAP=auto (default) maps the face buttons by label in menus and by place in play, switching on the
+//     screens the game enters (hid_game_log), so menus confirm with Xbox A / cross and gameplay matches PlayStation
+//     and Xbox; the button icons follow (prompts.c). =position maps by place, as on the console: the east button (Xbox B,
+//     circle) is Switch A, south (Xbox A, cross) B, west (Xbox X, square) Y, north (Xbox Y, triangle) X. The game
+//     works in PlayStation buttons and its Switch build maps them by place (main+0x1343380, after GetNpadState:
+//     Switch A to circle, B to cross, X to triangle, Y to square), so by place every gameplay control sits where it
+//     does on PlayStation and Xbox: throw to first with the east button, home with the south one, power swing with
+//     the west one. Its menus confirm with circle on Switch (BUTTON_MASK_UI_ACCEPT is 0x2000, main+0x4a36f4), so the
+//     east button confirms and the south one goes back. =label maps by the letter or symbol: Xbox A / PlayStation
+//     cross is Switch A (confirm with the south button), B / circle B, X / square X, Y / triangle Y (a
+//     Nintendo-labelled pad's A is A); gameplay controls then move: east and south trade places, and so do west and
+//     north (a throw to first on Xbox A, power swing on Xbox Y). Triggers past half way are ZL/ZR; View / Share /
 //     Create and the PlayStation touchpad click are -, Menu / Options are +. The guide button (Xbox, PS) opens the
 //     settings menu.
 //   - the keyboard, while a window of this process is in the foreground (GetAsyncKeyState):
@@ -147,15 +156,94 @@ static int window_focused(void) {
 
 static int key(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 
-// The Switch buttons of an XInput pad state.
-static uint64_t pad_bits(const XPad *p) {
+// ---- face buttons (MLB_PAD_MAP)
+// The pads' face buttons in place order: south, east, west, north. By position they are Switch B, A, Y, X, where
+// the console has them; by label each is the Switch button of its letter (FaceIn.lab).
+static const int face_pos[4] = {B_B, B_A, B_Y, B_X};
+typedef struct { uint8_t held; uint64_t lab[4]; } FaceIn;   // held: bit f for place f; lab[f]: Switch bits by label
+
+// mlbts-native: MLB_PAD_MAP=auto follows the game's own log. Its UI engine logs every screen it enters
+// ("uiEngine: Entering screen: [<movie>-><screen> (n)]", lm). Two recorded sessions (menus, an exhibition, Road to
+// the Show practice, the pause menu, batting, pitching, fielding and its slow-motion throw) show menu movies entered
+// for every menu, the in-game pause menu included, and the play HUD movies entered again whenever play resumes. So
+// the last such movie entered says whether a menu or play has the controller; the stadium boards, presentation
+// graphics and notifications the game also enters say nothing and change nothing.
+static volatile int screen_play;   // 1 after a play screen, 0 after a menu screen (and at boot)
+
+static int movie_is(const char *m, int n, const char *const *list) {
+    for (; *list; list++)
+        if ((int)strlen(*list) == n && !memcmp(m, *list, (size_t)n)) return 1;
+    return 0;
+}
+
+void hid_game_log(const char *text, int n) {
+    static const char pre[] = "uiEngine: Entering screen: [";
+    enum { PRE = sizeof pre - 1 };
+    if (n <= PRE || memcmp(text, pre, PRE)) return;
+    const char *m = text + PRE, *end = text + n, *arrow = m;
+    while (arrow + 1 < end && !(arrow[0] == '-' && arrow[1] == '>')) arrow++;
+    if (arrow + 1 >= end) return;
+    int mn = (int)(arrow - m);
+    static const char *const menus[] = {
+        "TitleLoadingScreen", "PM_Main_Alternate", "Pause_Menu", "Selection Box 2", "SubMenu Selection Box 2", "Dialog",
+        "Keyboard", "CareerDecision", "LaunchGame", "Topbar", "Background", NULL,
+    };
+    static const char *const play[] = {
+        "Scorebar", "TM_ScoreBar", "PitchSelect_Bars", "PitchHistory", "PitchMeter_Feedback", "SwingAnalysis",
+        "Fielding_Assets", "Fielding_Assistance", "Bullet_Time_Assets", "Lead_Runner", NULL,
+    };
+    int now;
+    if (movie_is(m, mn, play)) now = 1;
+    else if (movie_is(m, mn, menus) || (mn > 3 && !memcmp(m, "ol_", 3))) now = 0;   // ol_: the online and tutorial popups
+    else return;
+    if (__atomic_exchange_n(&screen_play, now, __ATOMIC_RELAXED) != now &&
+        !strcmp(cfg_value("MLB_PAD_MAP"), "auto"))
+        rt_log("hid: face buttons by %s (screen %.*s)", now ? "position, as on PlayStation and Xbox" : "label",
+               (int)(end - m - 1 > 0 ? end - m - 1 : 0), m);
+}
+
+int hid_face_position(void) {
+    static unsigned seen = ~0u;
+    static int mode;   // 0 label, 1 position, 2 auto
+    unsigned v = cfg_version();
+    if (v != seen) {
+        const char *m = cfg_value("MLB_PAD_MAP");
+        mode = !strcmp(m, "position") ? 1 : !strcmp(m, "label") ? 0 : 2;
+        seen = v;
+    }
+    return mode == 2 ? __atomic_load_n(&screen_play, __ATOMIC_RELAXED) : mode;
+}
+
+// The Switch bits of the held face buttons. When the mapping changes (auto: a screen changed), a button held at that
+// moment is ignored until released: the A that leaves the pause menu would otherwise turn into Switch B, a throw home
+// or a swing, the moment play resumes. overlay: the settings menu's own read, always by label and outside the latch.
+static uint64_t face_bits(const FaceIn *f, int overlay) {
+    static PlatMutex face_lock = PLAT_MUTEX_INIT;
+    static int last = -1;
+    static uint8_t blocked;
+    int pos = overlay ? 0 : hid_face_position();
+    uint8_t use = f->held;
+    if (!overlay) {
+        plat_mutex_lock(&face_lock);
+        if (pos != last) blocked = last < 0 ? 0 : f->held, last = pos;
+        blocked &= f->held;
+        use &= (uint8_t)~blocked;
+        plat_mutex_unlock(&face_lock);
+    }
     uint64_t b = 0;
-    int label = strcmp(cfg_value("MLB_PAD_MAP"), "position") != 0;
-    static const struct { uint16_t x; int lab, pos; } face[] = {
-        {0x1000, B_A, B_B}, {0x2000, B_B, B_A}, {0x4000, B_X, B_Y}, {0x8000, B_Y, B_X},   // Xbox A B X Y
+    for (int i = 0; i < 4; i++)
+        if (use >> i & 1) b |= pos ? BIT(face_pos[i]) : f->lab[i];
+    return b;
+}
+
+// The Switch buttons of an XInput pad state, but the face buttons (into *face).
+static uint64_t pad_bits(const XPad *p, FaceIn *face) {
+    uint64_t b = 0;
+    static const struct { uint16_t x; int lab; } faces[4] = {   // Xbox A B X Y: south, east, west, north
+        {0x1000, B_A}, {0x2000, B_B}, {0x4000, B_X}, {0x8000, B_Y},
     };
     for (int i = 0; i < 4; i++)
-        if (p->buttons & face[i].x) b |= BIT(label ? face[i].lab : face[i].pos);
+        if (p->buttons & faces[i].x) face->held |= (uint8_t)(1u << i), face->lab[i] |= BIT(faces[i].lab);
     static const struct { uint16_t x; int bit; } other[] = {
         {0x0001, B_UP}, {0x0002, B_DOWN}, {0x0004, B_LEFT}, {0x0008, B_RIGHT}, {0x0010, B_PLUS}, {0x0020, B_MINUS},
         {0x0040, B_LSTICK}, {0x0080, B_RSTICK}, {0x0100, B_L}, {0x0200, B_R},
@@ -322,16 +410,17 @@ static void sdl_scan(void) {
     p_SDL_free(ids);
 }
 
-// Under sdl_lock: the Switch buttons of one SDL pad; its guide button (Xbox, PS) ORs into *guide.
-static uint64_t sdl_bits(const SdlPad *p, int label, int *guide) {
+// Under sdl_lock: the Switch buttons of one SDL pad but the face buttons (into *face); its guide button (Xbox, PS)
+// ORs into *guide.
+static uint64_t sdl_bits(const SdlPad *p, FaceIn *face, int *guide) {
     SDL_Gamepad *g = p->g;
     uint64_t b = 0;
-    // South, east, west, north by position: Switch B, A, Y, X, where the console has them. By label: the letter or
-    // PlayStation symbol on the button; a pad without known labels as an Xbox pad (south A, east B, west X, north Y).
-    static const int pos[4] = {B_B, B_A, B_Y, B_X}, xbox[4] = {B_A, B_B, B_X, B_Y};
+    // By label: the letter or PlayStation symbol on the button; a pad without known labels as an Xbox pad (south A,
+    // east B, west X, north Y). By position: face_pos.
+    static const int xbox[4] = {B_A, B_B, B_X, B_Y};
     for (int f = 0; f < 4; f++)
         if (p_SDL_GetGamepadButton(g, face_sdl[f]))
-            b |= BIT(!label ? pos[f] : p->face_label[f] >= 0 ? p->face_label[f] : xbox[f]);
+            face->held |= (uint8_t)(1u << f), face->lab[f] |= BIT(p->face_label[f] >= 0 ? p->face_label[f] : xbox[f]);
     static const struct { SDL_GamepadButton s; int bit; } other[] = {
         {SDL_GAMEPAD_BUTTON_DPAD_UP, B_UP}, {SDL_GAMEPAD_BUTTON_DPAD_DOWN, B_DOWN},
         {SDL_GAMEPAD_BUTTON_DPAD_LEFT, B_LEFT}, {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, B_RIGHT},
@@ -354,9 +443,11 @@ static void take_stick(int32_t *x, int32_t *y, int32_t nx, int32_t ny) {
     if ((int64_t)nx * nx + (int64_t)ny * ny > (int64_t)*x * *x + (int64_t)*y * *y) *x = nx, *y = ny;
 }
 
-// 1 when a controller is connected. SDL's y axes grow downwards, the Switch's upwards.
-static int pad_read(PadIn *in) {
+// 1 when a controller is connected. SDL's y axes grow downwards, the Switch's upwards. overlay: the settings menu's
+// read (face_bits).
+static int pad_read(PadIn *in, int overlay) {
     memset(in, 0, sizeof *in);
+    FaceIn face = {0};
     plat_once(&sdl_once, sdl_load, NULL);
     if (!sdl_ok) {
         XPad p;
@@ -365,11 +456,10 @@ static int pad_read(PadIn *in) {
             return 0;
         }
         if (prompt_kind != 1) prompt_kind_set(1);   // mlbts-native: XInput pads are Xbox pads (button icons)
-        in->buttons = pad_bits(&p);
+        in->buttons = pad_bits(&p, &face) | face_bits(&face, overlay);
         in->lx = clamp_stick(p.lx), in->ly = clamp_stick(p.ly), in->rx = clamp_stick(p.rx), in->ry = clamp_stick(p.ry);
         return 1;
     }
-    int label = strcmp(cfg_value("MLB_PAD_MAP"), "position") != 0;
     plat_mutex_lock(&sdl_lock);
     uint64_t now = plat_now_ns();
     if (now - last_update >= UPDATE_NS) {   // the game reads the npad several times a frame: one update serves them
@@ -379,7 +469,10 @@ static int pad_read(PadIn *in) {
     }
     for (int i = 0; i < npads; i++) {
         SDL_Gamepad *g = pads[i].g;
-        uint64_t b = sdl_bits(&pads[i], label, &in->guide);
+        FaceIn pf = {0};
+        uint64_t b = sdl_bits(&pads[i], &pf, &in->guide);
+        face.held |= pf.held;
+        for (int f = 0; f < 4; f++) face.lab[f] |= pf.lab[f];
         int32_t lx = clamp_stick(p_SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFTX));
         int32_t ly = clamp_stick(-(int32_t)p_SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFTY));
         int32_t rx = clamp_stick(p_SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHTX));
@@ -389,11 +482,12 @@ static int pad_read(PadIn *in) {
         take_stick(&in->rx, &in->ry, rx, ry);
         // mlbts-native: this pad is the one in use (button icons, prompt_kind)
         if (npads > 1 && pads[i].kind != prompt_kind &&
-            (b || abs(lx) > STICK_DIR || abs(ly) > STICK_DIR || abs(rx) > STICK_DIR || abs(ry) > STICK_DIR))
+            (b || pf.held || abs(lx) > STICK_DIR || abs(ly) > STICK_DIR || abs(rx) > STICK_DIR || abs(ry) > STICK_DIR))
             prompt_kind_set(pads[i].kind);
     }
     int have = npads > 0;
     plat_mutex_unlock(&sdl_lock);
+    in->buttons |= face_bits(&face, overlay);
     return have;
 }
 
@@ -419,7 +513,7 @@ static void pad_rumble(uint16_t lo, uint16_t hi) {
 // (the same as the game's: A 0, B 1, X 2, Y 3, L 6, R 7, ZL 8, ZR 9, d-pad 12..15). 0 without a pad.
 int hid_menu_pad(uint64_t *buttons, int32_t *lx, int32_t *ly) {
     PadIn in;
-    int have = pad_read(&in);
+    int have = pad_read(&in, 1);
     *buttons = in.buttons, *lx = in.lx, *ly = in.ly;
     return have;
 }
@@ -429,7 +523,7 @@ int hid_menu_pad(uint64_t *buttons, int32_t *lx, int32_t *ly) {
 int hid_stick_percent(double now[2]) {
     PadIn in;
     now[0] = now[1] = 0;
-    if (!pad_read(&in)) return 0;
+    if (!pad_read(&in, 1)) return 0;
     double lx = in.lx / (double)STICK_MAX, ly = in.ly / (double)STICK_MAX, rx = in.rx / (double)STICK_MAX,
            ry = in.ry / (double)STICK_MAX;
     now[0] = fmin(sqrt(lx * lx + ly * ly), 1) * 100;
@@ -444,7 +538,7 @@ static void poll(NpadState *st) {
     int guide = 0;
     PadIn in;
     knobs();
-    if (pad_read(&in)) {
+    if (pad_read(&in, 0)) {
         b = in.buttons, guide = in.guide;
         lx = in.lx, ly = in.ly, rx = in.rx, ry = in.ry;
         dead_zone(&lx, &ly, dz_l);

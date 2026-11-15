@@ -586,12 +586,14 @@ static void tab_sound(float scale) {
 // ---- Controls
 static void tab_controls(float scale) {
     opt_begin("##controls", scale);
-    static const char *const map[] = {"By label", "By position"};
-    opt_choice("PAD_MAP", "Face buttons", map, 2,
-               "How the controller's face buttons map to the Switch buttons.\n\nBy label: Xbox A or PlayStation cross "
-               "is Switch A (confirm), B or circle is B, X or square is X, Y or triangle is Y. By position: the "
-               "buttons work by where they sit, as on a Switch controller, so the east button (Xbox B, circle) "
-               "confirms.");
+    static const char *const map[] = {"Automatic", "By label", "By position"};
+    opt_choice("PAD_MAP", "Face buttons", map, 3,
+               "How the controller's face buttons map to the Switch buttons.\n\nAutomatic (default): menus confirm "
+               "with A or cross and go back with B or circle; while you bat, pitch, field or run, every control is "
+               "where it is on PlayStation and Xbox (throw to first with B or circle, home with A or cross, power "
+               "swing with X or square). The button icons follow.\n\nBy label: always the menu layout, so gameplay "
+               "controls move (the right and bottom buttons trade places, and so do the left and top ones).\n\nBy "
+               "position: always the gameplay layout, so menus confirm with B or circle, as in the Switch version.");
     static const char *const prompts[] = {"Automatic", "Nintendo", "Xbox", "PlayStation"};
     opt_choice("PROMPTS", "Button icons", prompts, 4,
                "Whose buttons the game's prompts show.\n\nAutomatic: the controller you used last (Xbox or "

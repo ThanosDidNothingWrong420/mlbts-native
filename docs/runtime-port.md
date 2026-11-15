@@ -173,6 +173,17 @@ linker. `tools/shader_smoke.py` translates a sample of MLB's FXB shaders offline
     gamepad through SDL3 (Xbox and PlayStation pads: DualSense, DualSense Edge, DualShock 4; merged) and the keyboard
     (map in the file header; `MLB_PAD_MAP`, `MLB_RUMBLE`). `MLB_PAD_DRIVER=xinput`, or no `SDL3.dll` beside the exe,
     falls back to XInput (Xbox pads only). ✔
+    Face buttons: the game works in PlayStation buttons and its Switch build maps them by place (`main+0x1343380`:
+    Switch A is circle, B cross, X triangle, Y square), so by position throws, swings and pitches sit where they do
+    on PlayStation and Xbox; but its menus confirm with circle (`BUTTON_MASK_UI_ACCEPT` = 0x2000, `main+0x4a36f4`),
+    the east button. One icon cell serves both (the menu's "accept" and the throw to first are the Switch A cell), so
+    no fixed mapping gets menus and play right. `MLB_PAD_MAP=auto` (default) maps by label in menus and by position
+    in play, and the icons follow: the game logs every screen its UI engine enters (`uiEngine: Entering screen:
+    [<movie>->...]`), and the last menu movie (`TitleLoadingScreen`, `PM_Main_Alternate`, `Pause_Menu`, ...) or play
+    HUD movie (`Scorebar`, `PitchSelect_Bars`, `Fielding_Assets`, ...) entered decides (`hid.c hid_game_log`;
+    checked against two recorded sessions with memory snapshots). A face button held across a switch is ignored
+    until released. `label` and `position` fix one mapping. F8 (`statedump.c`, diagnostic) writes main's data and
+    bss to `<profile>/state-<frame>.bin` for such comparisons.
     The game's button prompts show the controller in use (`runtime/mlb/prompts.c`, `MLB_PROMPTS=auto|nintendo|xbox|
     playstation`, the *Button icons* row of the Controls tab). MLB draws every prompt button from one 1024x1024 BC7
     texture (the `symbols` entry of `NSW/UI/ART/FONTS/FONTS.TEX`), which has only Switch buttons; the RomFS has no Xbox
@@ -181,6 +192,12 @@ linker. `tools/shader_smoke.py` translates a sample of MLB's FXB shaders offline
     (`work/gen/prompt_icons.h`, run by `build.py`); `vk_texture.c` copies them over that texture's image after each
     upload, and uploads it again when the controller kind or the setting changes. `--check <png>` checks the cells
     against the texture exported from a capture and writes previews.
+    The play HUD (pitch list, fielding diamond) draws its buttons from other textures: one 128x128 BC7 texture per
+    button, entries of `NSW/UI/GAME/GAME.TEX` (and other packs, same bytes) named after the PlayStation buttons with
+    the Switch ones drawn in (`button_x` is Switch B, `button_circle` A, `button_triangle` X, `button_square` Y,
+    `button_l1/r1/l2/r2` L/R/ZL/ZR; found with a RenderDoc capture of the pitch list). `make_prompts.py` treats each
+    as a target with its own hash and patches it the same way; `--check-hud <GAME.TEX>` checks them against the game's
+    pack (TX12NSW: 0x140-byte entries from 0x30, LZ4 blocks, block-linear BC7) and writes previews.
 17. More offline services: `ssl`, `csrng` (host random bytes), `ngc:u` (no word list, nothing flagged), `friend:u`
     (an empty notification queue whose event never fires), `nim:eca`, `nsd:u` (environment `lp1`, `ResolveEx`), and
     `pctl`'s free-communication commands (permitted). The SDK's own `nn::account` user lists are overridden too

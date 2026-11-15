@@ -10,6 +10,7 @@
 #include "ipc.h"
 #include "platform/platform.h"
 #include "cfg.h"
+#include "prompts.h"
 
 void gfx_capture_arm(long ahead);   // runtime/gfx/gfx_stubs.c
 
@@ -53,6 +54,7 @@ static void lm_packet(const uint8_t *d, uint64_t n) {
     }
     if (!text) return;
     while (text_n > 0 && (text[text_n - 1] == '\n' || text[text_n - 1] == '\r' || !text[text_n - 1])) text_n--;
+    hid_game_log(text, text_n);   // mlbts-native: the screens the game enters switch MLB_PAD_MAP=auto
     if (memmem_lite(text, text_n, "===GAME ENTERED===")) {   // MLB_DRAWLOG=game: one frame's capture in the match
         const char *dl = cfg_get("MLB_DRAWLOG");
         if (dl && !strcmp(dl, "game")) gfx_capture_arm(600);

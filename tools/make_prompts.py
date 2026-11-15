@@ -23,6 +23,13 @@ Only the inside of a disc or tab is replaced (whole 4x4 blocks inside the ring),
 the d-pad cells are drawn whole, transparent around the cross as the originals are. Sticks, arrows and SL / SR keep
 their Switch icons (L and R in a disc read as the sticks on any pad).
 
+The play HUD (the pitch list, the fielding diamond) draws its buttons from other textures, one 128x128 BC7 texture per
+button (TARGETS): the same icons are drawn over their discs and tabs, and each texture is found by its own hash.
+
+--check-hud <GAME.TEX> (diagnosis, local only, needs the lz4 module): reads those textures from the game's
+NSW/UI/GAME/GAME.TEX, checks their hashes and that the replaced blocks hold only the old letter and the dark fill, and
+writes every set over them to work/scratch/hud-icons-check.png.
+
 --check <png> (diagnosis, local only): the texture exported from a capture. Checks that every replaced block lies
 inside its cell (no ring or neighbour texel under it) and covers the whole Switch letter, and writes the texture with
 each set's icons over it next to the png (<name>-<style>-<map>.png).
@@ -70,6 +77,49 @@ DPADS = {'dpad_ud': (104, 0, ('up', 'down')), 'dpad_lr': (208, 0, ('left', 'righ
 DPAD_SIZE = 104
 FACE_CAP, TAB_CAP = 43, 46   # cap heights of the game's letters in a disc and in a tab
 STROKE = 6.0                 # the letters' stem width, for the drawn symbols
+
+
+class Target:
+    """A texture of the game whose button icons are replaced. prompts.c finds it by its width (= height) and the FNV-1a
+    of the first 16 KiB of its storage as the game wrote it. Its cells: discs (centre of the inner disc, radius
+    disc_r), tabs (inner rectangle and big corner, radius tab_big), d-pads; face_cap and tab_cap are the cap heights
+    of its letters, tab_w the widest a tab's text gets (default 0.7 of the tab)."""
+    def __init__(self, name, hsh, size, discs, disc_r, tabs, tab_big, face_cap, tab_cap, dpads=None, tab_w=None):
+        self.name, self.hash, self.size = name, hsh, size
+        self.discs, self.disc_r, self.tabs, self.tab_big = discs, disc_r, tabs, tab_big
+        self.face_cap, self.tab_cap, self.dpads, self.tab_w = face_cap, tab_cap, dpads or {}, tab_w
+
+    def cells(self):
+        return [*self.discs, *self.tabs, *self.dpads]
+
+
+# The prompts' atlas: the "symbols" entry of NSW/UI/ART/FONTS/FONTS.TEX (1.0.15).
+ATLAS = Target('symbols', 0x654fe56d4ffb4ee7, 1024, DISCS, DISC_R, TABS, TAB_BIG, FACE_CAP, TAB_CAP, DPADS, tab_w=78.0)
+
+
+# The play HUD's buttons (the pitch list, the fielding diamond, ...): one 128x128 BC7 texture each, entries of
+# NSW/UI/GAME/GAME.TEX (and of THEME1, THEME2, TRAIN, FRONTEND and HRDERBY, the same bytes) named after the PlayStation
+# buttons and drawn with the Switch ones in their places: button_x (cross) is Switch B, button_circle A,
+# button_triangle X, button_square Y, button_l1 / r1 / l2 / r2 L / R / ZL / ZR (found with a RenderDoc capture of the
+# pitch list; geometry measured on the textures). A disc: radius 49 inside the ring around the texture's centre,
+# letters 48 texels tall. A tab: the inner rectangle, its big corner of radius about 33 (38 here: the blocks keep clear of the ring).
+def hud_face(name, hsh, cell):
+    return Target(name, hsh, 128, {cell: (64.0, 64.0)}, 49.0, {}, 0.0, 48, 0)
+
+
+def hud_tab(name, hsh, cell, rect, big):
+    return Target(name, hsh, 128, {}, 0.0, {cell: (rect, big)}, 38.0, 0, 40)
+
+
+TARGETS = [
+    ATLAS,
+    hud_face('button_circle', 0x9e7795814ec32b4c, 'A'), hud_face('button_x', 0xfc55934c56c5f503, 'B'),
+    hud_face('button_triangle', 0x0e124bb0e4be60dd, 'X'), hud_face('button_square', 0x92d1e6d7e03ab5f5, 'Y'),
+    hud_tab('button_l1', 0xc4556fa43dd8f284, 'L', (17, 31, 111, 97), 'tl'),
+    hud_tab('button_r1', 0xeeef6d131239d56f, 'R', (17, 31, 112, 98), 'tr'),
+    hud_tab('button_l2', 0xf5203794488141e5, 'ZL', (15, 30, 114, 99), 'tl'),
+    hud_tab('button_r2', 0x7c78b49245b74d37, 'ZR', (15, 29, 114, 99), 'tr'),
+]
 
 # What each style puts in each cell, faces by label; FACE_POSITION relabels the faces for MLB_PAD_MAP=position.
 STYLES = {
@@ -152,27 +202,30 @@ def font(cap):
     return _fonts[cap]
 
 
-def draw_glyph(c, g, cx, cy):
-    """Icon g centred on (cx, cy)."""
+def draw_glyph(c, g, cx, cy, face_cap=FACE_CAP, tab_cap=TAB_CAP, tab_w=78.0):
+    """Icon g centred on (cx, cy): letters face_cap texels tall in a disc (the drawn symbols scaled with them), tab_cap
+    in a tab, narrowed to tab_w."""
+    k = face_cap / FACE_CAP
+    stroke = STROKE * k
     if g in XBOX_COLOURS:
-        c.text(cx, cy, g, FACE_CAP, XBOX_COLOURS[g])
+        c.text(cx, cy, g, face_cap, XBOX_COLOURS[g])
     elif g in ('LB', 'RB', 'LT', 'RT', 'L1', 'R1', 'L2', 'R2'):
-        c.text(cx, cy, g, TAB_CAP, WHITE, max_w=78)
+        c.text(cx, cy, g, tab_cap, WHITE, max_w=tab_w)
     elif g == 'cross':
-        h = 15.5
-        c.line([(cx - h, cy - h), (cx + h, cy + h)], STROKE, PS_COLOURS[g])
-        c.line([(cx - h, cy + h), (cx + h, cy - h)], STROKE, PS_COLOURS[g])
+        h = 15.5 * k
+        c.line([(cx - h, cy - h), (cx + h, cy + h)], stroke, PS_COLOURS[g])
+        c.line([(cx - h, cy + h), (cx + h, cy - h)], stroke, PS_COLOURS[g])
     elif g == 'circle':
-        r = 19.0
-        c.ellipse((cx - r, cy - r, cx + r, cy + r), outline=PS_COLOURS[g], width=STROKE)
+        r = 19.0 * k
+        c.ellipse((cx - r, cy - r, cx + r, cy + r), outline=PS_COLOURS[g], width=stroke)
     elif g == 'square':
-        h = 17.0
-        c.rrect((cx - h, cy - h, cx + h, cy + h), 2.0, outline=PS_COLOURS[g], width=STROKE)
+        h = 17.0 * k
+        c.rrect((cx - h, cy - h, cx + h, cy + h), 2.0 * k, outline=PS_COLOURS[g], width=stroke)
     elif g == 'triangle':
-        s = 40.0   # side; the triangle's box is centred, a little high so it looks centred
+        s = 40.0 * k   # side; the triangle's box is centred, a little high so it looks centred
         hgt = s * math.sqrt(3) / 2
-        top, base = cy - hgt / 2 - 2.0, cy + hgt / 2 - 2.0
-        c.line([(cx, top), (cx + s / 2, base), (cx - s / 2, base), (cx, top)], STROKE, PS_COLOURS[g])
+        top, base = cy - hgt / 2 - 2.0 * k, cy + hgt / 2 - 2.0 * k
+        c.line([(cx, top), (cx + s / 2, base), (cx - s / 2, base), (cx, top)], stroke, PS_COLOURS[g])
     elif g in ('menu', 'options'):   # three lines, as on both controllers' button
         for dy in (-11.0, 0.0, 11.0):
             c.line([(cx - 16.0, cy + dy), (cx + 16.0, cy + dy)], 5.5, WHITE)
@@ -226,18 +279,18 @@ def draw_dpad(c, x0, y0, lit):
 
 
 # ---------------------------------------------------------------- the blocks of a cell
-def inside_disc(px, py, name, margin):
-    cx, cy = DISCS[name]
-    return (px - cx) ** 2 + (py - cy) ** 2 <= (DISC_R - margin) ** 2
+def inside_disc(t, px, py, name, margin):
+    cx, cy = t.discs[name]
+    return (px - cx) ** 2 + (py - cy) ** 2 <= (t.disc_r - margin) ** 2
 
 
-def inside_tab(px, py, name, margin):
-    (x0, y0, x1, y1), big = TABS[name]
+def inside_tab(t, px, py, name, margin):
+    (x0, y0, x1, y1), big = t.tabs[name]
     x0, y0, x1, y1 = x0 + margin, y0 + margin, x1 - margin, y1 - margin
     if not (x0 <= px <= x1 and y0 <= py <= y1):
         return False
     for k, (qx, qy) in {'tl': (x0, y0), 'tr': (x1, y0), 'bl': (x0, y1), 'br': (x1, y1)}.items():
-        r = max(TAB_BIG - margin, 0.0) if k == big else TAB_SMALL
+        r = max(t.tab_big - margin, 0.0) if k == big else TAB_SMALL
         ccx = qx + r if k[1] == 'l' else qx - r
         ccy = qy + r if k[0] == 't' else qy - r
         beyond_x = px < ccx if k[1] == 'l' else px > ccx
@@ -247,33 +300,33 @@ def inside_tab(px, py, name, margin):
     return True
 
 
-def cell_blocks(name):
+def cell_blocks(t, name):
     """(bx, by) of the 4x4 blocks the cell's icon replaces: every corner of the block a texel inside the disc or tab,
     or the whole square of a d-pad."""
-    if name in DPADS:
-        x0, y0, _ = DPADS[name]
+    if name in t.dpads:
+        x0, y0, _ = t.dpads[name]
         return [(bx, by) for by in range(y0 // 4, (y0 + DPAD_SIZE) // 4)
                 for bx in range(x0 // 4, (x0 + DPAD_SIZE) // 4)]
-    inside = inside_disc if name in DISCS else inside_tab
-    return [(bx, by) for by in range(256) for bx in range(256)
-            if all(inside(px, py, name, 1.0) for px in (bx * 4, bx * 4 + 4) for py in (by * 4, by * 4 + 4))]
+    inside = inside_disc if name in t.discs else inside_tab
+    n = t.size // 4
+    return [(bx, by) for by in range(n) for bx in range(n)
+            if all(inside(t, px, py, name, 1.0) for px in (bx * 4, bx * 4 + 4) for py in (by * 4, by * 4 + 4))]
 
 
-def render_cell(name, glyph):
+def render_cell(t, name, glyph):
     """The cell's blocks and their texels: ([(bx, by)], [(16, 4) uint8])."""
-    blocks = cell_blocks(name)
+    blocks = cell_blocks(t, name)
     bx0, by0 = min(b[0] for b in blocks), min(b[1] for b in blocks)
     bx1, by1 = max(b[0] for b in blocks) + 1, max(b[1] for b in blocks) + 1
-    c = Canvas(bx0 * 4, by0 * 4, (bx1 - bx0) * 4, (by1 - by0) * 4, (0, 0, 0, 0) if name in DPADS else FILL)
-    if name in DPADS:
-        draw_dpad(c, *DPADS[name])
+    c = Canvas(bx0 * 4, by0 * 4, (bx1 - bx0) * 4, (by1 - by0) * 4, (0, 0, 0, 0) if name in t.dpads else FILL)
+    if name in t.dpads:
+        draw_dpad(c, *t.dpads[name])
+    elif name in t.discs:
+        cx, cy = t.discs[name]
+        draw_glyph(c, glyph, cx, cy, face_cap=t.face_cap)
     else:
-        if name in DISCS:
-            cx, cy = DISCS[name]
-        else:
-            (x0, y0, x1, y1), _ = TABS[name]
-            cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-        draw_glyph(c, glyph, cx, cy)
+        (x0, y0, x1, y1), _ = t.tabs[name]
+        draw_glyph(c, glyph, (x0 + x1) / 2, (y0 + y1) / 2, tab_cap=t.tab_cap, tab_w=t.tab_w or 0.7 * (x1 - x0))
     t = c.texels()
     return blocks, [t[(by - by0) * 4:(by - by0) * 4 + 4, (bx - bx0) * 4:(bx - bx0) * 4 + 4].reshape(16, 4)
                     for bx, by in blocks]
@@ -483,22 +536,24 @@ def decode(blocks, bw, bh):
 
 # ---------------------------------------------------------------- the sets and the header
 def build():
-    """({(cell, icon): (blocks, texels)}, [[(cell, icon)] per set])."""
+    """({(target, cell, icon): (blocks, texels)}, [[(target, cell, icon)] per set])."""
     sets, patches = [], {}
     for style, mapping in SETS:
         s = []
-        for cell in [*DISCS, *TABS, *DPADS]:
-            src = FACE_POSITION.get(cell, cell) if mapping == 'position' else cell
-            key = (cell, 'dpad' if cell in DPADS else STYLES[style][src])
-            if key not in patches:
-                patches[key] = render_cell(cell, key[1])
-            s.append(key)
+        for t in TARGETS:
+            for cell in t.cells():
+                src = FACE_POSITION.get(cell, cell) if mapping == 'position' else cell
+                key = (t.name, cell, 'dpad' if cell in t.dpads else STYLES[style][src])
+                if key not in patches:
+                    patches[key] = render_cell(t, cell, key[2])
+                s.append(key)
         sets.append(s)
     return patches, sets
 
 
 def write_header(path, patches, sets, encoded):
     keys = list(patches)
+    names = [t.name for t in TARGETS]
     blob, runs, rows = bytearray(), [], []
     for k in keys:
         blocks = patches[k][0]
@@ -510,22 +565,27 @@ def write_header(path, patches, sets, encoded):
             else:
                 runs.append([bx, by, 1, len(blob) // 16])
             blob += encoded[k][at[(bx, by)]]
-        rows.append((r0, len(runs) - r0))
+        rows.append((r0, len(runs) - r0, names.index(k[0])))
     n = len(sets[0])
     out = ['// Generated by tools/make_prompts.py: the Xbox and PlayStation button icons runtime/mlb/prompts.c copies over',
            "// the game's Switch ones. Drawn from shapes and Windows' Bahnschrift font; nothing of the game. Do not edit.",
            '#pragma once', '#include <stdint.h>', '',
            f'enum {{ PROMPT_BLOCKS = {len(blob) // 16}, PROMPT_RUNS = {len(runs)}, PROMPT_PATCHES = {len(keys)}, '
-           f'PROMPT_SETS = {len(sets)}, PROMPT_SET_PATCHES = {n} }};', '',
-           '// The BC7 blocks of every patch, run after run (16 bytes each).',
-           'static const uint8_t prompt_blocks[PROMPT_BLOCKS * 16] = {']
+           f'PROMPT_SETS = {len(sets)}, PROMPT_SET_PATCHES = {n}, PROMPT_TARGETS = {len(TARGETS)} }};', '',
+           "// The game's textures the icons go over: FNV-1a of the first 16 KiB of the storage, and the width (= height).",
+           'static const uint64_t prompt_target_hash[PROMPT_TARGETS] = {']
+    out += ['    0x%016xull,   // %s' % (t.hash, t.name) for t in TARGETS]
+    out += ['};', 'static const uint16_t prompt_target_size[PROMPT_TARGETS] = {' +
+            ', '.join(str(t.size) for t in TARGETS) + '};', '',
+            '// The BC7 blocks of every patch, run after run (16 bytes each).',
+            'static const uint8_t prompt_blocks[PROMPT_BLOCKS * 16] = {']
     out += ['    ' + ','.join(map(str, blob[i:i + 48])) + ',' for i in range(0, len(blob), 48)]
     out += ['};', '// Runs of blocks along a row: x and y of the first (in blocks), count, its index in prompt_blocks.',
             'static const uint16_t prompt_runs[PROMPT_RUNS][4] = {']
     out += ['    {%d, %d, %d, %d},' % tuple(r) for r in runs]
-    out += ['};', '// One icon in one cell: first run, number of runs.',
-            'static const uint16_t prompt_patches[PROMPT_PATCHES][2] = {']
-    out += ['    {%d, %d},   // %s: %s' % (r[0], r[1], k[0], k[1]) for k, r in zip(keys, rows)]
+    out += ['};', '// One icon in one cell: first run, number of runs, target.',
+            'static const uint16_t prompt_patches[PROMPT_PATCHES][3] = {']
+    out += ['    {%d, %d, %d},   // %s %s: %s' % (r[0], r[1], r[2], *k) for k, r in zip(keys, rows)]
     out += ['};', '// The patches of each set: ' + ', '.join(f'{st} by {mp}' for st, mp in SETS) + '.',
             'static const uint16_t prompt_sets[PROMPT_SETS][PROMPT_SET_PATCHES] = {']
     out += ['    {' + ', '.join(str(keys.index(k)) for k in s) + '},' for s in sets]
@@ -539,8 +599,8 @@ def check(png, patches, sets, encoded):
     tex = np.asarray(Image.open(png).convert('RGBA')).copy()
     lum = tex[..., :3].astype(int).mean(-1)
     problems = 0
-    for (cell, g), (blocks, _) in patches.items():
-        if cell in DPADS:
+    for (tname, cell, g), (blocks, _) in patches.items():
+        if tname != ATLAS.name or cell in DPADS:
             continue
         cover = np.zeros(lum.shape, bool)
         for bx, by in blocks:
@@ -551,7 +611,7 @@ def check(png, patches, sets, encoded):
         # the Switch letter: bright texels 4 texels or more inside the ring, all under replaced blocks
         ys, xs = np.nonzero(lum > 80)
         inside = inside_disc if cell in DISCS else inside_tab
-        inner = np.array([inside(x + 0.5, y + 0.5, cell, 4.0) for x, y in zip(xs, ys)], bool)
+        inner = np.array([inside(ATLAS, x + 0.5, y + 0.5, cell, 4.0) for x, y in zip(xs, ys)], bool)
         miss = inner & ~cover[ys, xs]
         if miss.any():
             print(f'{cell}: {miss.sum()} letter texels outside the replaced blocks')
@@ -567,6 +627,8 @@ def check(png, patches, sets, encoded):
     for (style, mapping), s in zip(SETS, sets):
         out = tex.copy()
         for k in s:
+            if k[0] != ATLAS.name:
+                continue
             blocks = patches[k][0]
             dec = decode(encoded[k], len(blocks), 1)
             for i, (bx, by) in enumerate(blocks):
@@ -576,10 +638,110 @@ def check(png, patches, sets, encoded):
         print('wrote', name)
 
 
+def tx12_entry(pack, name):
+    """The storage of one texture of a TX12NSW pack (the game's texture files) as the game loads it: entries of 0x140
+    bytes from 0x30 (name, ..., +0x50 size, width, height, +0xc0 size, stored size, +0x124 offset), LZ4 blocks when
+    the stored size is smaller. Local diagnosis only (needs the lz4 module)."""
+    import lz4.block
+    d = pack.read_bytes()
+    for i in range(8192):
+        o = 0x30 + i * 0x140
+        nm = d[o:o + 0x40].split(b'\0')[0]
+        if not nm:
+            break
+        if nm.decode('latin1') != name:
+            continue
+        size, csize = struct.unpack_from('<II', d, o + 0xc0)
+        off = struct.unpack_from('<I', d, o + 0x124)[0]
+        raw = d[off:off + csize]
+        return lz4.block.decompress(raw, uncompressed_size=size) if csize < size else raw
+    return None
+
+
+def deswizzle(raw, w_blocks, h_blocks):
+    """Block-linear BC storage (16-byte blocks, GOBs of 64 bytes x 8 rows, the tallest block height that fits) to
+    row-major blocks."""
+    row = w_blocks * 16
+    gobs_w, bh = (row + 63) // 64, 1
+    while bh < 16 and bh * 8 < h_blocks:
+        bh *= 2
+    out = bytearray(row * h_blocks)
+    for y in range(h_blocks):
+        for xb in range(row):
+            x = xb % 64
+            off = ((y // (8 * bh)) * gobs_w + xb // 64) * 512 * bh + ((y % (8 * bh)) // 8) * 512
+            off += (x // 32) * 256 + ((y % 8) // 2) * 64 + ((x % 32) // 16) * 32 + (y % 2) * 16 + (x % 16)
+            out[y * row + xb] = raw[off]
+    return bytes(out)
+
+
+def fnv16k(b):
+    h = 0xcbf29ce484222325
+    for c in b[:16384]:
+        h = ((h ^ c) * 0x100000001b3) & 0xffffffffffffffff
+    return h
+
+
+def check_hud(pack, patches, sets, encoded):
+    """--check-hud: each play HUD target read from the game's pack (NSW/UI/GAME/GAME.TEX): its hash, the replaced
+    blocks against it (dark fill or the old letter only, every letter texel covered), and a preview of every set next
+    to the pack's name under work/scratch (local only)."""
+    problems, tiles = 0, {}
+    for t in TARGETS[1:]:
+        raw = tx12_entry(pack, t.name)
+        if raw is None:
+            print(f'{t.name}: not in {pack}')
+            problems += 1
+            continue
+        if fnv16k(raw) != t.hash:
+            print(f'{t.name}: hash {fnv16k(raw):016x}, expected {t.hash:016x}')
+            problems += 1
+        n = t.size // 4
+        lin = deswizzle(raw, n, n)
+        tex = decode([lin[i:i + 16] for i in range(0, len(lin), 16)], n, n).copy()
+        lum = tex[..., :3].astype(int).mean(-1)
+        (cell,) = t.cells()
+        inside = inside_disc if cell in t.discs else inside_tab
+        blocks = cell_blocks(t, cell)
+        cover = np.zeros(lum.shape, bool)
+        for bx, by in blocks:
+            cover[by * 4:by * 4 + 4, bx * 4:bx * 4 + 4] = True
+        ys, xs = np.nonzero(cover)
+        bad = [(x, y) for x, y in zip(xs, ys) if tex[y, x, 3] < 255 or
+               (lum[y, x] > 80 and not inside(t, x + 0.5, y + 0.5, cell, 4.0))]
+        if bad:
+            print(f'{t.name}: {len(bad)} replaced texels are ring or transparent, first {bad[0]}')
+            problems += 1
+        ys, xs = np.nonzero((lum > 80) & (tex[..., 3] == 255))
+        letter = [(x, y) for x, y in zip(xs, ys) if inside(t, x + 0.5, y + 0.5, cell, 4.0)]
+        miss = [p for p in letter if not cover[p[1], p[0]]]
+        if miss:
+            print(f'{t.name}: {len(miss)} letter texels outside the replaced blocks, first {miss[0]}')
+            problems += 1
+        for si, s in enumerate(sets):
+            out = tex.copy()
+            for k in s:
+                if k[0] == t.name:
+                    dec = decode(encoded[k], len(patches[k][0]), 1)
+                    for i, (bx, by) in enumerate(patches[k][0]):
+                        out[by * 4:by * 4 + 4, bx * 4:bx * 4 + 4] = dec[:, i * 4:i * 4 + 4]
+            tiles.setdefault(si, [tex]).append(out)
+    print('check-hud:', 'ok' if not problems else f'{problems} problems')
+    sheet = Image.new('RGBA', (len(TARGETS) * 136, len(SETS) * 136), (60, 90, 60, 255))
+    for si, row in tiles.items():
+        for j, im in enumerate(row[1:]):
+            sheet.alpha_composite(Image.fromarray(im), (j * 136 + 4, si * 136 + 4))
+    path = ROOT / 'work' / 'scratch' / 'hud-icons-check.png'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(path)
+    print('wrote', path, '(rows:', ', '.join(f'{st} by {mp}' for st, mp in SETS) + ')')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--out', type=Path, default=ROOT / 'work' / 'gen' / 'prompt_icons.h')
     ap.add_argument('--check', type=Path, help='the symbols texture exported from a capture (diagnosis)')
+    ap.add_argument('--check-hud', type=Path, help="the game's NSW/UI/GAME/GAME.TEX (diagnosis)")
     a = ap.parse_args()
     if not FONT.is_file():
         sys.exit(f'{FONT} not found (Windows 10 and later have it)')
@@ -600,10 +762,12 @@ def main():
         dif[..., :3] *= src[..., 3:4] / 255.0
         worst = max(worst, (float(dif.mean()), k), key=lambda w: w[0])
     print(f'make_prompts: {len(keys)} icons, {len(blocks)} blocks, worst mean texel error {worst[0]:.2f} '
-          f'({worst[1][0]}: {worst[1][1]})')
+          f'({" ".join(worst[1])})')
     write_header(a.out, patches, sets, encoded)
     if a.check:
         check(a.check, patches, sets, encoded)
+    if a.check_hud:
+        check_hud(a.check_hud, patches, sets, encoded)
 
 
 if __name__ == '__main__':

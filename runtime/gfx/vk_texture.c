@@ -1194,17 +1194,18 @@ static int upload_gpu(Tex *e) {
 
 // Copies the whole storage into the image (every level and layer the image has): on the GPU where it can
 // (upload_gpu), else on the CPU.
-// mlbts-native: the controller's button icons over the game's Switch ones (runtime/mlb/prompts.c). MLB draws every
-// button of its prompts from one 1024x1024 BC7 texture; after each upload of a texture of that shape whose storage is
-// that texture, the blocks of the icon set in use are copied over the image (the storage keeps the Switch icons).
-// prompts_fresh uploads it again when the set changed: another kind of controller used, or the settings menu.
+// mlbts-native: the controller's button icons over the game's Switch ones (runtime/mlb/prompts.c). MLB draws the
+// buttons of its prompts from one 1024x1024 BC7 texture and those of its play HUD from one 128x128 BC7 texture each;
+// after each upload of a texture of such a shape whose storage is one of them (e->prompts: 1 + the target), the
+// blocks of the icon set in use are copied over the image (the storage keeps the Switch icons). prompts_fresh uploads
+// it again when the set changed: another kind of controller used, the settings menu, or menus and play (MLB_PAD_MAP).
 static void prompts_apply(Tex *e) {
-    e->prompts = (uint8_t)mlb_prompts_is_icons(e->pub.addr, e->t.mem, e->t.L.size);
+    e->prompts = (uint8_t)mlb_prompts_is_icons(e->pub.addr, e->t.mem, e->t.L.size, e->t.d.width);
     e->prompts_set = -1;
     if (!e->prompts) return;
     int set = mlb_prompts_set(), nblocks = 0;
     const MlbPromptRun *runs = NULL;
-    int n = mlb_prompts_runs(set, &runs, &nblocks);
+    int n = mlb_prompts_runs(set, e->prompts - 1, &runs, &nblocks);
     e->prompts_set = (int8_t)set;
     if (!n) return;
     VkBufferImageCopy *rg = calloc((size_t)n, sizeof *rg);
@@ -1227,9 +1228,12 @@ static void prompts_apply(Tex *e) {
     vk_upload_end();
     free(rg);
     static int logged = -2;
-    if (logged != set) {
-        logged = set;
-        rt_log("prompts: texture %#llx: button icon set %d (%d blocks)", (unsigned long long)e->pub.addr, set, nblocks);
+    static uint32_t targets_seen;   // each target's first patch, then a line when the set changes
+    uint32_t bit = 1u << ((e->prompts - 1) & 31);
+    if (logged != set || !(targets_seen & bit)) {
+        logged = set, targets_seen |= bit;
+        rt_log("prompts: texture %#llx (target %d, %ux%u): button icon set %d (%d blocks)",
+               (unsigned long long)e->pub.addr, e->prompts - 1, e->t.d.width, e->t.d.height, set, nblocks);
     }
 }
 

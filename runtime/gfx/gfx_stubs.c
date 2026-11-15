@@ -214,6 +214,8 @@ int mlb_capture_tick(uint64_t frame, const char **shot) {
     }
     if (f12 && !f12_was) gfx_capture_arm(2);
     f12_was = f12 != 0;
+    void mlb_state_dump_tick(uint64_t frame);   // mlbts-native: F8, statedump.c (diagnostic)
+    mlb_state_dump_tick(frame);
     if ((long)frame == __atomic_load_n(&capture_at, __ATOMIC_RELAXED)) {
         snprintf(path, sizeof path, "%s/shot-%llu.png", rt_config()->profile, (unsigned long long)frame);
         *shot = path;
