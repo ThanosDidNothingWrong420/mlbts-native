@@ -942,8 +942,8 @@ static void count_use(int cls, int use, uint64_t n) {
 // MLB's celebrations on the field run, for each player, a few dispatches of one compute shader (44eefd63: strands or
 // cloth from the bones) and then one draw of its output, inside a 1440x810 pass: about 45 such switches a frame. A
 // dispatch cannot run inside a Vulkan pass, so each switch ended the pass, drained the GPU with a full barrier, ran the
-// dispatch and drained it again at the pass restart: about 6 ms of a 14 ms frame went to these waits (46 fps). The
-// game orders none of them with barriers of its own (154 a frame). Now such a dispatch skips the first drain when it
+// dispatch and drained it again at the pass restart: about 6 ms of a 14 ms frame went to these waits (46 fps). Now
+// such a dispatch skips the first drain when it
 // writes nothing the draws since the last full barrier read or write and reads nothing they write (their storage
 // writes, the passes' targets); the pass restart then waits only for the compute work (before the next draws and
 // dispatches) and the targets' earlier writes, when it renders to the same targets and nothing else was recorded since
@@ -951,6 +951,13 @@ static void count_use(int cls, int use, uint64_t n) {
 // textures, the passes' targets; a draw with a storage image leaves no such dispatch until the next full barrier. A
 // dispatch with a storage image, a copy while binding, or one that shares memory with the draws keeps the full barrier.
 // Dispatches chained after such a dispatch are checked the same way. MLB_LIGHT_DISPATCH=0: full barriers, as before.
+// The game also puts a barrier of its own (nvnCommandBufferBarrier) between a player's draw and the next dispatches,
+// one a switch (a celebration frame has about 150 barriers against 90 elsewhere), and that barrier, replayed as a full
+// one, ended the pass before the dispatch came: the check above almost never ran (0.7 of about 45 switches a frame).
+// Such a game barrier inside a pass is now put off (vk_exec_game_barrier): a dispatch next takes its place with the
+// check, any other command records it first (vk_exec_light_flush). One after dispatches that went without the full
+// barrier only waits for the compute work. Both only while the draws since the last full barrier wrote no storage
+// (their writes to the passes' targets are ordered by the narrow barrier at the restart).
 #define LT_N 4096   // ranges the draws since the last full barrier read or write
 #define LT_W 256    // of those, the ones they write
 #define LT_B 96     // ranges of the last draw's descriptor build (a skipped build notes them again)
@@ -978,8 +985,19 @@ static struct {
     int pending;                       // a dispatch since the last pass went without the full barrier
     VkCommandBuffer pend_cb;
     LtSig sig;                         // the pass it ended
-    uint64_t light, hit, other, chk, chk_full, narrow, narrow_no;
-} LT = {.cfg = -1, .at = -2};
+    int dsw;                           // a draw since the last full barrier binds storage it writes
+    int defer_rec, nb_rec;             // a game barrier put off at ex->recorded; one narrowed, recorded right after it
+    VkCommandBuffer defer_cb, nb_cb;
+    uint64_t defer_fence, nb_fence;
+    uint64_t light, hit, other, chk, chk_full, narrow, narrow_no, bar_defer, bar_narrow;
+    uint64_t why[5];   // other: feedback layouts or a dump, a BC stand-in, a storage image or copy, too many notes, a barrier
+    uint64_t nwhy[3];  // restart with the full barrier: feedback layouts, commands recorded since, other targets
+} LT = {.cfg = -1, .at = -2, .nb_rec = -1};
+// vk_exec.c walk: 1, a game barrier inside a pass is put off; 2, one after light dispatches was narrowed (draws may
+// follow too). vk_exec_light_flush records the full barrier before any other command.
+int vk_exec_bar_deferred;
+void vk_exec_light_flush(VkExec *ex);
+static long drawlog_now_l(void);
 
 static int lt_on(void) {
     if (LT.cfg < 0) {
@@ -994,7 +1012,7 @@ static int lt_on(void) {
 static void lt_sync(const VkExec *ex) {   // a full barrier since the notes began: they start again
     if (LT.at == ex->barrier_at && LT.fence == ex->fence) return;
     LT.at = ex->barrier_at, LT.fence = ex->fence;
-    LT.n = LT.nw = LT.over = 0;
+    LT.n = LT.nw = LT.over = LT.dsw = 0;
     memset(LT.ball, 0, sizeof LT.ball), memset(LT.bw, 0, sizeof LT.bw);
     LT.gen++;
 }
@@ -1049,6 +1067,7 @@ static void lt_bind(const VkExec *ex, uint64_t a, uint64_t n, int w) {
     else LT.blo[LT.bn] = a, LT.bhi[LT.bn] = a + n, LT.bw8[LT.bn++] = (uint8_t)(w != 0);
     lt_sync(ex);
     lt_add(a, n, w != 0);
+    if (w) LT.dsw = 1;
 }
 
 // An image binding (bind_resources): a storage image keeps the full barriers; the dispatch's sampled textures are
@@ -1326,20 +1345,22 @@ static void dispatch_copy_guard(VkExec *ex) {
 static int lt_begin(VkExec *ex) {
     if (!ex->in_pass || !lt_on()) return 0;
     if (ex->nfbl || vk_dump_armed) {   // feedback-loop layouts go back to GENERAL in the full barrier
-        LT.other++;
+        LT.other++, LT.why[0]++;
         return 0;
     }
+    for (uint32_t i = 0; i < ex->pass_ncolor && i < 8; i++)   // a 3D BC target's stand-in is copied at the pass end
+        if (ex->color[i].image && ex->color[i].img && ex->color[i].img->image != ex->color[i].image) {
+            LT.other++, LT.why[1]++;
+            return 0;
+        }
     LtSig s;
     lt_sig(ex, &s);
     vk_exec_dispatch_run_close(ex);
     ex->mark = NULL;   // perf: a timestamp waits for the work before it; this pass stays untimed
-    int r = ex->recorded;
+    // Query ends only. Uniform updates overlaid in the pass stay overlaid (no copies now): the dispatch and the draws
+    // after it bind their scratch bytes (ub_bind), a dispatch storing over one records the copies first (ub_written),
+    // and the next full barrier records them, as for updates overlaid between passes (TOTK_UB_OVERLAY_OUT).
     vk_exec_pass_end(ex);
-    if (ex->recorded == r + 1) vk_exec_ub_flush(ex);
-    if (ex->recorded != r + 1) {   // copies after the pass (3D BC targets, queries, uniform updates of the pass)
-        LT.other++;
-        return 0;
-    }
     LT.sig = s;
     LT.cand = 1, LT.cand_at = ex->barrier_at, LT.dbad = LT.dn = LT.dnt = LT.chained = 0, LT.nchk = 0;
     return 1;
@@ -1377,7 +1398,7 @@ static void lt_end(VkExec *ex, int expect) {
     if (LT.chained) LT.chk++, LT.chk_full += !ok;
     else if (ok) LT.light++;
     else if (hit) LT.hit++;
-    else LT.other++;
+    else LT.other++, LT.why[LT.dbad ? 2 : LT.over ? 3 : 4]++;
     if (ok) {
         LT.pending = 1, LT.pend_cb = ex->cb;
         return;
@@ -1385,27 +1406,75 @@ static void lt_end(VkExec *ex, int expect) {
     vk_exec_barrier(ex);
 }
 
+// Nothing but light dispatches (and the narrowed game barrier after them) recorded since the pass they ended
+static int lt_after_light(const VkExec *ex) {
+    if (!LT.pending || ex->cb != LT.pend_cb || ex->cb != disp_cb || ex->fence != disp_fence) return 0;
+    return ex->recorded == disp_rec || (ex->recorded == LT.nb_rec && ex->cb == LT.nb_cb && ex->fence == LT.nb_fence);
+}
+
+// A game barrier put off in this pass with nothing recorded since (op_dispatch: the dispatch takes its place)
+static int lt_deferred(const VkExec *ex) {
+    return vk_exec_bar_deferred == 1 && ex->in_pass && LT.defer_rec == ex->recorded && LT.defer_cb == ex->cb &&
+           LT.defer_fence == ex->fence;
+}
+
+// vk_exec.c walk: OP_BARRIER (NVNbarrierBits)
+void vk_exec_game_barrier(VkExec *ex, int bits) {
+    if (drawlog_now_l()) rt_log("drawlog barrier bits %#x%s", (unsigned)bits, ex->in_pass ? " in a pass" : "");
+    if (LT.cfg == 1) {
+        lt_sync(ex);
+        int quiet = !LT.dsw && !LT.over && !ex->nfbl && !vk_dump_armed;
+        if (quiet && ex->in_pass) {   // put off: a dispatch next checks what it shares with the draws instead
+            if (!lt_deferred(ex)) LT.bar_defer++;
+            vk_exec_bar_deferred = 1;
+            LT.defer_rec = ex->recorded, LT.defer_cb = ex->cb, LT.defer_fence = ex->fence;
+            return;
+        }
+        if (quiet && lt_after_light(ex)) {   // after light dispatches: the compute work before what follows
+            vk_exec_bar_deferred = 2;
+            if (ex->recorded == LT.nb_rec) return;   // right after the last one
+            VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                                   .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                   .srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT,
+                                   .dstStageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                   .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+            VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+            vk_exec_dispatch_run_close(ex);
+            vkCmdPipelineBarrier2(ex->cb, &di);
+            LT.nb_rec = ++ex->recorded, LT.nb_cb = ex->cb, LT.nb_fence = ex->fence;
+            LT.bar_narrow++;
+            return;
+        }
+    }
+    vk_exec_light_flush(ex);
+    vk_exec_barrier(ex);
+}
+
+// vk_exec.c walk, before a command other than a bind, a state change, a uniform update, a dispatch or a barrier: the
+// game barrier put off goes in now
+void vk_exec_light_flush(VkExec *ex) {
+    int m = vk_exec_bar_deferred;
+    vk_exec_bar_deferred = 0;
+    if (m == 1 && LT.defer_cb == ex->cb && LT.defer_fence == ex->fence) vk_exec_barrier(ex);
+    if (m == 2 && LT.nb_cb == ex->cb && LT.nb_fence == ex->fence && LT.nb_rec == ex->recorded) vk_exec_barrier(ex);
+}
+
 // vk_exec.c pass_begin, before its barrier: 1 when the pass restarts after dispatches that went without the full
 // barrier, on the targets of the pass they ended, with nothing else recorded since; then only a barrier from the
 // compute work (to the draws and later dispatches) and from the targets' earlier writes is recorded here.
 int vk_exec_light_restart(VkExec *ex, int nwant) {
-    int p = LT.pending;
+    vk_exec_bar_deferred = 0;   // a narrowed game barrier: the barrier below (or the full one) is after it
+    if (!LT.pending) return 0;
+    int after = lt_after_light(ex);   // reads LT.pending
     LT.pending = 0;
-    if (!p) return 0;
     LtSig s;
     lt_sig(ex, &s);
-    if (nwant || ex->nfbl || ex->cb != LT.pend_cb || ex->cb != disp_cb || ex->fence != disp_fence ||
-        ex->recorded != disp_rec || memcmp(&s, &LT.sig, sizeof s)) {
-        LT.narrow_no++;
+    int why = nwant || ex->nfbl ? 0 : !after ? 1 : memcmp(&s, &LT.sig, sizeof s) ? 2 : -1;
+    if (why >= 0) {
+        LT.narrow_no++, LT.nwhy[why]++;
         return 0;
     }
-    vk_exec_dispatch_run_close(ex);
-    int r = ex->recorded;
-    vk_exec_ub_flush(ex);
-    if (ex->recorded != r) {   // uniform update copies: the full barrier after them
-        LT.narrow_no++;
-        return 0;
-    }
+    vk_exec_dispatch_run_close(ex);   // overlaid uniform updates stay overlaid (lt_begin)
     VkMemoryBarrier2 mb[2] = {
         {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
          .srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT,
@@ -1438,14 +1507,19 @@ void vk_exec_light_pass(VkExec *ex) {
 
 // vk_exec.c op_report (MLB_TRACE=perf), every 600 frames
 void vk_exec_light_report(double nf) {
-    static uint64_t p[7];
-    uint64_t c[7] = {LT.light, LT.hit, LT.other, LT.chk, LT.chk_full, LT.narrow, LT.narrow_no};
-    if (LT.cfg == 1 && c[0] + c[1] + c[2] != p[0] + p[1] + p[2])
+    static uint64_t p[17];
+    uint64_t c[17] = {LT.light, LT.hit, LT.other, LT.chk, LT.chk_full, LT.narrow, LT.narrow_no, LT.bar_defer, LT.bar_narrow,
+                      LT.why[0], LT.why[1], LT.why[2], LT.why[3], LT.why[4], LT.nwhy[0], LT.nwhy[1], LT.nwhy[2]};
+    double d[17];
+    for (int i = 0; i < 17; i++) d[i] = (double)(c[i] - p[i]) / nf;
+    if (LT.cfg == 1 && d[0] + d[1] + d[2] + d[7] > 0)
         rt_log("perf: compute between draws, per frame: %.1f dispatches without the full barrier, %.1f with it (%.1f sharing "
-               "memory with the draws, %.1f other); %.1f chained after them checked, %.1f of those with it; pass restarts "
-               "after them: %.1f with a narrow barrier, %.1f with the full one", (c[0] - p[0]) / nf,
-               (c[1] - p[1] + c[2] - p[2]) / nf, (c[1] - p[1]) / nf, (c[2] - p[2]) / nf, (c[3] - p[3]) / nf,
-               (c[4] - p[4]) / nf, (c[5] - p[5]) / nf, (c[6] - p[6]) / nf);
+               "memory with the draws; other: %.1f feedback layouts, %.1f BC targets, %.1f a storage image or copy, %.1f too "
+               "many notes, %.1f a barrier while binding); %.1f chained after them checked, %.1f of those with it; pass "
+               "restarts after them: %.1f with a narrow barrier, %.1f with the full one (%.1f feedback layouts, %.1f "
+               "commands recorded since, %.1f other targets); game barriers in a pass put off %.1f, after them narrowed "
+               "%.1f", d[0], d[1] + d[2], d[1], d[9], d[10], d[11], d[12], d[13], d[3], d[4], d[5], d[6], d[14], d[15],
+               d[16], d[7], d[8]);
     memcpy(p, c, sizeof p);
 }
 
@@ -4713,7 +4787,15 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
         vk_exec_ub_flush(ex);
         chained = ex->recorded == r;
     }
-    if (!chained) {
+    // compute between draws: a game barrier put off in this pass is replaced by lt_begin's check (else by the full
+    // barrier); after one narrowed behind light dispatches (vk_exec_game_barrier), this dispatch is checked as a chained one
+    if (vk_exec_bar_deferred == 1 && !lt_deferred(ex)) vk_exec_light_flush(ex);
+    vk_exec_bar_deferred = 0;   // 2: after_nb below, else the full barrier
+    int after_nb = !chained && !ex->in_pass && LT.cfg == 1 && LT.pending && ex->cb == LT.pend_cb &&
+                   ex->recorded == LT.nb_rec && ex->cb == LT.nb_cb && ex->fence == LT.nb_fence;
+    if (after_nb) {
+        lt_chain(ex);
+    } else if (!chained) {
         if (!lt_begin(ex)) vk_exec_barrier(ex);   // ends the pass; earlier writes are visible to the shader
     } else {
         n_chained++;

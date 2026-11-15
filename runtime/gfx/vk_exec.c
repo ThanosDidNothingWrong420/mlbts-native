@@ -956,9 +956,48 @@ static void op_report(void) {
     }
     rt_log("%s", line);
     void vk_exec_light_report(double nf);   // vk_exec_draw.c
+    void vk_exec_light_flush_report(double nf);
     vk_exec_light_report(nf);
+    vk_exec_light_flush_report(nf);
     memset(opn, 0, sizeof opn), memset(opt, 0, sizeof opt);
     fr0 = fr, tsc0 = tsc, ns0 = ns;
+}
+
+// vk_exec_draw.c (compute between draws): a game barrier inside a pass is put off until a dispatch takes its place;
+// these commands record nothing in between (binds and state are recorded with the next draw or dispatch, an update
+// inside a pass is overlaid), any other records the barrier first.
+void vk_exec_game_barrier(VkExec *ex, int bits);
+void vk_exec_light_flush(VkExec *ex);
+extern int vk_exec_bar_deferred;
+#define LIGHT_BIT(op) (1ull << (op))
+#define LIGHT_SAFE                                                                                                     \
+    (LIGHT_BIT(OP_END) | LIGHT_BIT(OP_BEGIN) | LIGHT_BIT(OP_JUMP) | LIGHT_BIT(OP_CALL) | LIGHT_BIT(OP_UPDATE_UB) |    \
+     LIGHT_BIT(OP_VIEWPORTS) | LIGHT_BIT(OP_SCISSOR) | LIGHT_BIT(OP_DEPTH_RANGE) | LIGHT_BIT(OP_BIND_PROGRAM) |       \
+     LIGHT_BIT(OP_BIND_STATE) | LIGHT_BIT(OP_BIND_VATTR) | LIGHT_BIT(OP_BIND_VSTREAM) | LIGHT_BIT(OP_BIND_VBUF) |    \
+     LIGHT_BIT(OP_BIND_UBO) | LIGHT_BIT(OP_BIND_SSBO) | LIGHT_BIT(OP_BIND_TEX) | LIGHT_BIT(OP_BIND_SAMP) |           \
+     LIGHT_BIT(OP_BIND_IMG) | LIGHT_BIT(OP_STENCIL) | LIGHT_BIT(OP_POLY_OFFSET) | LIGHT_BIT(OP_BLEND_COLOR) |        \
+     LIGHT_BIT(OP_DEPTH_CLAMP) | LIGHT_BIT(OP_RASTER_DISCARD) | LIGHT_BIT(OP_PRIM_RESTART) |                        \
+     LIGHT_BIT(OP_COPY_STRIDE) | LIGHT_BIT(OP_SET_TEX_POOL) | LIGHT_BIT(OP_SET_SAMP_POOL) | LIGHT_BIT(OP_DISPATCH) | \
+     LIGHT_BIT(OP_BARRIER))
+#define LIGHT_DRAWS (LIGHT_BIT(OP_DRAW) | LIGHT_BIT(OP_DRAW_IDX) | LIGHT_BIT(OP_DRAW_IDX_IND))   // restart the pass
+_Static_assert(OP_COUNT_ <= 64, "LIGHT_SAFE is a 64-bit mask");
+static uint64_t light_flush_op[2][OP_COUNT_];   // MLB_TRACE=perf: the commands that recorded a game barrier put off
+
+void vk_exec_light_flush_report(double nf) {
+    for (int m = 0; m < 2; m++) {
+        char line[512];
+        int o = 0;
+        for (int k = 0; k < 4; k++) {
+            int best = -1;
+            for (int i = 0; i < OP_COUNT_; i++)
+                if (light_flush_op[m][i] && (best < 0 || light_flush_op[m][i] > light_flush_op[m][best])) best = i;
+            if (best < 0) break;
+            o += snprintf(line + o, sizeof line - o, " %s %.1f", nvn_op_name((uint32_t)best), light_flush_op[m][best] / nf);
+            light_flush_op[m][best] = 0;
+        }
+        if (o) rt_log("perf: game barriers %s, recorded in full before:%s per frame", m ? "narrowed after light dispatches" : "put off in a pass", line);
+        memset(light_flush_op[m], 0, sizeof light_flush_op[m]);
+    }
 }
 
 static void walk(VkExec *ex, const op_hdr *h, int depth) {
@@ -970,6 +1009,12 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
             int cmd = h->op != OP_CALL && h->op != OP_JUMP && h->op != OP_END;
             op_mark(cmd ? (int)h->op : -1);
             if (cmd) opn[h->op]++;
+        }
+        // (the same targets set again leave the pass open: set_rt)
+        if (vk_exec_bar_deferred && !((vk_exec_bar_deferred == 2 ? LIGHT_SAFE | LIGHT_DRAWS : LIGHT_SAFE) >> h->op & 1) &&
+            !(h->op == OP_SET_RT && !memcmp(&ex->rt, a, sizeof ex->rt))) {
+            light_flush_op[vk_exec_bar_deferred - 1][h->op]++;
+            vk_exec_light_flush(ex);   // the game barrier put off or narrowed
         }
         switch (h->op) {
         case OP_END: return;
@@ -1030,7 +1075,7 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
         case OP_COPY_STRIDE: ex->copy_stride = ((const p_copy_stride *)a)->stride; break;
         case OP_SET_TEX_POOL: ex->tex_pool = ((const p_set_pool *)a)->pool, ex->tex_serial++; break;
         case OP_SET_SAMP_POOL: ex->samp_pool = ((const p_set_pool *)a)->pool; break;
-        case OP_BARRIER: vk_exec_barrier(ex); break;
+        case OP_BARRIER: vk_exec_game_barrier(ex, ((const p_barrier *)a)->bits); break;
         case OP_DRAW: case OP_DRAW_IDX: case OP_DISPATCH: case OP_UPDATE_UB: case OP_DRAW_IDX_IND: case OP_DISPATCH_IND:
             if (h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND) vk_exec_frame.draws_seen++, split_draws++;
             if (h->op == OP_DISPATCH || h->op == OP_DISPATCH_IND) vk_exec_frame.dispatches++, split_draws++;

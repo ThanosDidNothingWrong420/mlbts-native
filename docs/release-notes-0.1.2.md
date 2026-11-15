@@ -1,4 +1,4 @@
-**MLB The Show 26 for PC 0.1.2: renaming a player no longer crashes the game.**
+**MLB The Show 26 for PC 0.1.2: renaming a player no longer crashes the game, and celebrations run smoother.**
 
 > [!IMPORTANT]
 > **No game files are included.** You need your own copy of MLB The Show 26 with the **1.0.15** update, dumped as NSP
@@ -12,6 +12,8 @@
 - **Changing a player's name works.** After a name was typed and confirmed (for example in Road to the Show's player
   editor), the game checked it with the console's word filter, which the port did not answer yet, and closed. The
   name is now accepted as typed.
+- **Smoother celebrations.** When players celebrate on the field, the graphics card no longer stops and waits between
+  each player's animation step and drawing, where that is safe.
 
 ## Updating
 
