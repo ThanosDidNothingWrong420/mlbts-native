@@ -1,17 +1,21 @@
 // mlbts-native (diagnostic): F8 in the game window writes main's writable memory (data and bss) to
 // <profile>/state-<frame>.bin, with a beep. Snapshots taken in different game situations (a menu, live fielding) are
 // compared offline to find the game's own variables that tell them apart (the controller face-button mode, hid.c).
-// Costs one key-state read per presented frame until pressed.
+// Only with MLB_STATEDUMP=1: a player's report (0.1.3, RTTS batting) showed F8 pressed three times by mistake, each a
+// beep, a 42 MB file in their profile folder and an 88 ms frame. Off, it costs one int test per presented frame.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
 #include <stdint.h>
 #include <stdio.h>
 
+#include "cfg.h"
 #include "host.h"
 
 void mlb_state_dump_tick(uint64_t frame) {
-    static int was;
+    static int on = -1, was;
+    if (on < 0) on = cfg_int("STATEDUMP") != 0;
+    if (!on) return;
     HWND fg = GetForegroundWindow();
     DWORD pid = 0;
     if (fg) GetWindowThreadProcessId(fg, &pid);

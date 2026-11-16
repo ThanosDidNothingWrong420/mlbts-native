@@ -120,6 +120,8 @@ is refused). Players' launchers (0.1.1 and later) find the newest release throug
   - `verify:` lines comparing large drawn textures with their guest memory.
   It costs nothing until pressed.
 - **F11**: fullscreen toggle.
+- **F8** (only with `MLB_STATEDUMP=1`): writes main's data and bss to `work/profile/state-<frame>.bin` with a beep, to
+  compare game variables between situations (`statedump.c`).
 - **Under RenderDoc**, F12 is RenderDoc's capture (see below) and our capture moves to **F9**.
 - Knobs for the same machinery: `MLB_DRAWLOG=<frame>|game`, `MLB_SHOT=<frame>,...`, `MLB_DRAWTEX=<fs hash>,...`
   (save the textures of draws with those fragment shaders), `MLB_WATCH=<addr>,<size>;...` (log texture creations and
