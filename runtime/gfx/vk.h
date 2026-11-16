@@ -506,6 +506,10 @@ uint64_t vk_sync_reserve(void);            // asynchronous replay: the value the
 int vk_sync_fence_wait(uint64_t value, uint64_t timeout_ns);   // 1 when done; 0 on timeout or a value never submitted
 uint64_t vk_sync_fence_done(void);         // highest done value
 uint64_t vk_sync_issued(void);             // newest submitted value (the one being recorded is this + 1)
+void vk_completion_story(char *b, size_t n);   // mlbts-native diagnosis: timeline values and the side-effect queue
+// mlbts-native diagnosis (MLB_TRACE=perf): when value v was submitted and the completion thread saw it reached (0: not
+// yet); 0 when v is no longer in the table
+int vk_sync_value_times(uint64_t v, uint64_t *sub, uint64_t *seen);
 void vk_sync_finish(void);                 // every submitted value done
 void vk_sync_shutdown(void);               // finish, stop the completion thread, free the command buffers
 // The op-stream replay (vk_exec.c): records the command handles of one submission into cb, which the caller has

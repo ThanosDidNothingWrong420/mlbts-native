@@ -85,12 +85,103 @@ static void note_gpu_write(VkExec *ex, uint64_t addr, uint64_t size) {
     vk_completion_add(ex->fence, guest_written_cb, r);
 }
 
-typedef struct { volatile uint32_t *val; uint32_t mode, value; } EventWrite;
+typedef struct { volatile uint32_t *val; uint32_t mode, value; uint64_t fence; } EventWrite;
+
+// mlbts-native diagnosis (MLB_TRACE=perf): per event word, the timeline value of its newest signal, when the replay
+// recorded it and when its write was applied, for gfx_event_story. At each batter walk-up of 1.0.20 the game's main
+// thread spins in its GPU wait (f_70005a1a90 polls nvnEventGetValue until the count it signalled is reached) for
+// about half a second while the replay and the GPU look idle half of that time. The replay thread fills an entry, the
+// completion thread (or the poll) marks it applied; read racily by the polling thread.
+#define EVS_N 64
+static struct { volatile uint32_t *val; volatile uint64_t fence, rec_ns, applied_ns, applied_fence; } evs[EVS_N];
+static int evs_find(const volatile uint32_t *val, int add) {
+    unsigned s = (unsigned)(((uintptr_t)val >> 2) * 0x9E3779B1u) % EVS_N;
+    for (int k = 0; k < EVS_N; k++, s = (s + 1) % EVS_N) {
+        if (evs[s].val == val) return (int)s;
+        if (!evs[s].val) {
+            if (!add) return -1;
+            evs[s].val = (volatile uint32_t *)val;
+            return (int)s;
+        }
+    }
+    return -1;
+}
+static void evs_recorded(const volatile uint32_t *val, uint64_t fence) {
+    if (!(rt_trace & RT_TRACE_PERF)) return;
+    int s = evs_find(val, 1);
+    if (s >= 0) evs[s].fence = fence, evs[s].rec_ns = kern_now_ns();
+}
+static void evs_applied(const volatile uint32_t *val, uint64_t fence) {
+    if (!(rt_trace & RT_TRACE_PERF)) return;
+    int s = evs_find(val, 0);
+    if (s >= 0) evs[s].applied_fence = fence, evs[s].applied_ns = kern_now_ns();
+}
+void gfx_fence_story(uint64_t v, uint64_t t0, char *b, size_t n);   // vk_backend.c
+// One line for a long wait on the event word val that began at t0 (nvn_api_core.c): its newest signal, that signal's
+// submission (queued, replayed), and the timeline with the completion queue.
+void gfx_event_story(const volatile uint32_t *val, uint64_t t0, char *b, size_t n) {
+    char fs[400], cs[300];
+    vk_completion_story(cs, sizeof cs);
+    int s = evs_find(val, 0);
+    if (s < 0) {
+        snprintf(b, n, "no signal of it replayed yet; %s", cs);
+        return;
+    }
+    uint64_t f = evs[s].fence, af = evs[s].applied_fence;
+    double ms = 1e-6;
+    gfx_fence_story(f, t0, fs, sizeof fs);
+    snprintf(b, n, "newest signal: value %llu, recorded %+.1f ms; last applied: value %llu at %+.1f ms (from the wait's "
+             "start); %s; %s", (unsigned long long)f, ((double)evs[s].rec_ns - (double)t0) * ms, (unsigned long long)af,
+             af ? ((double)evs[s].applied_ns - (double)t0) * ms : 0.0, fs, cs);
+}
+
+// mlbts-native diagnosis (MLB_TRACE=perf): the game's GPU waits in bursts. Each batter walk-up of 1.0.20 is about 50
+// waits in a row (submit, wait for the event, submit the next), each under 30 ms, about 10 ms apiece, with the replay
+// thread idle about 60 % of the time. nvn_api_core.c calls this when a thread's poll of an event word ends (the value
+// moved on or another event was polled): t0 the first poll at the old value, t1 now, polls how many. Waits closer than
+// 50 ms to the last one form a burst; a burst that waited 100 ms or more gets one line: per wait, from its start, when
+// the submission whose signal ended it was queued for the replay, replayed, submitted, seen reached by the completion
+// thread and applied, and when the game saw it. Per thread (the main thread's are the ones that matter).
+int gfx_fence_times(uint64_t v, uint64_t *enq, uint64_t *rs, uint64_t *re);   // vk_backend.c
+static _Thread_local struct {
+    uint64_t start, last_end, n, waited, timed;
+    double s[7];
+} EB;
+static void eb_flush(void) {
+    if (EB.n && EB.waited >= 100000000ull) {
+        double k = EB.timed ? 1e-6 / (double)EB.timed : 0;
+        double span = (double)(EB.last_end - EB.start);
+        rt_log("nvn: game GPU wait burst: %llu waits over %.1f ms (%.1f ms waiting, the game ran %.2f ms between waits); "
+               "per wait from its start (%llu timed): queued %+.2f, replay start %+.2f, end %+.2f, submitted %+.2f, "
+               "GPU reached (seen) %+.2f, applied %+.2f, seen by the game %+.2f ms (frame %llu)",
+               (unsigned long long)EB.n, span / 1e6, EB.waited / 1e6, (span - (double)EB.waited) / 1e6 / (double)EB.n,
+               (unsigned long long)EB.timed, EB.s[0] * k, EB.s[1] * k, EB.s[2] * k, EB.s[3] * k, EB.s[4] * k,
+               EB.s[5] * k, EB.s[6] * k, (unsigned long long)gfx_counters.frames);
+    }
+    memset(&EB, 0, sizeof EB);
+}
+void gfx_event_wait_end(const volatile uint32_t *val, uint64_t t0, uint64_t t1, uint64_t polls) {
+    if (EB.n && (t0 > EB.last_end + 50000000ull || t1 > EB.start + 1000000000ull)) eb_flush();
+    if (polls < 2) return;   // found at once: not a wait
+    if (!EB.n) EB.start = t0;
+    EB.n++, EB.waited += t1 - t0, EB.last_end = t1;
+    int s = evs_find(val, 0);
+    if (s < 0) return;
+    uint64_t f = evs[s].applied_fence, app = evs[s].applied_ns, enq, rs, re, sub, seen;
+    if (!f || app < t0 || !gfx_fence_times(f, &enq, &rs, &re) || !vk_sync_value_times(f, &sub, &seen) || !rs || !re ||
+        !seen)
+        return;
+    double d[7] = {(double)enq - (double)t0, (double)rs - (double)t0, (double)re - (double)t0, (double)sub - (double)t0,
+                   (double)seen - (double)t0, (double)app - (double)t0, (double)t1 - (double)t0};
+    for (int i = 0; i < 7; i++) EB.s[i] += d[i];
+    EB.timed++;
+}
 
 static void event_cb(void *arg) {
     EventWrite *e = arg;
     if (e->mode == NVN_EVENT_SIGNAL_MODE_ADD) __atomic_fetch_add(e->val, e->value, __ATOMIC_RELEASE);
     else __atomic_store_n(e->val, e->value, __ATOMIC_RELEASE);
+    evs_applied(e->val, e->fence);
     free(e);
 }
 
@@ -299,7 +390,7 @@ static void oq_report(VkExec *ex, uint64_t addr) {
 // completion callback stays as the backstop; each signal is applied once (an ADD event must not count twice).
 // MLB_EVENT_GPU=0: at completion only, as before.
 #define EV_N 1024
-typedef struct { volatile uint32_t *val; uint32_t mode, value, seq; volatile int32_t done; } EvRec;
+typedef struct { volatile uint32_t *val; uint32_t mode, value, seq; volatile int32_t done; uint64_t fence; } EvRec;
 static EvRec ev_rec[EV_N];
 static uint32_t ev_next = 1, ev_lo = 1;   // the next sequence number (replay thread); the lowest not known applied (poll)
 static volatile uint32_t ev_pub = 1;       // sequence numbers below it are recorded
@@ -315,6 +406,7 @@ static void ev_apply(EvRec *r) {
     if (__atomic_exchange_n(&r->done, 1, __ATOMIC_ACQ_REL)) return;
     if (r->mode == NVN_EVENT_SIGNAL_MODE_ADD) __atomic_fetch_add(r->val, r->value, __ATOMIC_RELEASE);
     else __atomic_store_n(r->val, r->value, __ATOMIC_RELEASE);
+    evs_applied(r->val, r->fence);
     __atomic_sub_fetch(&ev_pending, 1, __ATOMIC_RELEASE);
 }
 static void ev_cb(void *arg) {   // the submission completed: every signal in it has been reached
@@ -381,17 +473,18 @@ static int ev_init(void) {
 static void signal_event(VkExec *ex, const p_signal_event *p) {
     uint32_t s = ev_next;
     EvRec *r = &ev_rec[s % EV_N];
+    evs_recorded(p->val, ex->fence);
     if (!ev_init() || (r->seq && !r->done)) {   // off, or the slot's previous signal still pending: at completion
         EventWrite *e = malloc(sizeof *e);
         if (!e) rt_fatal("vk: out of memory");
-        *e = (EventWrite){p->val, p->mode, p->value};
+        *e = (EventWrite){p->val, p->mode, p->value, ex->fence};
         vk_completion_add(ex->fence, event_cb, e);
         if (ev_state > 0) ev_n_fallback++;
         return;
     }
     ev_next = s + 1 ? s + 1 : 1;
     plat_mutex_lock(&ev_lock);
-    *r = (EvRec){p->val, p->mode, p->value, s, 0};
+    *r = (EvRec){p->val, p->mode, p->value, s, 0, ex->fence};
     plat_mutex_unlock(&ev_lock);
     __atomic_add_fetch(&ev_pending, 1, __ATOMIC_RELEASE);
     vk_exec_barrier(ex);   // ends the pass; the work before the signal is done before the write below

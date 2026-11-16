@@ -617,9 +617,50 @@ NVN_API(nvnEventFinalize) { ((ev_t *)arg_p(c, 0))->magic = 0; }
 // uint32_t nvnEventGetValue(const NVNevent *e)
 // mlbts-native: the back end first applies the event signals the GPU has reached (vk_exec_xfer.c gfx_event_poll)
 __attribute__((weak)) void gfx_event_poll(void) {}
+// mlbts-native diagnosis (MLB_TRACE=perf): a thread polling one event word that stays at one value. At each batter
+// walk-up of 1.0.20 the main thread spins about half a second in its GPU wait (f_70005a1a90: nvnEventGetValue until
+// the count it signalled is reached, nvnSyncWait between polls), while the replay thread and the GPU look idle for
+// about half of it. Once a wait has 1000 polls and lasts 30 ms, a line with the event's story (vk_exec_xfer.c
+// gfx_event_story: its newest signal, that submission's replay, the timeline and the completion queue), again at 150
+// and 400 ms, and one when the value moves on.
+__attribute__((weak)) void gfx_event_story(const volatile uint32_t *val, uint64_t t0, char *b, size_t n) {
+    (void)val, (void)t0, snprintf(b, n, "-");
+}
+static _Thread_local const volatile uint32_t *ew_val;
+static _Thread_local uint32_t ew_v;
+static _Thread_local uint64_t ew_t0, ew_polls;
+static _Thread_local int ew_stage;
+static volatile int32_t ew_lines;
+// vk_exec_xfer.c: a wait ended (bursts of short waits get one line there)
+__attribute__((weak)) void gfx_event_wait_end(const volatile uint32_t *val, uint64_t t0, uint64_t t1, uint64_t polls) {
+    (void)val, (void)t0, (void)t1, (void)polls;
+}
+static void event_wait_note(const volatile uint32_t *val, uint32_t v) {
+    uint64_t now = kern_now_ns();
+    if (val != ew_val || v != ew_v) {
+        if (ew_val) gfx_event_wait_end(ew_val, ew_t0, now, ew_polls);
+        if (ew_stage && __atomic_add_fetch(&ew_lines, 1, __ATOMIC_RELAXED) <= 2000)
+            rt_log("nvn: event wait on %p ended after %.1f ms and %llu polls: %u -> %u%s (frame %llu)", (const void *)ew_val,
+                   (now - ew_t0) / 1e6, (unsigned long long)ew_polls, ew_v, val == ew_val ? v : 0,
+                   val == ew_val ? "" : ", another event polled", (unsigned long long)gfx_counters.frames);
+        ew_val = val, ew_v = v, ew_t0 = now, ew_polls = 0, ew_stage = 0;
+        return;
+    }
+    static const uint64_t at[3] = {30000000ull, 150000000ull, 400000000ull};
+    if (++ew_polls < 1000 || ew_stage >= 3 || now - ew_t0 < at[ew_stage]) return;
+    ew_stage++;
+    if (__atomic_add_fetch(&ew_lines, 1, __ATOMIC_RELAXED) > 2000) return;
+    char story[900];
+    gfx_event_story(val, ew_t0, story, sizeof story);
+    rt_log("nvn: event wait on %p at %u for %.1f ms, %llu polls (frame %llu): %s", (const void *)val, v,
+           (now - ew_t0) / 1e6, (unsigned long long)ew_polls, (unsigned long long)gfx_counters.frames, story);
+}
 NVN_API(nvnEventGetValue) {
     gfx_event_poll();
-    ret_x(c, *((const ev_t *)arg_p(c, 0))->val);
+    const volatile uint32_t *val = ((const ev_t *)arg_p(c, 0))->val;
+    uint32_t v = *val;
+    if (rt_trace & RT_TRACE_PERF) event_wait_note(val, v);
+    ret_x(c, v);
 }
 // void nvnEventSignal(NVNevent *e, NVNeventSignalMode mode, uint32_t value)
 NVN_API(nvnEventSignal) {

@@ -276,6 +276,17 @@ static void replay_main(void *arg) {
     return;
 }
 
+// mlbts-native diagnosis (the game's GPU waits, vk_exec_xfer.c): when value v's item was queued for the replay and
+// when its replay started and ended (0: not yet); 0 when v is not in the table.
+int gfx_fence_times(uint64_t v, uint64_t *enq, uint64_t *rs, uint64_t *re) {
+    if (!gfx_replay_async()) return 0;
+    plat_mutex_lock(&rl);
+    int ok = ft[v % FT_N].value == v;
+    if (ok) *enq = ft[v % FT_N].enq, *rs = ft[v % FT_N].rs, *re = ft[v % FT_N].re;
+    plat_mutex_unlock(&rl);
+    return ok;
+}
+
 // One line on timeline value v for a long sync wait that began at t0: its queueing and replay relative to t0, the GPU's
 // completed value now, and the replay queue.
 void gfx_fence_story(uint64_t v, uint64_t t0, char *b, size_t n) {

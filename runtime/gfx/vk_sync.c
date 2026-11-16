@@ -11,6 +11,7 @@
 // Side effects written after GPU completion, as MacNativeGames does: games/totk/third_party/d2r_gfx/gfx/nvn/hle_nvn.c:7-9
 // (https://github.com/ly05010419/MacNativeGames @ b75be8cfa704df3701e86130c8ced268e79d6b11, MIT, Copyright (c) 2026
 // jhaizhou; origin d2r-mobile).
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -46,6 +47,10 @@ static uint64_t reserved;         // asynchronous replay: newest value handed ou
 static int stop;
 static Pending *queue;            // side effects in the order they were added
 static int qhead, qn, qcap;
+// mlbts-native diagnosis (MLB_TRACE=perf; the game's GPU waits, nvn_api_core.c): per timeline value, when its
+// submission went to the queue and when the completion thread saw the GPU reach it (st_lock).
+#define VT_N 1024
+static struct { uint64_t v, sub, seen; } vt[VT_N];
 
 // ---- GPU time (TOTK_TRACE=perf): each submission part (vk_sync_split) writes a timestamp when it starts and when it
 // ends, into a ring of query pairs. The completion thread reads a pair once the part's value is reached and adds the
@@ -264,6 +269,11 @@ static void completion_main(void *arg) {
             vkGetSemaphoreCounterValue(c->device, c->timeline, &reached);
             plat_mutex_lock(&st_lock);
             if (reached > issued) reached = issued;
+            if (rt_trace & RT_TRACE_PERF) {
+                uint64_t now = kern_now_ns();
+                for (uint64_t v = done + 1; v <= reached && v <= done + VT_N; v++)
+                    if (vt[v % VT_N].v == v && !vt[v % VT_N].seen) vt[v % VT_N].seen = now;
+            }
         }
         while (qn && queue[qhead].fence <= reached) {
             Pending p = queue[qhead++];
@@ -437,6 +447,7 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
     }
     s->fence = recorded ? fence : 0;
     plat_mutex_lock(&st_lock);
+    if (rt_trace & RT_TRACE_PERF) vt[fence % VT_N].v = fence, vt[fence % VT_N].sub = kern_now_ns(), vt[fence % VT_N].seen = 0;
     __atomic_store_n(&issued, fence, __ATOMIC_RELEASE);
     plat_cond_broadcast(&cv_work);
     plat_mutex_unlock(&st_lock);
@@ -502,6 +513,36 @@ static int fence_wait_impl(uint64_t value, uint64_t timeout_ns) {
 uint64_t vk_sync_fence_done(void) { return __atomic_load_n(&done, __ATOMIC_ACQUIRE); }
 
 uint64_t vk_sync_issued(void) { return __atomic_load_n(&issued, __ATOMIC_ACQUIRE); }
+
+// mlbts-native diagnosis (a long nvnEventGetValue wait, vk_exec_xfer.c gfx_event_story): the timeline as the GPU has
+// it now, then done, issued and reserved, and the side-effect queue: its length, the value its first callback waits
+// for, its lowest value and how many callbacks the GPU has already reached. The queue runs in order, so a first
+// callback for a later value would hold back the ones behind it.
+int vk_sync_value_times(uint64_t v, uint64_t *sub, uint64_t *seen) {
+    plat_mutex_lock(&st_lock);
+    int ok = vt[v % VT_N].v == v;
+    if (ok) *sub = vt[v % VT_N].sub, *seen = vt[v % VT_N].seen;
+    plat_mutex_unlock(&st_lock);
+    return ok;
+}
+
+void vk_completion_story(char *b, size_t n) {
+    VkCtx *c = vk_ctx();
+    uint64_t gpu = 0;
+    if (c) vkGetSemaphoreCounterValue(c->device, c->timeline, &gpu);
+    plat_mutex_lock(&st_lock);
+    uint64_t lo = UINT64_MAX, head = qn ? queue[qhead].fence : 0;
+    int due = 0;
+    for (int i = 0; i < qn; i++) {
+        uint64_t f = queue[qhead + i].fence;
+        if (f < lo) lo = f;
+        if (f <= gpu) due++;
+    }
+    snprintf(b, n, "GPU at %llu, done %llu, issued %llu, reserved %llu; callbacks %d (first for %llu, lowest %llu, %d "
+             "the GPU reached)", (unsigned long long)gpu, (unsigned long long)done, (unsigned long long)issued,
+             (unsigned long long)reserved, qn, (unsigned long long)head, (unsigned long long)(qn ? lo : 0), due);
+    plat_mutex_unlock(&st_lock);
+}
 
 void vk_sync_finish(void) {
     vk_sync_start();

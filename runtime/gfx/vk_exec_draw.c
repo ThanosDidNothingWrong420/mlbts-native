@@ -185,7 +185,8 @@ static struct {
     struct { uint64_t lo, hi; } f[OV_FOREIGN];   // GPU writes of other kinds
     // since the last perf line (vk_exec_ub_perf)
     uint64_t c_update, c_overlaid, c_overlaid_out, c_flush, c_bind, c_merged, c_mixed, c_inpass, c_outside, c_early,
-        c_order, c_big, b_merged;
+        c_order, c_big, b_merged, c_exact;
+    uint32_t c_maxbatch;       // the most copies one flush recorded
 } OV = {.mode = -1};
 // mlbts-native: a merged copy larger than this brings the overlays' copies forward instead (ub_bind).
 #define OV_MERGE_MAX (64u << 10)
@@ -5005,38 +5006,74 @@ static int ov_out_on(void) {
     return RT_KNOB_ON(mode);
 }
 
+// mlbts-native: where each range's overlay and pending copy sit in OV.o and OV.p. ov_add dropped the older entry of
+// the same range by scanning both lists and moving the rest down: with 1.0.20's ~1,000 updates a submission (the
+// 1.0.15 log had ~225) and lists up to OV_N long that grew with the square of the list, and in the batter walk-up
+// frames and the wide stadium shot about a quarter of the replay went to ov_add, its memmove and the list scans. Now
+// an entry a newer update of the same range replaces is marked dead in place (o: lo = hi = 0, p: dst = size = 0, which
+// no range overlaps), found through these hash tables; the lists keep their order and are compacted when one fills.
+// Each table holds at most OV_N keys between clears (one per entry added), a quarter of its slots.
+#define OVH_N 8192         // power of two
+typedef struct { uint64_t lo[OVH_N], hi[OVH_N]; uint32_t idx[OVH_N], gen[OVH_N], cur; } OvHash;
+static OvHash OVH_O, OVH_P;
+static void ovh_clear(OvHash *h) {
+    if (++h->cur == 0) memset(h->gen, 0, sizeof h->gen), h->cur = 1;
+}
+static uint32_t ovh_find(OvHash *h, uint64_t lo, uint64_t hi) {   // the key's slot, or the free slot for it
+    uint32_t s = (uint32_t)(((lo ^ (hi << 21)) * 0x9E3779B97F4A7C15ull) >> 51) & (OVH_N - 1);
+    while (h->gen[s] == h->cur && !(h->lo[s] == lo && h->hi[s] == hi)) s = (s + 1) & (OVH_N - 1);
+    return s;
+}
+static int ovh_get(OvHash *h, uint64_t lo, uint64_t hi) {
+    uint32_t s = ovh_find(h, lo, hi);
+    return h->gen[s] == h->cur ? (int)h->idx[s] : -1;
+}
+static void ovh_put(OvHash *h, uint64_t lo, uint64_t hi, uint32_t idx) {
+    uint32_t s = ovh_find(h, lo, hi);
+    h->gen[s] = h->cur, h->lo[s] = lo, h->hi[s] = hi, h->idx[s] = idx;
+}
+static void ovh_reset(void) { ovh_clear(&OVH_O), ovh_clear(&OVH_P); }
+
 static void ov_sub(const VkExec *ex) {   // the submission being replayed
     if (OV.fence == ex->fence) return;
     if (OV.np)   // barrier_to records them at the latest at the submission's closing barrier
         rt_log("vk: %u overlaid uniform updates of submission %llu were never copied into their buffers", OV.np,
                (unsigned long long)OV.fence);
     OV.fence = ex->fence, OV.n = OV.np = OV.nf = 0, OV.f_over = 0, OV.lo = UINT64_MAX, OV.hi = 0;
+    ovh_reset();
 }
 
 static void ov_span(void) {
     OV.lo = UINT64_MAX, OV.hi = 0;
     for (uint32_t i = 0; i < OV.n; i++) {
+        if (!OV.o[i].hi) continue;   // dead
         if (OV.o[i].lo < OV.lo) OV.lo = OV.o[i].lo;
         if (OV.o[i].hi > OV.hi) OV.hi = OV.o[i].hi;
     }
 }
 
+// Drops the dead entries of both lists, in order, and indexes the rest again: when one list is full.
+static void ov_compact(void) {
+    uint32_t k = 0;
+    ovh_reset();
+    for (uint32_t i = 0; i < OV.n; i++)
+        if (OV.o[i].hi) ovh_put(&OVH_O, OV.o[i].lo, OV.o[i].hi, k), OV.o[k++] = OV.o[i];
+    OV.n = k, k = 0;
+    for (uint32_t i = 0; i < OV.np; i++)
+        if (OV.p[i].size) ovh_put(&OVH_P, OV.p[i].dst, OV.p[i].dst + OV.p[i].size, k), OV.p[k++] = OV.p[i];
+    OV.np = k;
+}
+
 // A new overlay of [lo, hi), and its copy. An older overlay or pending copy of exactly that range is dropped: the new
 // one covers it, and the terrain rewrites one block before each draw, so the lists stay as short as the blocks.
 static void ov_add(uint64_t lo, uint64_t hi, VkBuffer b, VkDeviceSize o, const VkMemSpan *sp) {
-    for (uint32_t i = 0; i < OV.n; i++)
-        if (OV.o[i].lo == lo && OV.o[i].hi == hi) {
-            memmove(&OV.o[i], &OV.o[i + 1], sizeof OV.o[0] * (OV.n - i - 1));
-            OV.n--;
-            break;
-        }
-    for (uint32_t i = 0; i < OV.np; i++)
-        if (OV.p[i].dst == lo && OV.p[i].size == hi - lo) {
-            memmove(&OV.p[i], &OV.p[i + 1], sizeof OV.p[0] * (OV.np - i - 1));
-            OV.np--;
-            break;
-        }
+    int i = ovh_get(&OVH_O, lo, hi);
+    if (i >= 0 && OV.o[i].lo == lo && OV.o[i].hi == hi) OV.o[i].lo = OV.o[i].hi = 0;
+    i = ovh_get(&OVH_P, lo, hi);
+    if (i >= 0 && OV.p[i].dst == lo && OV.p[i].size == hi - lo) OV.p[i].dst = 0, OV.p[i].size = 0;
+    ovh_put(&OVH_O, lo, hi, OV.n);
     OV.o[OV.n++] = (typeof(OV.o[0])){lo, hi, ++OV.serial, b, o};
+    ovh_put(&OVH_P, lo, hi, OV.np);
     OV.p[OV.np++] = (typeof(OV.p[0])){lo, b, o, *sp, hi - lo};
     if (lo < OV.lo) OV.lo = lo;
     if (hi > OV.hi) OV.hi = hi;
@@ -5053,12 +5090,10 @@ static int ov_foreign_hits(uint64_t lo, uint64_t hi) {
 // (the write came after a barrier, or ub_written brought them forward), so they only stop serving bindings.
 static void ov_retire(uint64_t lo, uint64_t hi) {
     if (!OV.n || lo >= OV.hi || hi <= OV.lo) return;
-    uint32_t k = 0;
+    int hit = 0;
     for (uint32_t i = 0; i < OV.n; i++)
-        if (!(lo < OV.o[i].hi && hi > OV.o[i].lo)) OV.o[k++] = OV.o[i];
-    if (k == OV.n) return;
-    OV.n = k;
-    ov_span();
+        if (lo < OV.o[i].hi && hi > OV.o[i].lo) OV.o[i].lo = OV.o[i].hi = 0, hit = 1;   // dead, in place (OVH_O)
+    if (hit) ov_span();
 }
 
 // A GPU write of another kind into [addr, addr+n) in this submission (vk_exec_xfer.c note_gpu_write, storage bindings).
@@ -5068,6 +5103,36 @@ void vk_exec_ub_foreign(VkExec *ex, uint64_t addr, uint64_t n) {
     if (OV.nf == OV_FOREIGN) OV.f_over = 1;
     else OV.f[OV.nf].lo = addr, OV.f[OV.nf].hi = addr + n, OV.nf++;
     ov_retire(addr, addr + n);
+}
+
+// mlbts-native: which copies of a flush overlap one recorded since the last barrier, by 256-byte granule. The check
+// compared each copy with every earlier one since the barrier: with up to OV_N copies in a batch that grew with the
+// square of the batch, and in the batter walk-up frames of 1.0.20 (about half a second each) the replay spent about
+// 17 % of its time in that loop. Now each copy looks up its granules in a hash set of those the batch's copies wrote
+// since the barrier; only a granule hit runs the exact comparison (blocks that share a granule without overlapping).
+// A copy over more than OVG_SPAN granules, or a full set, sends the rest of the batch to the exact comparison.
+#define OVG_N 8192         // power of two
+#define OVG_SPAN 64        // granules per copy the set takes (16 KiB)
+static struct { uint64_t key[OVG_N]; uint32_t gen[OVG_N]; uint32_t cur, used; } OVG;
+static void ovg_clear(void) {
+    if (++OVG.cur == 0) memset(OVG.gen, 0, sizeof OVG.gen), OVG.cur = 1;
+    OVG.used = 0;
+}
+static uint32_t ovg_slot(uint64_t g) { return (uint32_t)((g * 0x9E3779B97F4A7C15ull) >> 51) & (OVG_N - 1); }
+static int ovg_has(uint64_t g) {
+    for (uint32_t s = ovg_slot(g);; s = (s + 1) & (OVG_N - 1)) {
+        if (OVG.gen[s] != OVG.cur) return 0;
+        if (OVG.key[s] == g) return 1;
+    }
+}
+static void ovg_add(uint64_t g) {
+    for (uint32_t s = ovg_slot(g);; s = (s + 1) & (OVG_N - 1)) {
+        if (OVG.gen[s] != OVG.cur) {
+            OVG.gen[s] = OVG.cur, OVG.key[s] = g, OVG.used++;
+            return;
+        }
+        if (OVG.key[s] == g) return;
+    }
 }
 
 // Records the copies of the updates overlaid so far, behind a barrier against the draws that read the old bytes.
@@ -5087,24 +5152,44 @@ void vk_exec_ub_flush(VkExec *ex) {
                            .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT};
     VkDependencyInfo wdi = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &ww};
     uint32_t since = 0;   // the first copy recorded after the last barrier
+    int exact = 0;        // the granule set no longer holds every copy since the barrier
+    ovg_clear();
+    uint32_t live = 0;
     for (uint32_t i = 0; i < OV.np; i++) {
-        for (uint32_t k = since; k < i; k++)
-            if (OV.p[i].dst < OV.p[k].dst + OV.p[k].size && OV.p[k].dst < OV.p[i].dst + OV.p[i].size) {
-                vkCmdPipelineBarrier2(ex->cb, &wdi);
-                ex->recorded++;
-                OV.c_order++;
-                since = i;
-                break;
-            }
+        if (!OV.p[i].size) continue;   // dropped for a newer update of its range (ov_add)
+        live++;
+        uint64_t g0 = OV.p[i].dst >> 8, g1 = (OV.p[i].dst + (OV.p[i].size ? OV.p[i].size : 1) - 1) >> 8;
+        int maybe = exact;
+        for (uint64_t g = g0; !maybe && g <= g1 && g - g0 < OVG_SPAN; g++) maybe = ovg_has(g);
+        if (!exact && g1 - g0 >= OVG_SPAN) maybe = 1;   // too wide to look up granule by granule
+        if (maybe) {
+            OV.c_exact++;
+            for (uint32_t k = since; k < i; k++)
+                if (OV.p[i].dst < OV.p[k].dst + OV.p[k].size && OV.p[k].dst < OV.p[i].dst + OV.p[i].size) {
+                    vkCmdPipelineBarrier2(ex->cb, &wdi);
+                    ex->recorded++;
+                    OV.c_order++;
+                    since = i;
+                    ovg_clear(), exact = 0;
+                    break;
+                }
+        }
+        if (!exact) {
+            if (g1 - g0 >= OVG_SPAN || OVG.used + (g1 - g0 + 1) > OVG_N / 2) exact = 1;
+            else
+                for (uint64_t g = g0; g <= g1; g++) ovg_add(g);
+        }
         VkBufferCopy cp = {OV.p[i].soff, OV.p[i].sp.offset, OV.p[i].size};
         vkCmdCopyBuffer(ex->cb, OV.p[i].src, OV.p[i].sp.buffer, 1, &cp);
         ex->recorded++;
     }
+    if (live > OV.c_maxbatch) OV.c_maxbatch = live;
     OV.np = 0;
     // The full barrier barrier_to records next makes the copied bytes visible: later bindings read the real buffer,
     // as after an update copied at once, and need no overlay lookups or merged copies (ov_at answers 0 for them, so
     // the descriptor build skip rebuilds the draws that bound an overlay)
     OV.n = 0;
+    ovh_reset();
     ov_span();
     OV.c_flush++;
 }
@@ -5123,12 +5208,13 @@ void vk_exec_ub_perf(void) {
     rt_log("perf: uniform updates per submission %.1f: %.1f overlaid (%.1f of them between passes; copied in %.2f "
            "batches), %.1f copied in a pass, %.1f outside one; bindings from an overlay %.1f (%.1f merged, %.1f over "
            "other GPU writes; %.1f KiB copied per merge), %.2f batches brought forward for a storage write, %.2f for a "
-           "binding over %u KiB, %.2f barriers between overlapping copies",
+           "binding over %u KiB, %.2f barriers between overlapping copies (%.1f copies compared exactly; largest batch "
+           "%u copies)",
            OV.c_update * k, OV.c_overlaid * k, OV.c_overlaid_out * k, OV.c_flush * k, OV.c_inpass * k, OV.c_outside * k,
            OV.c_bind * k, OV.c_merged * k, OV.c_mixed * k, OV.c_merged ? OV.b_merged / 1024.0 / OV.c_merged : 0.0,
-           OV.c_early * k, OV.c_big * k, OV_MERGE_MAX >> 10, OV.c_order * k);
+           OV.c_early * k, OV.c_big * k, OV_MERGE_MAX >> 10, OV.c_order * k, OV.c_exact * k, OV.c_maxbatch);
     OV.c_update = OV.c_overlaid = OV.c_overlaid_out = OV.c_flush = OV.c_bind = OV.c_merged = OV.c_mixed = 0;
-    OV.c_inpass = OV.c_outside = OV.c_early = OV.c_order = OV.c_big = OV.b_merged = 0;
+    OV.c_inpass = OV.c_outside = OV.c_early = OV.c_order = OV.c_big = OV.b_merged = OV.c_exact = 0, OV.c_maxbatch = 0;
 }
 
 // The scratch bytes of a uniform or storage binding [addr, addr+n) an overlay of this submission touches: 1 with *out
@@ -5206,6 +5292,7 @@ static void op_update_ub(VkExec *ex, const p_update_ub *u) {
         ov_sub(ex);
         OV.c_update++;
         int here = ex->in_pass || ov_out_on();
+        if (here && (OV.n == OV_N || OV.np == OV_N)) ov_compact();   // room from the entries newer updates replaced
         if (here && OV.n < OV_N && OV.np < OV_N && !ov_foreign_hits(u->dst, u->dst + u->size)) {
             uint8_t *d = scratch(ex, u->size, &b, &o);
             memcpy(d, u->data, u->size);
