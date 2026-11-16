@@ -182,7 +182,7 @@ static struct {
     int f_over;                // more foreign writes than f holds: no more overlays in this submission
     struct { uint64_t lo, hi, serial; VkBuffer buf; VkDeviceSize off; } o[OV_N];   // oldest first, no two equal
     struct { uint64_t dst; VkBuffer src; VkDeviceSize soff; VkMemSpan sp; uint64_t size; } p[OV_N];   // to copy
-    struct { uint64_t lo, hi; } f[OV_FOREIGN];   // GPU writes of other kinds
+    struct { uint64_t lo, hi; } f[OV_FOREIGN];   // GPU writes of other kinds: disjoint, sorted (ovf_add)
     // since the last perf line (vk_exec_ub_perf)
     uint64_t c_update, c_overlaid, c_overlaid_out, c_flush, c_bind, c_merged, c_mixed, c_inpass, c_outside, c_early,
         c_order, c_big, b_merged, c_exact;
@@ -346,12 +346,42 @@ static int ub_bind(VkExec *ex, uint64_t addr, uint64_t n, uint64_t align, VkDesc
 static void ub_written(VkExec *ex, uint64_t addr, uint64_t n);
 
 int vk_watch_hit(uint64_t a, uint64_t n);   // vk_texture.c (mlbts-native diagnosis)
+// mlbts-native: the ranges of the submission's written list (CbRes.written), to find one already there. note_written
+// compared each new range with every earlier one: 1.0.20 notes about 1,000 uniform updates a submission besides the
+// storage writes, so that grew with the square of the list (about 1 % of the replay in the match profile). Entries of
+// another submission carry an older generation; the table doubles when half full.
+typedef struct { uint64_t a, s; uint32_t g; } NwEnt;
+static struct { NwEnt *k; uint32_t cap, used, gen; uint64_t fence; } NW;
+static int nw_put(uint64_t a, uint64_t s) {   // 1 when the range is new
+    for (uint32_t i = (uint32_t)(((a ^ (s << 40)) * 0x9E3779B97F4A7C15ull) >> 32) & (NW.cap - 1);; i = (i + 1) & (NW.cap - 1)) {
+        NwEnt *e = &NW.k[i];
+        if (e->g != NW.gen) {
+            *e = (NwEnt){a, s, NW.gen};
+            NW.used++;
+            return 1;
+        }
+        if (e->a == a && e->s == s) return 0;
+    }
+}
+static void nw_grow(const CbRes *r) {
+    uint32_t cap = NW.cap ? NW.cap * 2 : 4096;
+    NwEnt *k = calloc(cap, sizeof *k);
+    if (!k) rt_fatal("vk: out of memory");
+    free(NW.k);
+    NW.k = k, NW.cap = cap, NW.used = 0, NW.gen = 1;
+    for (int i = 0; i < r->nwritten; i++) nw_put(r->written[i].addr, r->written[i].size);
+}
 static void note_written(VkExec *ex, uint64_t addr, uint64_t size) {
     if (vk_watch_hit(addr, size))
         rt_log("watch: a shader writes buffer range %#llx+%#llx", (unsigned long long)addr, (unsigned long long)size);
     CbRes *r = cb_res(ex);
-    for (int i = 0; i < r->nwritten; i++)
-        if (r->written[i].addr == addr && r->written[i].size == size) return;
+    if (!NW.cap) nw_grow(r);
+    if (NW.fence != ex->fence) {   // a new submission: its list starts empty
+        NW.fence = ex->fence, NW.used = 0;
+        if (++NW.gen == 0) memset(NW.k, 0, sizeof *NW.k * NW.cap), NW.gen = 1;
+    }
+    if ((NW.used + 1) * 2 > NW.cap) nw_grow(r);
+    if (!nw_put(addr, size)) return;
     if (r->nwritten == r->cwritten) r->written = grow(r->written, &r->cwritten, sizeof *r->written);
     r->written[r->nwritten++] = (Range){addr, size};
     vk_mem_gpu_pending(addr, size);
@@ -1633,6 +1663,12 @@ static uint32_t feedback_scan(VkExec *ex, const GfxShader *fs) {
     int n = gfx_shader_resources(fs, GFX_RES_TEX, &res);
     uint32_t m = 0, gen = vk_texture_slots_gen();   // before any lookup
     int memo = td_mode(), locked = 0;
+    for (int r = 0; r < n; r++)   // mlbts-native: the memo lines asked for together first (as in bind_resources)
+        for (int k = 0; k < (res[r].count ? res[r].count : 1) && k < 8; k++) {
+            int slot = res[r].slot + k;
+            uint64_t h = slot >= 0 && slot < 128 ? ex->tex[NVN_STAGE_FS][slot] : 0;
+            if (h) __builtin_prefetch(&FM[(h * 0x9E3779B97F4A7C15ull) >> 51]);
+        }
     for (int r = 0; r < n; r++)
         for (int k = 0; k < (res[r].count ? res[r].count : 1); k++) {
             int slot = res[r].slot + k;
@@ -1827,13 +1863,17 @@ static struct {
     VkDescriptorImageInfo out;
 } TD[TD_N];
 
+static inline uint32_t td_index(uint64_t h, uint32_t type, int separate) {
+    return (uint32_t)((h * 0x9E3779B97F4A7C15ull ^ (uint64_t)type << 7 ^ (uint64_t)separate) >> 51);
+}
+
 static void tex_info_lookup(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage, int separate,
                             VkDescriptorImageInfo *out) {
     int td_on = td_mode();
     VkImage image;
     if (!h || storage || !td_on) return tex_info_full(ex, r, h, storage, separate, out, &image);
     uint32_t gen = vk_texture_slots_gen(), ep = vk_texture_epoch(), sg = vk_sampler_gen();   // before any lookup
-    typeof(TD[0]) *m = &TD[(h * 0x9E3779B97F4A7C15ull ^ (uint64_t)r->type << 7 ^ (uint64_t)separate) >> 51];
+    typeof(TD[0]) *m = &TD[td_index(h, r->type, separate)];
     if (m->valid && m->h == h && m->type == r->type && m->separate == separate && m->sgen == sg &&
         slot_still(&m->gen, m->tok, h, gen)) {
         if (m->epoch != ep) {   // the slot's first binding in this submission: only its storage check is due
@@ -2464,6 +2504,21 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         RS.rec = 1, RS.ncnt = 0, RS.cnt_over = 0, RS.volatile_ = 0, RS.cmds = 0;
     }
     if (gfx && lt_on()) LT.bdraw = 1, LT.bn = 0, LT.bover = 0;   // the draw's ranges are noted (compute between draws)
+    // mlbts-native: the descriptor memo entries (TD, 512 KiB, direct-mapped) of the draw's sampled textures are asked
+    // for together before the loop reads them one by one. Each read waited for its line from memory in turn: the line
+    // that compares the entry was the hottest of the replay in the 1.0.20 match profile (about 5 % of its time); the
+    // prefetches let those waits overlap.
+    for (uint32_t i = 0; i < info->n_bindings; i++) {
+        const VkPipeBinding *b = &info->bindings[i];
+        if (b->kind != GFX_RES_TEX || b->type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER ||
+            b->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER)
+            continue;
+        int st = nvn_stage_of(b->stage);
+        for (uint32_t k = 0, cnt = b->count ? b->count : 1; k < cnt && k < 8; k++) {
+            uint64_t h = res_tex_handle(ex, st, b->res, (int)k);
+            if (h) __builtin_prefetch(&TD[td_index(h, b->res->type, b->res->separate)]);
+        }
+    }
     uint32_t n_sets = info->n_sets ? info->n_sets : 1;
     uint32_t lo[2] = {0, 0}, hi[2] = {0, 0}, d0[2] = {0, 0};   // bindings [lo, hi) and first descriptor per set
     int need_w = 0;                                             // a set without a template: fill the write structs
@@ -5079,11 +5134,48 @@ static void ov_add(uint64_t lo, uint64_t hi, VkBuffer b, VkDeviceSize o, const V
     if (hi > OV.hi) OV.hi = hi;
 }
 
+// mlbts-native: OV.f holds the submission's GPU writes of other kinds as disjoint ranges sorted by address, merged
+// where they overlap or touch, so a lookup is a binary search. It was a list in arrival order scanned for every
+// overlaid update and every binding over an overlay: with 1.0.20's ~250 such writes and ~1,000 updates a submission
+// that was about 1.5 % of the replay in the match profile.
+static uint32_t ovf_first(uint64_t lo) {   // the first range ending after lo
+    uint32_t a = 0, b = OV.nf;
+    while (a < b) {
+        uint32_t m = (a + b) / 2;
+        if (OV.f[m].hi <= lo) a = m + 1;
+        else b = m;
+    }
+    return a;
+}
+static void ovf_add(uint64_t lo, uint64_t hi) {
+    uint32_t a = 0, b = OV.nf;   // the first range that reaches lo (overlaps or touches)
+    while (a < b) {
+        uint32_t m = (a + b) / 2;
+        if (OV.f[m].hi < lo) a = m + 1;
+        else b = m;
+    }
+    uint32_t e = a;
+    for (; e < OV.nf && OV.f[e].lo <= hi; e++) {
+        if (OV.f[e].lo < lo) lo = OV.f[e].lo;
+        if (OV.f[e].hi > hi) hi = OV.f[e].hi;
+    }
+    if (e == a) {   // touches none: inserted
+        if (OV.nf == OV_FOREIGN) {
+            OV.f_over = 1;
+            return;
+        }
+        memmove(&OV.f[a + 1], &OV.f[a], sizeof OV.f[0] * (OV.nf - a));
+        OV.nf++;
+    } else if (e > a + 1) {   // joins several: they become one
+        memmove(&OV.f[a + 1], &OV.f[e], sizeof OV.f[0] * (OV.nf - e));
+        OV.nf -= e - a - 1;
+    }
+    OV.f[a].lo = lo, OV.f[a].hi = hi;
+}
 static int ov_foreign_hits(uint64_t lo, uint64_t hi) {
     if (OV.f_over) return 1;
-    for (uint32_t i = 0; i < OV.nf; i++)
-        if (lo < OV.f[i].hi && hi > OV.f[i].lo) return 1;
-    return 0;
+    uint32_t i = ovf_first(lo);
+    return i < OV.nf && OV.f[i].lo < hi;
 }
 
 // The overlays over [lo, hi) no longer hold the newest bytes: the real buffer does. Their copies were recorded already
@@ -5100,8 +5192,7 @@ static void ov_retire(uint64_t lo, uint64_t hi) {
 void vk_exec_ub_foreign(VkExec *ex, uint64_t addr, uint64_t n) {
     if (OV.mode <= 0 || !n) return;
     ov_sub(ex);
-    if (OV.nf == OV_FOREIGN) OV.f_over = 1;
-    else OV.f[OV.nf].lo = addr, OV.f[OV.nf].hi = addr + n, OV.nf++;
+    ovf_add(addr, addr + n);
     ov_retire(addr, addr + n);
 }
 
