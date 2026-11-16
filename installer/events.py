@@ -81,3 +81,88 @@ class Reporter:
         if self.log_file:
             self.log_file.close()
             self.log_file = None
+
+
+# ---- RecompLauncher: progress lines instead of the events (cli.py --launcher) --------------------------------------
+# RecompLauncher (recomplauncher.com) installs and updates the port from the GitHub releases; recomplauncher.json at the
+# repository root, copied into each release (tools/make_release.py), tells it how. It runs the setup without a window
+# with the game in {install}/MLBTS, a folder no release has, so an update never unpacks over it; after an update it runs
+# the setup again, which skips the extraction and rebuilds mlb.exe. It reads the setup's stdout only: the number is its
+# progress bar and the text is shown under it, and a failure is the exit code plus the last line, so the error is
+# written as a progress line too. ProgressLines is the `out` of Reporter: it reads each JSON event line and writes one
+# `progress <0..1> <text>` line. Each step has a share of the bar (WEIGHTS, roughly its part of a first install); a step
+# with a known amount moves inside its share. The bar never goes back, and reaches 1 only when the setup ends well.
+WEIGHTS = {'check': 2, 'exefs': 3, 'romfs': 55, 'build': 35, 'finish': 5}
+OTHER_WEIGHT = 2
+BEFORE_END = 0.99
+
+
+class ProgressLines:
+    def __init__(self, stream):
+        self.stream = stream
+        self.steps = []       # [(id, title)] from the start event
+        self.state = {}       # step id -> started | done | skipped
+        self.within = 0.0     # 0..1 of the running step, when its amount is known
+        self.current = None
+        self.best = 0.0
+        self.text = ''
+
+    # the file interface events.Reporter writes to
+    def write(self, text):
+        for line in text.splitlines():
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(e, dict):
+                self.event(e)
+        return len(text)
+
+    def flush(self):
+        self.stream.flush()
+
+    def fraction(self):
+        weights = {s: WEIGHTS.get(s, OTHER_WEIGHT) for s, _ in self.steps} or {'all': 1}
+        done = 0.0
+        for s, w in weights.items():
+            st = self.state.get(s)
+            if st in ('done', 'skipped'):
+                done += w
+            elif st == 'started' and s == self.current:
+                done += w * self.within
+        return done / sum(weights.values())
+
+    def event(self, e):
+        kind, limit = e.get('type'), BEFORE_END
+        if kind == 'start':
+            self.steps = [(s.get('id'), s.get('title', '')) for s in e.get('steps', [])]
+            return
+        if kind == 'step':
+            sid, st = e.get('step'), e.get('state')
+            self.state[sid] = st
+            if st == 'started':
+                self.current, self.within = sid, 0.0
+                self.text = dict(self.steps).get(sid, sid)
+            elif st == 'skipped':
+                return
+        elif kind == 'progress':
+            if e.get('total'):
+                self.within = max(self.within, min(1.0, e.get('done', 0) / e['total']))
+            self.text = e.get('text') or self.text
+        elif kind == 'error':
+            self.text = e.get('text', 'The setup failed.')
+        elif kind == 'end':
+            result = e.get('result')
+            if result == 'ok':
+                limit = self.best = 1.0
+                self.text = 'The game is ready.'
+            elif result == 'cancelled':
+                self.text = 'The setup was cancelled.'
+            elif not self.text:
+                self.text = 'The setup failed. The log in the logs folder says why.'
+        else:
+            return   # warnings stay in the log
+        self.best = max(self.best, min(limit, self.fraction()))
+        if self.text:
+            self.stream.write(f'progress {self.best:.3f} {" ".join(str(self.text).split())}\n')
+            self.stream.flush()
