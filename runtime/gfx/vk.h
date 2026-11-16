@@ -60,7 +60,12 @@ typedef struct {
     int amd;                           // an AMD GPU (vendor 0x1002), any driver
     int amd_sc;                        // AMD's Windows driver branch for RDNA 1 and 2 ("AMD proprietary shader compiler")
     int mesa;                          // a Mesa driver the game runs on: RADV, ANV or NVK
+    // Texel buffer view offset alignment (Vulkan 1.3 texelBufferAlignment), [0] sampled, [1] written (imageBuffer):
+    // bytes, and whether one texel's size suffices when smaller (vk_caps_texel_align).
+    uint32_t tb_align[2];
+    uint8_t tb_single[2];
 } VkCaps;
+VkDeviceSize vk_caps_texel_align(int written, int texel_bytes);   // the offset alignment of such a view
 extern VkCaps vk_caps;
 void vk_caps_driver(VkPhysicalDevice p);             // first, before vkCreateDevice: vk_caps.amd, amd_sc, mesa
 void vk_caps_features(VkPhysicalDeviceFeatures *f);   // before vkCreateDevice (TOTK_VK_NO_FLOAT64 clears shaderFloat64)

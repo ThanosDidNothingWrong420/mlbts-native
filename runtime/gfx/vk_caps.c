@@ -62,6 +62,17 @@ int vk_caps_gpl(const VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT *f,
     return vk_caps.gpl;
 }
 
+// Vulkan's rule for a texel buffer view's offset: the byte alignment, or with the single-texel flag the size of one
+// texel when smaller (one component for 3-component formats, whose texel size is a multiple of three).
+VkDeviceSize vk_caps_texel_align(int written, int texel_bytes) {
+    VkDeviceSize a = vk_caps.tb_align[written != 0] ? vk_caps.tb_align[written != 0] : 16;
+    if (vk_caps.tb_single[written != 0] && texel_bytes > 0) {
+        VkDeviceSize t = (VkDeviceSize)(texel_bytes % 3 ? texel_bytes : texel_bytes / 3);
+        if (t < a) a = t;
+    }
+    return a;
+}
+
 static int has_ext(const VkExtensionProperties *ep, uint32_t n, const char *name) {
     for (uint32_t i = 0; i < n; i++)
         if (!strcmp(ep[i].extensionName, name)) return 1;
@@ -103,6 +114,20 @@ void vk_caps_init(VkCtx *c) {
     if (a && !(a & (a - 1)) && a > real_align) l->minStorageBufferOffsetAlignment = a;
     vk_caps.sbuf_align = l->minStorageBufferOffsetAlignment > 4 ? (uint32_t)l->minStorageBufferOffsetAlignment : 0;
 
+    // mlbts-native: texel buffer views. A Vulkan 1.3 instance has texelBufferAlignment on, so a view's offset needs only
+    // the 1.3 alignments, or one texel when the single-texel flag says so, not minTexelBufferOffsetAlignment. Intel Arc
+    // (A770, B580; issue #7) reports 64 in minTexelBufferOffsetAlignment but 16 bytes or one texel for storage views and
+    // 1 byte for sampled ones. Checked against the 64, the skinning imageBuffers MLB places 32 bytes into a buffer got
+    // the zero view: pitchers drew without a torso or as a huge grey polygon. TOTK_VK_TEXEL_ALIGN=<power of two> uses
+    // that many bytes for both without the single-texel rule (=64 shows the Intel bug on other GPUs).
+    uint32_t base = l->minTexelBufferOffsetAlignment ? (uint32_t)l->minTexelBufferOffsetAlignment : 16;
+    vk_caps.tb_align[0] = p13.uniformTexelBufferOffsetAlignmentBytes ? (uint32_t)p13.uniformTexelBufferOffsetAlignmentBytes : base;
+    vk_caps.tb_align[1] = p13.storageTexelBufferOffsetAlignmentBytes ? (uint32_t)p13.storageTexelBufferOffsetAlignmentBytes : base;
+    vk_caps.tb_single[0] = p13.uniformTexelBufferOffsetSingleTexelAlignment != VK_FALSE;
+    vk_caps.tb_single[1] = p13.storageTexelBufferOffsetSingleTexelAlignment != VK_FALSE;
+    uint32_t ta = env_u32("TOTK_VK_TEXEL_ALIGN", 0);
+    if (ta && !(ta & (ta - 1))) vk_caps.tb_align[0] = vk_caps.tb_align[1] = ta, vk_caps.tb_single[0] = vk_caps.tb_single[1] = 0;
+
     uint32_t want = env_u32("TOTK_VK_SUBGROUP", 32);
     int pin = f13.subgroupSizeControl && cfg_bool("TOTK_VK_SUBGROUP_PIN") && p13.minSubgroupSize <= want &&
               want <= p13.maxSubgroupSize;
@@ -137,6 +162,8 @@ void vk_caps_init(VkCtx *c) {
            f64_supported, vk_caps.float64, (unsigned)l->minStorageBufferOffsetAlignment, real_align,
            (unsigned long long)l->minUniformBufferOffsetAlignment, pd.maxPushDescriptors, c->has_provoking_vertex,
            (int)pvf.provokingVertexLast);
+    rt_log("vk caps: texel buffer offset alignment %u (device), sampled %u%s, storage %u%s", base, vk_caps.tb_align[0],
+           vk_caps.tb_single[0] ? " or one texel" : "", vk_caps.tb_align[1], vk_caps.tb_single[1] ? " or one texel" : "");
     rt_log("vk caps: ext index_type_uint8 khr %d ext %d, attachment_feedback_loop_layout %d dynamic_state %d, "
            "graphics_pipeline_library %d; depth attachment D16 %c D24S8 %c X8D24 %c D32 %c D32S8 %c",
            has_ext(ep, ne, "VK_KHR_index_type_uint8"), has_ext(ep, ne, "VK_EXT_index_type_uint8"),

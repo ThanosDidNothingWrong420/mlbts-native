@@ -1,4 +1,5 @@
-**MLB The Show 26 for PC 0.1.4: smoother batting scenes, no developer tools running in the background.**
+**MLB The Show 26 for PC 0.1.4: player models fixed on Intel Arc, smoother batting scenes, no developer tools running
+in the background.**
 
 > [!IMPORTANT]
 > **No game files are included.** You need your own copy of MLB The Show 26 with the **1.0.20** update (the 1.0.15
@@ -9,6 +10,10 @@
 
 ## What's new
 
+- **Player models fixed on Intel Arc graphics cards** (A770, B580 and others, [#7](https://github.com/sam110411/mlbts-native/issues/7)).
+  Pitchers drew without a torso in close-ups, and a huge grey shape covered part of the screen in the pitching view.
+  The port checked where the game keeps its animated body data against a stricter rule than Intel's driver actually
+  needs, and handed the game empty data instead. It now uses the driver's real rule.
 - **Faster batting scenes.** At the plate, in the Road to the Show screens between pitches and at each batter's
   walk-up, the port spent too long preparing each frame for the graphics card: much of that time went to bookkeeping
   for the game's small data updates, which grew much faster than their number. That work is now much cheaper, so

@@ -1754,13 +1754,7 @@ int vk_texture_slot_desc(int id, tex_t *out);        // vk_texture.c
 void vk_defer_buffer_view(VkBufferView view);        // vk_memory.c
 static void note_written(VkExec *ex, uint64_t addr, uint64_t n);
 static VkBufferView texel_view(VkExec *ex, uint64_t h, int written) {
-    static VkDeviceSize align;
     VkCtx *c = vk_ctx();
-    if (!align) {
-        VkPhysicalDeviceProperties p;
-        vkGetPhysicalDeviceProperties(c->phys, &p);
-        align = p.limits.minTexelBufferOffsetAlignment ? p.limits.minTexelBufferOffsetAlignment : 16;
-    }
     tex_t t;
     if (!h || !vk_texture_slot_desc((int)(h & 0xfffff), &t) || t.d.target != NVN_TEXTURE_TARGET_BUFFER || !t.mem)
         return Z.zview;
@@ -1771,6 +1765,7 @@ static VkBufferView texel_view(VkExec *ex, uint64_t h, int written) {
         return Z.zview;
     }
     uint64_t addr = (uint64_t)(uintptr_t)t.mem, bytes = (uint64_t)t.d.width * (uint64_t)bpb;
+    VkDeviceSize align = vk_caps_texel_align(written, bpb);   // vk_caps.c: Vulkan 1.3's rule, not minTexelBufferOffsetAlignment
     VkMemSpan sp;
     if (!vk_mem_resolve(addr, 1, &sp) || (written && sp.offset % align)) {
         warn_once(W_BIND, "buffer texture at %#llx is not backed or not aligned: a zero view is bound", (unsigned long long)addr);
