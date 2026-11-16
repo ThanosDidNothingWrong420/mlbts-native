@@ -194,7 +194,9 @@ class Check(Step):
                                'AMD Zen or newer).')
         if not detect.vulkan():
             raise InstallError('No Vulkan driver found (vulkan-1.dll). Install the latest driver for your graphics card.')
-        if not lay.dev and (ctx.dest == lay.root or lay.root in ctx.dest.parents):
+        # A launcher keeps its folder, so the game may go in a folder of its own inside it (cli.py --launcher)
+        inside_ok = getattr(opt, 'launcher', False) and ctx.dest != lay.root and lay.temp not in (ctx.dest, *ctx.dest.parents)
+        if not lay.dev and not inside_ok and (ctx.dest == lay.root or lay.root in ctx.dest.parents):
             raise InstallError('Pick an install folder outside the setup folder: the setup folder can be deleted after '
                                'the install.')
         needs_files = ctx.plan_runs('exefs') or ctx.plan_runs('romfs')
