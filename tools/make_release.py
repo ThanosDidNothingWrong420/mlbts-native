@@ -304,7 +304,7 @@ def build_sources(out, version):
                       (SRC / 'runtime' / 'core' / 'LICENSE.totk-recomp', 'totk-recomp-LICENSE.txt'),
                       (SRC / 'runtime' / 'third_party' / 'imgui' / 'LICENSE.txt', 'imgui-LICENSE.txt')):
         shutil.copy2(src, lic / name)
-    for name in ('LICENSE', 'THIRD_PARTY_NOTICES.md'):
+    for name in ('LICENSE', 'THIRD_PARTY_NOTICES.md', 'recomplauncher.json'):   # recomplauncher.json: events.ProgressLines
         shutil.copy2(SRC / name, out / name)
     (out / 'README.txt').write_text(README.format(version=version), encoding='utf-8')
     (out / 'VERSION').write_text(version + '\n', encoding='utf-8')

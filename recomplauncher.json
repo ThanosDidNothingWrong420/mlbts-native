@@ -1,0 +1,652 @@
+{
+    "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+    "format": 1,
+    "name": "MLB The Show 26",
+    "repo": "sam110411/mlbts-native",
+    "min": "0.90.0-beta.27",
+    "requires": [
+        "start",
+        "exit_codes",
+        "settings.ini",
+        "settings.choices",
+        "settings.slider",
+        "settings.groups"
+    ],
+    "inputs": [
+        {
+            "id": "base",
+            "label": "Your MLB The Show 26 game (base NSP)",
+            "role": "game",
+            "formats": [
+                {
+                    "type": "file",
+                    "extensions": [
+                        "nsp"
+                    ],
+                    "requires": [
+                        "keys"
+                    ]
+                }
+            ]
+        },
+        {
+            "id": "update",
+            "label": "The 1.0.20 or 1.0.15 update (NSP)",
+            "role": "update",
+            "formats": [
+                {
+                    "type": "file",
+                    "extensions": [
+                        "nsp"
+                    ],
+                    "requires": [
+                        "keys"
+                    ]
+                }
+            ]
+        },
+        {
+            "id": "keys",
+            "label": "Nintendo Switch prod.keys",
+            "role": "key",
+            "shared": "switch.prod-keys"
+        }
+    ],
+    "prepare": {
+        "program": [
+            "python/python.exe"
+        ],
+        "args": [
+            "-m",
+            "installer",
+            "--base",
+            "{input:base}",
+            "--update",
+            "{input:update}",
+            "--keys",
+            "{input:keys}",
+            "--dest",
+            "{install}/MLBTS",
+            "--launcher"
+        ],
+        "label": "Building the game from your files",
+        "timeout": 10800,
+        "options": [
+            {
+                "id": "dlss",
+                "label": "NVIDIA DLSS",
+                "note": "Downloads NVIDIA's DLSS file for RTX cards.",
+                "args": [
+                    "--dlss"
+                ],
+                "os": [
+                    "windows"
+                ],
+                "gpu": "nvidia",
+                "license": {
+                    "name": "NVIDIA RTX SDKs License",
+                    "url": "https://github.com/NVIDIA/DLSS/blob/main/LICENSE.txt"
+                }
+            },
+            {
+                "id": "ryujinx_save",
+                "label": "Bring over my Ryujinx save",
+                "note": "Copies your save from Ryujinx, if you have one.",
+                "args": [
+                    "--import-save"
+                ],
+                "os": [
+                    "windows"
+                ]
+            }
+        ]
+    },
+    "start": {
+        "program": [
+            "MLBTS/mlb.exe",
+            "MLBTS-Setup.exe"
+        ]
+    },
+    "exit_codes": {
+        "1": "The game stopped with an error. Its log is in MLBTS/logs/mlb.log."
+    },
+    "config": [
+        {
+            "id": "main",
+            "format": "ini",
+            "file": [
+                {
+                    "path": "{install}/MLBTS/mlb.cfg"
+                }
+            ]
+        }
+    ],
+    "saves": [
+        "{install}/MLBTS/profile"
+    ],
+    "folders": {
+        "saves": [
+            {
+                "path": "{install}/MLBTS/profile"
+            }
+        ],
+        "logs": [
+            {
+                "path": "{install}/MLBTS/logs"
+            }
+        ]
+    },
+    "settings": [
+        {
+            "id": "fullscreen",
+            "label": "Window mode",
+            "group": "Display",
+            "help": "Fullscreen or a window.",
+            "choices": [
+                {
+                    "label": "Fullscreen",
+                    "set": {
+                        "FULLSCREEN": "1"
+                    }
+                },
+                {
+                    "label": "Window",
+                    "set": {
+                        "FULLSCREEN": "0"
+                    }
+                }
+            ],
+            "defaults": {
+                "FULLSCREEN": "0"
+            }
+        },
+        {
+            "id": "output_res",
+            "label": "Resolution",
+            "group": "Display",
+            "help": "The size the game draws its picture at. Higher is sharper and needs a faster graphics card.",
+            "choices": [
+                {
+                    "label": "1280x720",
+                    "set": {
+                        "OUTPUT_RES": "1280x720"
+                    }
+                },
+                {
+                    "label": "1920x1080",
+                    "set": {
+                        "OUTPUT_RES": "1920x1080"
+                    }
+                },
+                {
+                    "label": "2560x1440",
+                    "set": {
+                        "OUTPUT_RES": "2560x1440"
+                    }
+                },
+                {
+                    "label": "3840x2160",
+                    "set": {
+                        "OUTPUT_RES": "3840x2160"
+                    }
+                }
+            ],
+            "defaults": {
+                "OUTPUT_RES": "1920x1080"
+            }
+        },
+        {
+            "id": "render_scale",
+            "label": "Render scale",
+            "group": "Display",
+            "help": "How much of the resolution the 3D scene is drawn at. Game keeps the game's own scale.",
+            "choices": [
+                {
+                    "label": "Game",
+                    "set": {
+                        "RENDER_SCALE": "game"
+                    }
+                },
+                {
+                    "label": "100%",
+                    "set": {
+                        "RENDER_SCALE": "100"
+                    }
+                },
+                {
+                    "label": "125%",
+                    "set": {
+                        "RENDER_SCALE": "125"
+                    }
+                },
+                {
+                    "label": "150%",
+                    "set": {
+                        "RENDER_SCALE": "150"
+                    }
+                }
+            ],
+            "defaults": {
+                "RENDER_SCALE": "game"
+            }
+        },
+        {
+            "id": "present",
+            "label": "V-Sync",
+            "group": "Display",
+            "help": "Mailbox is smooth with no tearing. V-Sync locks to the display. Off can tear.",
+            "choices": [
+                {
+                    "label": "Mailbox",
+                    "set": {
+                        "VK_PRESENT": "mailbox"
+                    }
+                },
+                {
+                    "label": "V-Sync",
+                    "set": {
+                        "VK_PRESENT": "fifo"
+                    }
+                },
+                {
+                    "label": "Off",
+                    "set": {
+                        "VK_PRESENT": "immediate"
+                    }
+                }
+            ],
+            "defaults": {
+                "VK_PRESENT": "mailbox"
+            }
+        },
+        {
+            "id": "aspect",
+            "label": "Aspect ratio",
+            "group": "Display",
+            "choices": [
+                {
+                    "label": "Fit",
+                    "set": {
+                        "ASPECT": "fit"
+                    }
+                },
+                {
+                    "label": "Stretch",
+                    "set": {
+                        "ASPECT": "stretch"
+                    }
+                }
+            ],
+            "defaults": {
+                "ASPECT": "fit"
+            }
+        },
+        {
+            "id": "hdr",
+            "label": "HDR",
+            "group": "Display",
+            "help": "HDR10 output. Needs an HDR display with HDR switched on in Windows.",
+            "choices": [
+                {
+                    "label": "Off",
+                    "set": {
+                        "HDR": "0"
+                    }
+                },
+                {
+                    "label": "On",
+                    "set": {
+                        "HDR": "1"
+                    }
+                }
+            ],
+            "defaults": {
+                "HDR": "0"
+            }
+        },
+        {
+            "id": "fps",
+            "label": "Frame rate",
+            "group": "Graphics",
+            "choices": [
+                {
+                    "label": "60 fps",
+                    "set": {
+                        "FPS_LIMIT": "60"
+                    }
+                },
+                {
+                    "label": "30 fps",
+                    "set": {
+                        "FPS_LIMIT": "30"
+                    }
+                }
+            ],
+            "defaults": {
+                "FPS_LIMIT": "60"
+            }
+        },
+        {
+            "id": "dlss",
+            "label": "DLSS",
+            "group": "Graphics",
+            "help": "NVIDIA RTX cards only. DLAA keeps the full resolution; the others draw fewer pixels for more frames per second.",
+            "choices": [
+                {
+                    "label": "Off",
+                    "set": {
+                        "DLSS": "off"
+                    }
+                },
+                {
+                    "label": "DLAA",
+                    "set": {
+                        "DLSS": "dlaa"
+                    }
+                },
+                {
+                    "label": "Quality",
+                    "set": {
+                        "DLSS": "quality"
+                    }
+                },
+                {
+                    "label": "Balanced",
+                    "set": {
+                        "DLSS": "balanced"
+                    }
+                },
+                {
+                    "label": "Performance",
+                    "set": {
+                        "DLSS": "performance"
+                    }
+                },
+                {
+                    "label": "Ultra Performance",
+                    "set": {
+                        "DLSS": "ultra_performance"
+                    }
+                }
+            ],
+            "defaults": {
+                "DLSS": "off"
+            }
+        },
+        {
+            "id": "upscaler",
+            "label": "Upscaler",
+            "group": "Graphics",
+            "help": "How the picture is scaled to the window. Bilinear is the game's own look.",
+            "choices": [
+                {
+                    "label": "Bilinear",
+                    "set": {
+                        "UPSCALER": "bilinear"
+                    }
+                },
+                {
+                    "label": "FSR",
+                    "set": {
+                        "UPSCALER": "fsr"
+                    }
+                }
+            ],
+            "defaults": {
+                "UPSCALER": "bilinear"
+            }
+        },
+        {
+            "id": "aa",
+            "label": "Anti-aliasing",
+            "group": "Graphics",
+            "choices": [
+                {
+                    "label": "FXAA",
+                    "set": {
+                        "AA": "fxaa"
+                    }
+                },
+                {
+                    "label": "Off",
+                    "set": {
+                        "AA": "off"
+                    }
+                }
+            ],
+            "defaults": {
+                "AA": "fxaa"
+            }
+        },
+        {
+            "id": "shadows",
+            "label": "Shadow quality",
+            "group": "Graphics",
+            "choices": [
+                {
+                    "label": "Game",
+                    "set": {
+                        "SHADOW_RES": "game"
+                    }
+                },
+                {
+                    "label": "1024",
+                    "set": {
+                        "SHADOW_RES": "1024"
+                    }
+                },
+                {
+                    "label": "1536",
+                    "set": {
+                        "SHADOW_RES": "1536"
+                    }
+                },
+                {
+                    "label": "2048",
+                    "set": {
+                        "SHADOW_RES": "2048"
+                    }
+                }
+            ],
+            "defaults": {
+                "SHADOW_RES": "game"
+            }
+        },
+        {
+            "id": "aniso",
+            "label": "Texture filtering",
+            "group": "Graphics",
+            "choices": [
+                {
+                    "label": "Game",
+                    "set": {
+                        "ANISO": "game"
+                    }
+                },
+                {
+                    "label": "4x",
+                    "set": {
+                        "ANISO": "4"
+                    }
+                },
+                {
+                    "label": "8x",
+                    "set": {
+                        "ANISO": "8"
+                    }
+                },
+                {
+                    "label": "16x",
+                    "set": {
+                        "ANISO": "16"
+                    }
+                }
+            ],
+            "defaults": {
+                "ANISO": "game"
+            }
+        },
+        {
+            "id": "fov",
+            "label": "Field of view",
+            "group": "Graphics",
+            "slider": {
+                "key": "FOV",
+                "min": 70,
+                "max": 140,
+                "step": 5,
+                "format": "%d"
+            },
+            "defaults": {
+                "FOV": "100"
+            }
+        },
+        {
+            "id": "overlay",
+            "label": "Performance overlay",
+            "group": "Graphics",
+            "choices": [
+                {
+                    "label": "Off",
+                    "set": {
+                        "PERF_OVERLAY": "off"
+                    }
+                },
+                {
+                    "label": "FPS",
+                    "set": {
+                        "PERF_OVERLAY": "fps"
+                    }
+                },
+                {
+                    "label": "Full",
+                    "set": {
+                        "PERF_OVERLAY": "full"
+                    }
+                }
+            ],
+            "defaults": {
+                "PERF_OVERLAY": "off"
+            }
+        },
+        {
+            "id": "volume",
+            "label": "Volume",
+            "group": "Sound",
+            "slider": {
+                "key": "VOLUME",
+                "min": 0,
+                "max": 100,
+                "step": 5,
+                "format": "%d"
+            },
+            "defaults": {
+                "VOLUME": "100"
+            }
+        },
+        {
+            "id": "prompts",
+            "label": "Button prompts",
+            "group": "Controls",
+            "help": "Whose buttons the game shows. Auto follows the controller.",
+            "choices": [
+                {
+                    "label": "Auto",
+                    "set": {
+                        "PROMPTS": "auto"
+                    }
+                },
+                {
+                    "label": "Xbox",
+                    "set": {
+                        "PROMPTS": "xbox"
+                    }
+                },
+                {
+                    "label": "PlayStation",
+                    "set": {
+                        "PROMPTS": "playstation"
+                    }
+                },
+                {
+                    "label": "Nintendo",
+                    "set": {
+                        "PROMPTS": "nintendo"
+                    }
+                }
+            ],
+            "defaults": {
+                "PROMPTS": "auto"
+            }
+        },
+        {
+            "id": "rumble",
+            "label": "Vibration",
+            "group": "Controls",
+            "choices": [
+                {
+                    "label": "On",
+                    "set": {
+                        "RUMBLE": "1"
+                    }
+                },
+                {
+                    "label": "Off",
+                    "set": {
+                        "RUMBLE": "0"
+                    }
+                }
+            ],
+            "defaults": {
+                "RUMBLE": "1"
+            }
+        },
+        {
+            "id": "pad_driver",
+            "label": "Controller driver",
+            "group": "Controls",
+            "advanced": true,
+            "help": "SDL works with Xbox and PlayStation controllers. XInput is Xbox only.",
+            "choices": [
+                {
+                    "label": "SDL",
+                    "set": {
+                        "PAD_DRIVER": "sdl"
+                    }
+                },
+                {
+                    "label": "XInput",
+                    "set": {
+                        "PAD_DRIVER": "xinput"
+                    }
+                }
+            ],
+            "defaults": {
+                "PAD_DRIVER": "sdl"
+            }
+        },
+        {
+            "id": "mode",
+            "label": "Console mode",
+            "group": "Controls",
+            "advanced": true,
+            "choices": [
+                {
+                    "label": "Docked",
+                    "set": {
+                        "OPERATION_MODE": "docked"
+                    }
+                },
+                {
+                    "label": "Handheld",
+                    "set": {
+                        "OPERATION_MODE": "handheld"
+                    }
+                }
+            ],
+            "defaults": {
+                "OPERATION_MODE": "docked"
+            }
+        }
+    ]
+}
