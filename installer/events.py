@@ -106,6 +106,7 @@ class ProgressLines:
         self.current = None
         self.best = 0.0
         self.text = ''
+        self.last = ''
 
     # the file interface events.Reporter writes to
     def write(self, text):
@@ -163,6 +164,8 @@ class ProgressLines:
         else:
             return   # warnings stay in the log
         self.best = max(self.best, min(limit, self.fraction()))
-        if self.text:
-            self.stream.write(f'progress {self.best:.3f} {" ".join(str(self.text).split())}\n')
+        line = f'progress {self.best:.3f} {" ".join(str(self.text).split())}\n'
+        if self.text and line != self.last:   # a failure's error and end events say the same thing
+            self.last = line
+            self.stream.write(line)
             self.stream.flush()

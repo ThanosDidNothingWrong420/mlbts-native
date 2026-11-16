@@ -146,18 +146,18 @@
                 {
                     "label": "Fullscreen",
                     "set": {
-                        "FULLSCREEN": "1"
+                        "MLB_FULLSCREEN": "1"
                     }
                 },
                 {
                     "label": "Window",
                     "set": {
-                        "FULLSCREEN": "0"
+                        "MLB_FULLSCREEN": "0"
                     }
                 }
             ],
             "defaults": {
-                "FULLSCREEN": "0"
+                "MLB_FULLSCREEN": "0"
             }
         },
         {
@@ -169,30 +169,30 @@
                 {
                     "label": "1280x720",
                     "set": {
-                        "OUTPUT_RES": "1280x720"
+                        "MLB_OUTPUT_RES": "1280x720"
                     }
                 },
                 {
                     "label": "1920x1080",
                     "set": {
-                        "OUTPUT_RES": "1920x1080"
+                        "MLB_OUTPUT_RES": "1920x1080"
                     }
                 },
                 {
                     "label": "2560x1440",
                     "set": {
-                        "OUTPUT_RES": "2560x1440"
+                        "MLB_OUTPUT_RES": "2560x1440"
                     }
                 },
                 {
                     "label": "3840x2160",
                     "set": {
-                        "OUTPUT_RES": "3840x2160"
+                        "MLB_OUTPUT_RES": "3840x2160"
                     }
                 }
             ],
             "defaults": {
-                "OUTPUT_RES": "1920x1080"
+                "MLB_OUTPUT_RES": "1920x1080"
             }
         },
         {
@@ -204,30 +204,30 @@
                 {
                     "label": "Game",
                     "set": {
-                        "RENDER_SCALE": "game"
+                        "MLB_RENDER_SCALE": "game"
                     }
                 },
                 {
                     "label": "100%",
                     "set": {
-                        "RENDER_SCALE": "100"
+                        "MLB_RENDER_SCALE": "100"
                     }
                 },
                 {
                     "label": "125%",
                     "set": {
-                        "RENDER_SCALE": "125"
+                        "MLB_RENDER_SCALE": "125"
                     }
                 },
                 {
                     "label": "150%",
                     "set": {
-                        "RENDER_SCALE": "150"
+                        "MLB_RENDER_SCALE": "150"
                     }
                 }
             ],
             "defaults": {
-                "RENDER_SCALE": "game"
+                "MLB_RENDER_SCALE": "game"
             }
         },
         {
@@ -239,24 +239,24 @@
                 {
                     "label": "Mailbox",
                     "set": {
-                        "VK_PRESENT": "mailbox"
+                        "MLB_VK_PRESENT": "mailbox"
                     }
                 },
                 {
                     "label": "V-Sync",
                     "set": {
-                        "VK_PRESENT": "fifo"
+                        "MLB_VK_PRESENT": "fifo"
                     }
                 },
                 {
                     "label": "Off",
                     "set": {
-                        "VK_PRESENT": "immediate"
+                        "MLB_VK_PRESENT": "immediate"
                     }
                 }
             ],
             "defaults": {
-                "VK_PRESENT": "mailbox"
+                "MLB_VK_PRESENT": "mailbox"
             }
         },
         {
@@ -267,18 +267,18 @@
                 {
                     "label": "Fit",
                     "set": {
-                        "ASPECT": "fit"
+                        "MLB_ASPECT": "fit"
                     }
                 },
                 {
                     "label": "Stretch",
                     "set": {
-                        "ASPECT": "stretch"
+                        "MLB_ASPECT": "stretch"
                     }
                 }
             ],
             "defaults": {
-                "ASPECT": "fit"
+                "MLB_ASPECT": "fit"
             }
         },
         {
@@ -290,18 +290,18 @@
                 {
                     "label": "Off",
                     "set": {
-                        "HDR": "0"
+                        "MLB_HDR": "0"
                     }
                 },
                 {
                     "label": "On",
                     "set": {
-                        "HDR": "1"
+                        "MLB_HDR": "1"
                     }
                 }
             ],
             "defaults": {
-                "HDR": "0"
+                "MLB_HDR": "0"
             }
         },
         {
@@ -312,18 +312,18 @@
                 {
                     "label": "60 fps",
                     "set": {
-                        "FPS_LIMIT": "60"
+                        "MLB_FPS_LIMIT": "60"
                     }
                 },
                 {
                     "label": "30 fps",
                     "set": {
-                        "FPS_LIMIT": "30"
+                        "MLB_FPS_LIMIT": "30"
                     }
                 }
             ],
             "defaults": {
-                "FPS_LIMIT": "60"
+                "MLB_FPS_LIMIT": "60"
             }
         },
         {
@@ -335,42 +335,42 @@
                 {
                     "label": "Off",
                     "set": {
-                        "DLSS": "off"
+                        "MLB_DLSS": "off"
                     }
                 },
                 {
                     "label": "DLAA",
                     "set": {
-                        "DLSS": "dlaa"
+                        "MLB_DLSS": "dlaa"
                     }
                 },
                 {
                     "label": "Quality",
                     "set": {
-                        "DLSS": "quality"
+                        "MLB_DLSS": "quality"
                     }
                 },
                 {
                     "label": "Balanced",
                     "set": {
-                        "DLSS": "balanced"
+                        "MLB_DLSS": "balanced"
                     }
                 },
                 {
                     "label": "Performance",
                     "set": {
-                        "DLSS": "performance"
+                        "MLB_DLSS": "performance"
                     }
                 },
                 {
                     "label": "Ultra Performance",
                     "set": {
-                        "DLSS": "ultra_performance"
+                        "MLB_DLSS": "ultra_performance"
                     }
                 }
             ],
             "defaults": {
-                "DLSS": "off"
+                "MLB_DLSS": "off"
             }
         },
         {
@@ -382,18 +382,18 @@
                 {
                     "label": "Bilinear",
                     "set": {
-                        "UPSCALER": "bilinear"
+                        "MLB_UPSCALER": "bilinear"
                     }
                 },
                 {
                     "label": "FSR",
                     "set": {
-                        "UPSCALER": "fsr"
+                        "MLB_UPSCALER": "fsr"
                     }
                 }
             ],
             "defaults": {
-                "UPSCALER": "bilinear"
+                "MLB_UPSCALER": "bilinear"
             }
         },
         {
@@ -404,18 +404,18 @@
                 {
                     "label": "FXAA",
                     "set": {
-                        "AA": "fxaa"
+                        "MLB_AA": "fxaa"
                     }
                 },
                 {
                     "label": "Off",
                     "set": {
-                        "AA": "off"
+                        "MLB_AA": "off"
                     }
                 }
             ],
             "defaults": {
-                "AA": "fxaa"
+                "MLB_AA": "fxaa"
             }
         },
         {
@@ -426,30 +426,30 @@
                 {
                     "label": "Game",
                     "set": {
-                        "SHADOW_RES": "game"
+                        "MLB_SHADOW_RES": "game"
                     }
                 },
                 {
                     "label": "1024",
                     "set": {
-                        "SHADOW_RES": "1024"
+                        "MLB_SHADOW_RES": "1024"
                     }
                 },
                 {
                     "label": "1536",
                     "set": {
-                        "SHADOW_RES": "1536"
+                        "MLB_SHADOW_RES": "1536"
                     }
                 },
                 {
                     "label": "2048",
                     "set": {
-                        "SHADOW_RES": "2048"
+                        "MLB_SHADOW_RES": "2048"
                     }
                 }
             ],
             "defaults": {
-                "SHADOW_RES": "game"
+                "MLB_SHADOW_RES": "game"
             }
         },
         {
@@ -460,30 +460,30 @@
                 {
                     "label": "Game",
                     "set": {
-                        "ANISO": "game"
+                        "MLB_ANISO": "game"
                     }
                 },
                 {
                     "label": "4x",
                     "set": {
-                        "ANISO": "4"
+                        "MLB_ANISO": "4"
                     }
                 },
                 {
                     "label": "8x",
                     "set": {
-                        "ANISO": "8"
+                        "MLB_ANISO": "8"
                     }
                 },
                 {
                     "label": "16x",
                     "set": {
-                        "ANISO": "16"
+                        "MLB_ANISO": "16"
                     }
                 }
             ],
             "defaults": {
-                "ANISO": "game"
+                "MLB_ANISO": "game"
             }
         },
         {
@@ -491,14 +491,14 @@
             "label": "Field of view",
             "group": "Graphics",
             "slider": {
-                "key": "FOV",
+                "key": "MLB_FOV",
                 "min": 70,
                 "max": 140,
                 "step": 5,
                 "format": "%d"
             },
             "defaults": {
-                "FOV": "100"
+                "MLB_FOV": "100"
             }
         },
         {
@@ -509,24 +509,24 @@
                 {
                     "label": "Off",
                     "set": {
-                        "PERF_OVERLAY": "off"
+                        "MLB_PERF_OVERLAY": "off"
                     }
                 },
                 {
                     "label": "FPS",
                     "set": {
-                        "PERF_OVERLAY": "fps"
+                        "MLB_PERF_OVERLAY": "fps"
                     }
                 },
                 {
                     "label": "Full",
                     "set": {
-                        "PERF_OVERLAY": "full"
+                        "MLB_PERF_OVERLAY": "full"
                     }
                 }
             ],
             "defaults": {
-                "PERF_OVERLAY": "off"
+                "MLB_PERF_OVERLAY": "off"
             }
         },
         {
@@ -534,14 +534,14 @@
             "label": "Volume",
             "group": "Sound",
             "slider": {
-                "key": "VOLUME",
+                "key": "MLB_VOLUME",
                 "min": 0,
                 "max": 100,
                 "step": 5,
                 "format": "%d"
             },
             "defaults": {
-                "VOLUME": "100"
+                "MLB_VOLUME": "100"
             }
         },
         {
@@ -553,30 +553,30 @@
                 {
                     "label": "Auto",
                     "set": {
-                        "PROMPTS": "auto"
+                        "MLB_PROMPTS": "auto"
                     }
                 },
                 {
                     "label": "Xbox",
                     "set": {
-                        "PROMPTS": "xbox"
+                        "MLB_PROMPTS": "xbox"
                     }
                 },
                 {
                     "label": "PlayStation",
                     "set": {
-                        "PROMPTS": "playstation"
+                        "MLB_PROMPTS": "playstation"
                     }
                 },
                 {
                     "label": "Nintendo",
                     "set": {
-                        "PROMPTS": "nintendo"
+                        "MLB_PROMPTS": "nintendo"
                     }
                 }
             ],
             "defaults": {
-                "PROMPTS": "auto"
+                "MLB_PROMPTS": "auto"
             }
         },
         {
@@ -587,18 +587,18 @@
                 {
                     "label": "On",
                     "set": {
-                        "RUMBLE": "1"
+                        "MLB_RUMBLE": "1"
                     }
                 },
                 {
                     "label": "Off",
                     "set": {
-                        "RUMBLE": "0"
+                        "MLB_RUMBLE": "0"
                     }
                 }
             ],
             "defaults": {
-                "RUMBLE": "1"
+                "MLB_RUMBLE": "1"
             }
         },
         {
@@ -611,18 +611,18 @@
                 {
                     "label": "SDL",
                     "set": {
-                        "PAD_DRIVER": "sdl"
+                        "MLB_PAD_DRIVER": "sdl"
                     }
                 },
                 {
                     "label": "XInput",
                     "set": {
-                        "PAD_DRIVER": "xinput"
+                        "MLB_PAD_DRIVER": "xinput"
                     }
                 }
             ],
             "defaults": {
-                "PAD_DRIVER": "sdl"
+                "MLB_PAD_DRIVER": "sdl"
             }
         },
         {
@@ -634,18 +634,18 @@
                 {
                     "label": "Docked",
                     "set": {
-                        "OPERATION_MODE": "docked"
+                        "MLB_OPERATION_MODE": "docked"
                     }
                 },
                 {
                     "label": "Handheld",
                     "set": {
-                        "OPERATION_MODE": "handheld"
+                        "MLB_OPERATION_MODE": "handheld"
                     }
                 }
             ],
             "defaults": {
-                "OPERATION_MODE": "docked"
+                "MLB_OPERATION_MODE": "docked"
             }
         }
     ]

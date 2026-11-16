@@ -133,6 +133,9 @@ at the repository root is copied into each release (`tools/make_release.py`) and
   the tools if the launcher stops the setup (`installer/cli.py`), and allows the install folder inside the setup
   folder: the launcher unpacks each release over its folder and never touches `MLBTS/`.
 - After an update the launcher runs the setup again; it skips the extraction and rebuilds `mlb.exe`.
-- The launcher's settings tab writes `MLBTS/mlb.cfg` (the same keys as `runtime/mlb/cfg.c`), and backs up `MLBTS/profile`.
+- The launcher's settings tab writes `MLBTS/mlb.cfg` (the keys of `runtime/mlb/cfg.c`), and backs up `MLBTS/profile`.
+  Its keys are spelled `MLB_<KEY>`, as the in-game menu writes them (`cfg.c` save_file): the game reads `X` and
+  `MLB_X` as one setting, but the launcher matches the text, so with `X` it would not see the menu's `MLB_X` line,
+  and would add its own line after it that undoes the menu's change.
 
 When a setting is added to or renamed in `cfg.c`, update its entry in `recomplauncher.json` too.
