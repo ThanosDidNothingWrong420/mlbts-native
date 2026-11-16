@@ -168,7 +168,7 @@ void vk_hdr_to_srgb8(const uint8_t *in, uint8_t *out, size_t px, int a2r) { (voi
 // <profile>/shot-<frame>.png through gfx_present.c's capture path (the one TotK's menu test shots use).
 void vk_drawlog_arm_at(long frame);   // vk_exec_draw.c
 // One frame's capture, `ahead` presents from now: its draws in the log (MLB_DRAWLOG format) and its picture as
-// <profile>/shot-<frame>.png. F12 (F9 under RenderDoc) in the game window asks for one; so does MLB_DRAWLOG=game, 10 s after the game logs
+// <profile>/shot-<frame>.png. F12 with MLB_CAPTURE_KEY=1 (F9 under RenderDoc) in the game window asks for one; so does MLB_DRAWLOG=game, 10 s after the game logs
 // ===GAME ENTERED=== (services.c).
 static volatile long capture_at = -1;
 void gfx_capture_arm(long ahead) {
@@ -181,13 +181,12 @@ void gfx_capture_arm(long ahead) {
 int mlb_capture_tick(uint64_t frame, const char **shot) {
     static char path[1100];
     static int f12_was;
-    HWND fg = GetForegroundWindow();
-    DWORD pid = 0;
-    if (fg) GetWindowThreadProcessId(fg, &pid);
     // Under RenderDoc F12 (and Print Screen) is its frame capture: ours moves to F9, so one key takes one capture.
+    // mlbts-native: without RenderDoc, F12 only with MLB_CAPTURE_KEY=1. Players press F12 for a screenshot (Steam's
+    // key), and the capture writes every render target as a PNG and the frame's draws into mlb.log: a long stall.
     static int key;
     if (!key) {
-        key = GetModuleHandleA("renderdoc.dll") ? VK_F9 : VK_F12;
+        key = GetModuleHandleA("renderdoc.dll") ? VK_F9 : cfg_int("CAPTURE_KEY") ? VK_F12 : -1;
         if (key == VK_F9) {
             // A RenderDoc capture copies every dirty resource and keeps two copies of each mapped range in system
             // memory: several GiB of commit on top of the game's. Short of it, RenderDoc's allocations fail and it
@@ -199,7 +198,12 @@ int mlb_capture_tick(uint64_t frame, const char **shot) {
                    ms.ullAvailPageFile < (12ull << 30) ? " (low: a capture may run out of memory and crash; raise the page file)" : "");
         }
     }
-    int f12 = pid == GetCurrentProcessId() && (GetAsyncKeyState(key) & 0x8001);
+    DWORD pid = 0;
+    if (key > 0) {
+        HWND fg = GetForegroundWindow();
+        if (fg) GetWindowThreadProcessId(fg, &pid);
+    }
+    int f12 = key > 0 && pid == GetCurrentProcessId() && (GetAsyncKeyState(key) & 0x8001);
     if (key == VK_F9) {   // RenderDoc's F12: the free commit at the press (a capture short of it crashes in renderdoc.dll)
         static int rd_was;
         int rd = pid == GetCurrentProcessId() && (GetAsyncKeyState(VK_F12) & 0x8001);

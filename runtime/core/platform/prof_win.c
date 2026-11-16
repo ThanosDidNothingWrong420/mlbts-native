@@ -1,4 +1,4 @@
-// Sampling profiler (MLB_SAMPLER=<path>). tools/prof_report.py reads the profile with the link map
+// Sampling profiler (MLB_SAMPLER=<path>, or on for <profile>/prof.txt; off by default). tools/prof_report.py reads the profile with the link map
 // (work/build/mlb.map). A host thread wakes every 1 ms and, for every other thread, suspends it, reads Rip and resumes
 // it. The sampler never allocates or takes a lock between SuspendThread and ResumeThread and never runs guest code.
 // The profile is text:
@@ -370,7 +370,7 @@ void prof_sampler_write(void) {
 }
 
 int prof_sampler_start(void) {
-    out_path = cfg_get("MLB_SAMPLER");
+    out_path = cfg_get("SAMPLER_OUT");   // mlbts-native: main.c resolves MLB_SAMPLER (on, off or a path) into it
     if (!out_path || !*out_path) {
         out_path = NULL;
         return 0;

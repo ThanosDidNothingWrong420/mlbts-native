@@ -114,6 +114,7 @@ static const CfgMeta metas[] = {
     {"WB_FENCE_LIMIT", "65536", "0..1073741824", RESTART}, {"WB_MERGE", "1", "0|1", RESTART}, {"WB_EXACT", "1", "0|1", RESTART},
     {"PASS_CRUMBS", "", "0|1", RESTART},   // vk_crumbs.c pass marks; unset: VK_AMD_buffer_marker only
     {"STATEDUMP", "0", "0|1", RESTART},    // statedump.c: F8 writes main's data and bss to the profile folder
+    {"CAPTURE_KEY", "0", "0|1", RESTART},  // gfx_stubs.c: F12 captures a frame (always F9 under RenderDoc)
     {"INPUT_RECORD", "", NULL, RESTART},
 };
 

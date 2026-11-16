@@ -102,16 +102,18 @@ is refused). Players' launchers (0.1.1 and later) find the newest release throug
 
 - `work/build/logs/mlb.log`: the whole run. It is replaced at the next start, so **copy it to `work/scratch/` before
   launching anything** if it holds evidence. `[lm 0]` lines are the game's own log; `[host]` lines are ours.
-- Once a second: `perf: frame N:` lines (fps, GPU time, texture uploads and aliases, VRAM), `mem:` and `sched:`.
+- Developer diagnostics are off by default (players' builds too); `work/build/mlb.cfg` turns them on for the dev
+  tree: `MLB_TRACE=perf,sched`, `MLB_SAMPLER=on`, `MLB_CAPTURE_KEY=1`, `MLB_STATEDUMP=1`.
+- Once a second (`MLB_TRACE=perf`): `perf: frame N:` lines (fps, GPU time, texture uploads and aliases, VRAM), `mem:`; `sched:` with `sched`.
   `sched: <thread> wait N: host on exe+0x...` names where a thread is stuck.
 - Crash: `FATAL: ...` with host frames like `mlb+0xc0944`. Symbolize them with
   `"/c/Program Files/LLVM/bin/llvm-symbolizer.exe" --obj=work/build/mlb.exe --relative-address 0xc0944`.
-- Slow frames (19 ms+) dump a sampler profile to `work/profile/prof.txt.f<frame>`. Read it with
+- With `MLB_SAMPLER=on`, slow frames (19 ms+) dump a sampler profile to `work/profile/prof.txt.f<frame>`. Read it with
   `.venv/Scripts/python -I tools/prof_report.py <profile> [map] --top 40 --chains 30`.
 
 ## In-game diagnostic keys
 
-- **F12** (no RenderDoc): our own capture, 2 frames ahead, with a beep. It writes:
+- **F12** (no RenderDoc, with `MLB_CAPTURE_KEY=1`): our own capture, 2 frames ahead, with a beep. It writes:
   - the frame's draw log into `mlb.log` (`drawlog` lines: every draw's pass, formats, shader hashes, textures and
     their guest addresses);
   - `work/profile/shot-<frame>.png`, the presented picture;

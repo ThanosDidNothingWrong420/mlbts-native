@@ -363,10 +363,9 @@ int main(int argc, char **argv) {
     setvbuf(stderr, NULL, _IONBF, 0);
     plat_crash_hook(crash_handler);
     cfg_load_file();   // mlb.cfg beside the exe: before any setting is read (the defaults below leave its values alone)
-    // mlbts-native, for now (the batting frame rate): the per-second perf lines are on unless MLB_TRACE says otherwise
-    // and the guest scheduler's report every 120 presents (per thread: run, block, sleep and core-wait shares, wake and
-    // core-grant latency, sleep asked against taken): the uneven frames at 60 fps
-    if (!cfg_get("MLB_TRACE")) cfg_set("TRACE", "perf,sched");
+    // mlbts-native: no tracing unless MLB_TRACE asks for it. Releases had perf,sched on for every player (from the
+    // batting frame-rate work): counting and timing in the replay and the scheduler, and lines every second in mlb.log.
+    // The developer's own mlb.cfg sets MLB_TRACE.
     // REPLAY_ASYNC and FRAME_QUEUE are on by default: their rows in cfg.c say why (the settings menu's reset needs the
     // defaults in the table)
     parse_trace();
@@ -398,14 +397,17 @@ int main(int argc, char **argv) {
     if (import) return save_import_main(import_from);
     log_open();
     if (probe) return probe_fs();
-    // mlbts-native, for now (the batting frame rate): the sampling profiler, with every thread's call chains for each
-    // frame of 19 ms or more (one every 3 s at most) in <profile>/prof.txt.f<frame> (MLB_SAMPLER=off: none)
-    if (!cfg_get("MLB_SAMPLER")) {
+    // mlbts-native: the sampling profiler only when asked (it suspends every thread to sample it). MLB_SAMPLER=on: every
+    // thread's call chains for each frame of 19 ms or more (one every 3 s at most) in <profile>/prof.txt.f<frame>;
+    // MLB_SAMPLER=<path>: a profile there; off or unset: none.
+    // The path goes to SAMPLER_OUT (prof_win.c), which an MLB_SAMPLER in the environment cannot shadow.
+    const char *smp = cfg_get("MLB_SAMPLER");
+    if (smp && (!strcmp(smp, "on") || !strcmp(smp, "1"))) {
         static char sp[1100];
         snprintf(sp, sizeof sp, "%s/prof.txt", cfg.profile);
-        cfg_set("SAMPLER", sp);
+        cfg_set("SAMPLER_OUT", sp);
         if (!cfg_get("MLB_SAMPLER_SLOW")) cfg_set("SAMPLER_SLOW", "19");
-    } else if (!strcmp(cfg_get("MLB_SAMPLER"), "off")) cfg_set("SAMPLER", "");
+    } else if (smp && *smp && strcmp(smp, "off") && strcmp(smp, "0")) cfg_set("SAMPLER_OUT", smp);
     prof_start();   // perf.c: the frame-time summary, MLB_TRACE=perf, MLB_SAMPLER
     playtime_init();   // playtime.c: the settings menu's play time, in <profile>/playtime.txt
     rt_boot();

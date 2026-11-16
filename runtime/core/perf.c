@@ -22,7 +22,7 @@ volatile uint32_t prof_render_tid, prof_main_tid, prof_replay_tid;
 
 // The sampler (platform/prof_win.c); without one these do nothing.
 __attribute__((weak)) int prof_sampler_start(void) {
-    if (cfg_get("MLB_SAMPLER")) rt_log("prof: MLB_SAMPLER: no sampling profiler on this OS");
+    if (cfg_get("SAMPLER_OUT")) rt_log("prof: MLB_SAMPLER: no sampling profiler on this OS");
     return 0;
 }
 __attribute__((weak)) void prof_sampler_write(void) {}

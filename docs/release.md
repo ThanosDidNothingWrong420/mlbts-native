@@ -36,7 +36,7 @@ setup, start it, press **Update**. Setup 0.1.0 has no updater, so its players up
   mlb.exe, SDL3.dll              the game, built on this PC (tools/build.py --portable: paths beside the exe)
   totk_xlate.exe, totk_xlate.id  the shader translator
   nvngx_dlss.dll                 NVIDIA DLSS, downloaded from NVIDIA's DLSS repository when the box is ticked
-  mlb.cfg                        settings; the setup writes MLB_SAMPLER=off (the profiler is a developer tool)
+  mlb.cfg                        settings; the setup writes MLB_SAMPLER=off (the profiler is off by default since 0.1.4 anyway)
   game/exefs/, game/romfs/       extracted from the player's NSPs (+ romfs_list.tsv, romfs_info.json, romfs.complete)
   profile/                       saves, account
   logs/                          mlb.log of the last run
