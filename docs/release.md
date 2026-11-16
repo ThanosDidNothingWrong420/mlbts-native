@@ -121,3 +121,18 @@ that say no game files are included (`docs/release-notes-<version>.md`).
 - Preparing the shaders at install: the game translates them while playing, so the first matches stutter while the
   cache fills.
 - One language (English) in the setup window.
+
+## RecompLauncher
+
+[RecompLauncher](https://recomplauncher.com) installs and updates the port from the GitHub releases. `recomplauncher.json`
+at the repository root is copied into each release (`tools/make_release.py`) and tells it how:
+
+- Easy Setup asks for the base NSP, the update NSP and prod.keys, then runs the setup without a window:
+  `python/python.exe -m installer --base ... --update ... --keys ... --dest "{install}/MLBTS" --launcher`.
+- `--launcher` prints `progress <0..1> <text>` lines instead of the JSON events (`installer/events.py` ProgressLines), ends
+  the tools if the launcher stops the setup (`installer/cli.py`), and allows the install folder inside the setup
+  folder: the launcher unpacks each release over its folder and never touches `MLBTS/`.
+- After an update the launcher runs the setup again; it skips the extraction and rebuilds `mlb.exe`.
+- The launcher's settings tab writes `MLBTS/mlb.cfg` (the same keys as `runtime/mlb/cfg.c`), and backs up `MLBTS/profile`.
+
+When a setting is added to or renamed in `cfg.c`, update its entry in `recomplauncher.json` too.
