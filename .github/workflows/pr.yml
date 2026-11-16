@@ -13,7 +13,7 @@ jobs:
     outputs:
       xlate: ${{ steps.changed.outputs.xlate }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 2
 
@@ -50,7 +50,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || needs.checks.outputs.xlate == 'true'
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: actions/setup-python@v5
         with:
