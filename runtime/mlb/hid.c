@@ -116,6 +116,7 @@ static int32_t clamp_stick(int32_t v) { return v > STICK_MAX ? STICK_MAX : v < -
 // ---- the settings this file reads, again whenever cfg_version changes (the settings menu applies them live)
 static unsigned knobs_ver;
 static double dz_l, dz_r, rumble_gain = 1;
+static int rumble_on;   // MLB_RUMBLE: read here, not per call (cfg_get is two getenv calls and a table scan)
 
 static double dead_zone_of(const char *key) {
     const char *v = cfg_get(key);   // unset or empty: both sticks' value
@@ -130,6 +131,7 @@ static void knobs(void) {
     dz_r = dead_zone_of("RSTICK_DEADZONE");
     double g = cfg_double("RUMBLE_STRENGTH");
     rumble_gain = g < 0 ? 0 : g / 100;
+    rumble_on = cfg_bool("MLB_RUMBLE");
     __atomic_store_n(&knobs_ver, v, __ATOMIC_RELEASE);
 }
 
@@ -654,9 +656,20 @@ static void npad_state(Cpu *c, int full_key, const char *fn) {
     uint32_t id = id_of(c, 1, fn);
     NpadState st;
     memset(&st, 0, sizeof st);
-    st.sampling = kern_now_ns() / 5000000;   // the console samples every 5 ms
+    uint64_t now = kern_now_ns();
+    st.sampling = now / 5000000;   // the console samples every 5 ms
     if (full_key && connected(id)) {
-        poll(&st);
+        // mlbts-native: one reading serves the calls of the next 1 ms. The game asks several times a frame on its main
+        // thread, and each reading asks SDL (or XInput) for the pads, Windows for 26 keys and the foreground window:
+        // 2% of that thread's time in the attract demo match at an unlocked frame rate. The console samples every 5 ms.
+        static PlatMutex poll_lock = PLAT_MUTEX_INIT;
+        static NpadState last;
+        static uint64_t last_ns;
+        plat_mutex_lock(&poll_lock);
+        if (!last_ns || now - last_ns >= 1000000) poll(&last), last_ns = now;
+        st.buttons = last.buttons;
+        st.lx = last.lx, st.ly = last.ly, st.rx = last.rx, st.ry = last.ry;
+        plat_mutex_unlock(&poll_lock);
         st.attributes = ATTR_CONNECTED | ATTR_WIRED;
     }
     *out = st;
@@ -723,13 +736,13 @@ static void ov_vib_info(Cpu *c) {
 static void ov_vib_send(Cpu *c) {
     const uint8_t *h = arg_p(c, 0);
     const VibrationValue *v = arg_p(c, 1);
-    if (!h || !v || !cfg_bool("MLB_RUMBLE")) return;
+    knobs();
+    if (!h || !v || !rumble_on) return;
     plat_mutex_lock(&lock);
     if (h[2]) vib_high = v->amp_high > v->amp_low ? v->amp_high : v->amp_low;
     else vib_low = v->amp_low > v->amp_high ? v->amp_low : v->amp_high;
     float lo = vib_low, hi = vib_high;
     plat_mutex_unlock(&lock);
-    knobs();
     lo *= (float)rumble_gain, hi *= (float)rumble_gain;
     pad_rumble((uint16_t)(fminf(fmaxf(lo, 0), 1) * 65535), (uint16_t)(fminf(fmaxf(hi, 0), 1) * 65535));
 }

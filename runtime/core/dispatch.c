@@ -10,6 +10,9 @@
 // The table is filled once by rt_dispatch_init and then made read-only, so any number of threads read it without
 // locks or per-thread caches. Host (HLE) functions at addresses outside the modules live in a small hash table that
 // is also fixed at init; they are looked up only after the flat table misses.
+// mlbts-native: the host-function window of hostfn.c is a range check before the hash table. (A cache of recent
+// targets in front of the table was tried: the samples after the load in rt_dispatch stayed the same, so it was not
+// the table's cache misses that cost there.)
 #include "dispatch.h"
 #include "host.h"
 #include "platform/platform.h"
@@ -30,6 +33,8 @@ static struct __attribute__((aligned(64))) {
     uintptr_t anchor;
     uint64_t lo;
     uint64_t slots;
+    uint64_t hbase, hsize;   // mlbts-native: the host-function window (rt_register_host_range)
+    GuestFn hfn;
 } D;
 
 static const RtModule *g_mods[MAX_MODULES];   // sorted by base
@@ -96,6 +101,15 @@ void rt_register_host(uint64_t addr, GuestFn fn) {
     g_host[h].addr = addr;
     g_host[h].fn = fn;
     g_nhost++;
+}
+
+// mlbts-native: every address in [base, base + size) that is a multiple of 16 goes to fn, which checks it. hostfn.c's
+// host functions sit there (RT_HOSTFN_BASE + 16 * i, all hostfn_entry): the hash lookup of host_lookup missed the cache
+// on each NVN call, 2% of the game's main thread in the attract demo match. The entries stay registered one by one too.
+void rt_register_host_range(uint64_t base, uint64_t size, GuestFn fn) {
+    if (g_ready) rt_fatal("rt_register_host_range(%#llx) after rt_dispatch_init", (unsigned long long)base);
+    if ((base & 15) || !fn) rt_fatal("rt_register_host_range: bad range %#llx", (unsigned long long)base);
+    D.hbase = base, D.hsize = size, D.hfn = fn;
 }
 
 static void *table_alloc(uint64_t bytes) {
@@ -195,6 +209,7 @@ __attribute__((noinline, noreturn, cold)) static void dispatch_fail(Cpu *c) {
 
 // Host functions, and the fatal error. A separate tail call keeps the fast path below free of a stack frame.
 __attribute__((noinline)) static void dispatch_slow(Cpu *c) {
+    if (c->pc - D.hbase < D.hsize && !(c->pc & 15)) __attribute__((musttail)) return D.hfn(c);
     GuestFn f = g_ready ? host_lookup(c->pc) : NULL;
     if (!f) dispatch_fail(c);
     __attribute__((musttail)) return f(c);
