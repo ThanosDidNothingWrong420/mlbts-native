@@ -46,6 +46,7 @@ import hostmem  # noqa: E402
 import jumptables  # noqa: E402
 import patches  # noqa: E402
 import regs  # noqa: E402
+import vregs  # noqa: E402
 from check_content import GENERATED_MARKER  # noqa: E402
 from layout import layout, write as write_layout  # noqa: E402
 from lifter import hx  # noqa: E402
@@ -445,7 +446,7 @@ class Emitter:
         body = []   # (instruction index or None for a label, line); a line belongs to the instruction it lifts
 
         def emit(i, line):
-            body.append((i, line))
+            body.append((i, vregs.rewrite(line)))   # mlbts-native: V registers on VB (recomp/vregs.py)
 
         k = None
         for i, ins in enumerate(insns):
@@ -501,8 +502,16 @@ class Emitter:
                 out.append('    ' + rp.decl())
             self.stats['local_reg_functions'] += bool(rp.regs)
             self.stats['reg_spills'] += sum(len(s) for s in rp.spill)
-            out += [line if i is None else rp.resolve(i, line) for i, line in body]
+            vp = vregs.plan(texts, succ, clean, vregs.LAZY if self.kept else frozenset())
+            if vp.used:
+                out.append('    ' + vp.decl())
+            self.stats['local_vreg_functions'] += bool(vp.used)
+            self.stats['vreg_spills'] += sum(len(s) for s in vp.spill) + sum(len(s) for s in vp.spill_call)
+            self.stats['vreg_unparsed'] += vp.unparsed
+            out += [line if i is None else rp.resolve(i, vp.resolve(i, line)) for i, line in body]
         else:
+            if any('VB' in line or vregs.MACRO.search(line) for _, line in body):   # fb_<entry>: on the Cpu's
+                out.insert(out.index(f'static void {fb}(Cpu *c) {{') + 1, '    vreg *const VB = (vreg *)c->v;')
             out += [line for _, line in body]
         out.append('}')
         self.stats['functions'] += 1
