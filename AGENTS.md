@@ -179,6 +179,13 @@ is refused). Players' launchers (0.1.1 and later) find the newest release throug
 - Shaders: Maxwell shaders are translated by a .NET tool built from `tools/xlate` (Ryujinx's translator plus TotK's
   patches). Pipelines and shader caches live in `work/build/`.
 
+## Frame rate notes
+
+- MLB steps its game by the measured frame time, not by frames: its frame timer only sleeps to a vsync count the game
+  keeps in its data. `MLB_FPS_LIMIT` (F1 → Display) other than 60 sets that count to 0 at each present and the
+  present pacer holds the limit (`runtime/mlb/framerate.c`, `docs/frame-rate.md`). No game code is patched.
+  `MLB_TRACE=perf` logs game time against wall time (`perf: frame rate:`).
+
 ## Audio notes
 
 - MLB mixes everything in software (Sony's Scream engine) and sends one 5.1 PCM stream to `audout` (`audout.c`).

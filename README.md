@@ -45,7 +45,9 @@ release is made: [docs/release.md](docs/release.md).
 - Resolution options: output size, render scale, FSR 1, and NVIDIA DLSS / DLAA (the DLSS library is downloaded
   separately, not shipped here).
 - FXAA, anisotropic filtering, shadow quality options, colour presets, HDR output, field-of-view and aspect options.
-- In-game settings menu, performance overlay, fullscreen toggle (F11), frame limiter.
+- In-game settings menu, performance overlay, fullscreen toggle (F11).
+- Frame rate limit from 30 to 240 fps or the monitor's rate, at the game's normal speed
+  ([docs/frame-rate.md](docs/frame-rate.md)).
 - Software-mixed 5.1 audio output through WASAPI.
 - Built-in diagnostics for graphics bugs: frame capture (F12), draw logs, RenderDoc support.
 
