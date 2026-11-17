@@ -361,6 +361,7 @@ class Emitter:
         # The same holds for registers in locals (recomp/regs.py): fb_<entry> keeps them in the Cpu too.
         local = not all_labels
         spill, reload, reload_call = (regs.SPILL, regs.RELOAD, regs.RELOAD_CALL) if local else ('', '', '')
+        spill_call = regs.SPILL_CALL if local else ''   # mlbts-native: a call keeps X19-X28 in locals (regs.LAZY)
         succ = self.flow(insns, entry, end, tables) if local else None
         fp = self.flag_plan(insns, entry, end, tables, succ) if local else None
         if fp and fp.used:
@@ -408,9 +409,9 @@ class Emitter:
         def call(t, a):
             if t in starts:
                 refs.add(t)
-                return f'c->x[30] = {hx(a + 4)}; {spill}{fname(t)}(c);{reload_call}'
+                return f'c->x[30] = {hx(a + 4)}; {spill_call}{fname(t)}(c);{reload_call}'
             self.stats['external_calls'] += 1
-            return f'c->x[30] = {hx(a + 4)}; {spill}c->pc = {hx(t)}; rt_dispatch(c);{reload_call}'
+            return f'c->x[30] = {hx(a + 4)}; {spill_call}c->pc = {hx(t)}; rt_dispatch(c);{reload_call}'
 
         def op(i, code):
             code = fx(i, code)
@@ -467,7 +468,7 @@ class Emitter:
             elif k == 'bl':
                 emit(i, '    ' + call(ins.target, a))
             elif k == 'blr':
-                emit(i, f'    c->pc = {ins.target}; c->x[30] = {hx(a + 4)}; {spill}rt_dispatch(c);{reload_call}')
+                emit(i, f'    c->pc = {ins.target}; c->x[30] = {hx(a + 4)}; {spill_call}rt_dispatch(c);{reload_call}')
             elif k == 'br':
                 jt = tables.get(a)
                 if jt == 'all':
