@@ -285,7 +285,7 @@ static bool g_modal;            // a confirmation is open: B and Esc close it, n
 // Every setting the pages show, for "Reset all settings" (cfg_reset) and "Restart now".
 static const char *const kMenuKeys[] = {
     "RENDER_SCALE", "UPSCALER", "SHARPNESS", "DLSS", "DLSS_PRESET", "AA", "AA_STRENGTH", "ANISO", "COLOR_PRESET", "COLOR_BRIGHTNESS", "COLOR_CONTRAST", "COLOR_SATURATION",
-    "COLOR_GAMMA", "FULLSCREEN", "WINDOW_SIZE", "VK_PRESENT", "ASPECT", "GPU_INDEX", "PERF_OVERLAY", "FRAME_QUEUE",
+    "COLOR_GAMMA", "FULLSCREEN", "WINDOW_SIZE", "VK_PRESENT", "FPS_LIMIT", "ASPECT", "GPU_INDEX", "PERF_OVERLAY", "FRAME_QUEUE",
     "ASSUME_FOCUS", "VOLUME", "PAD_MAP", "PROMPTS", "RUMBLE", "RUMBLE_STRENGTH", "STICK_DEADZONE", "LSTICK_DEADZONE",
     "RSTICK_DEADZONE", "ASYNC_PREEMPT", "REPLAY_ASYNC", "PIPE_WAIT", "PIPE_SKIP", "LIB_PREBUILD",
     "LIB_PREBUILD_THREADS", "PIPE_PREBUILD", "PREWARM_XLATE", "GPL", "ASTC", "MEMORY", "TEX_ALIAS",
@@ -526,6 +526,8 @@ static const char *present_note(void) {
     return note;
 }
 
+extern "C" const char *frame_rate_note(void);   // runtime/mlb/framerate.c
+
 static void tab_display(float scale) {
     opt_begin("##display", scale);
     opt_toggle("FULLSCREEN", "Fullscreen", "Borderless fullscreen on the monitor the window is on. F11 also switches it.");
@@ -536,6 +538,17 @@ static void tab_display(float scale) {
                "tearing or waiting. VSync waits for the display's refresh (more input delay). Off shows frames as soon "
                "as they are done and can tear.",
                present_note());
+    // mlbts-native: MLB_FPS_LIMIT (runtime/mlb/framerate.c)
+    static const char *const fps[] = {"30", "40", "45", "60", "90", "120", "144", "165", "240", "display"};
+    static const char *const fps_names[] = {"30", "40", "45", "60 (the game's own)", "90", "120", "144", "165", "240",
+                                            "Monitor refresh rate"};
+    opt_choice_list("FPS_LIMIT", "Frame rate limit", fps, fps_names, 10,
+                    "The most frames per second the game draws. 60 is the game's own.\n\n"
+                    "The game moves by the time each frame took, not by a count of frames, so it plays at the same "
+                    "speed at any limit. A limit above your monitor's refresh rate only helps with Presentation set to "
+                    "Fast VSync or Off. A few game situations step by fixed 1/60 s ticks: there the game keeps its own "
+                    "60 fps by itself. Higher limits need more CPU and GPU. Applies at once.",
+                    -1, frame_rate_note());
     static const char *const aspect[] = {"Keep 16:9", "Stretch"};
     opt_choice("ASPECT", "Aspect ratio", aspect, 2,
                "Keep 16:9 adds black bars when the window has another shape. Stretch fills the window and distorts "

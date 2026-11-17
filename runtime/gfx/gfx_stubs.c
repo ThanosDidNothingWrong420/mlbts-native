@@ -18,11 +18,7 @@
 #include "vk_dlaa.h"
 #include "vk_exec.h"
 
-// ---- frame_rate.c: the host half of TotK's fps60/realtime patch sets. Off: presents follow the game's own NVN
-// present interval.
-int frame_step_realtime(void) { return 0; }
-uint64_t frame_step_cap_ns(void) { return 0; }
-void frame_step_present(uint64_t display_ns, int interval) { (void)display_ns, (void)interval; }
+// ---- frame_rate.c: MLB's own is runtime/mlb/framerate.c (MLB_FPS_LIMIT through the game's frame timer, no patches)
 
 // ---- resolution.c: TotK's output/scene size patches and FOV
 void res_fov_live(void) {}
