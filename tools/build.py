@@ -236,7 +236,10 @@ def main():
     lines = [f'# {GENERATED_MARKER}: written by tools/build.py', f'builddir = {rel(out)}', f'cc = "{Path(a.clang).as_posix()}"',
              f'genflags = {" ".join(GEN_FLAGS)} {" ".join(inc_gen)}',
              f'rtflags = {" ".join(rt_flags)} {" ".join(inc_rt)}',
-             'rule cc_gen', '  command = $cc $genflags -c $in -o $out', '  description = CC $in',
+             # mlbts-native: the generated code tracks its headers too (runtime/core/simd.h is inlined everywhere: a
+             # change there left every game object stale)
+             'rule cc_gen', '  command = $cc $genflags -MD -MF $out.d -c $in -o $out', '  depfile = $out.d',
+             '  deps = gcc', '  description = CC $in',
              'rule cc_rt', '  command = $cc $rtflags -MD -MF $out.d -c $in -o $out', '  depfile = $out.d',
              '  deps = gcc', '  description = CC $in',
              f'cxxflags = {" ".join(cxx_flags)} {" ".join(inc_rt)}',

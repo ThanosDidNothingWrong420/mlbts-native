@@ -209,6 +209,47 @@ SN T FN(redo)(Cpu *c, int op, T a, T b, T d, T r) {
     return FBAD(op, r) ? FN(fix)(c, op, a, b, d) : r;
 }
 
+SI VTU FN(vsel)(VTS m, VTU x, VTU y) { return (x & (VTU)m) | (y & ~(VTU)m); }
+
+// mlbts-native: NaN results in one vector pass, for the ops whose host result is right in every lane but its NaN
+// lanes when FPCR.FZ and FPCR.DN are clear (MLB runs with FPCR 0): ADD, SUB, MUL, DIV, MADD (a + b*d) and the min/max
+// family. FPProcessNaNs: the first signalling NaN quietened, else the first quiet NaN, else (an invalid op) the default
+// NaN; MADD gives the default NaN for a quiet NaN addend with inf * 0; FMAXNM/FMINNM give the number when the other
+// operand is a quiet NaN. r: the host result. The same as FN(fix) per lane. Games hit this all the time: vec3 math in
+// 4-lane registers carries a NaN in the unused lane, and each op on such a vector reran every lane through the scalar
+// path (FN(vslow) -> op -> redo -> fix -> nan2), 2-4 % of the samples in the game's code during a match.
+#define FNANQ(op) ((op) == FOP_ADD || (op) == FOP_SUB || (op) == FOP_MUL || (op) == FOP_DIV || (op) == FOP_MADD \
+                   || FMINMAX(op))
+SI VT FN(nanv)(int op, VT a, VT b, VT d, VT r) {
+    VTU x = (VTU)a, y = (VTU)b, z = (VTU)d, q = (VTU){} + QB, s = (VTU){} + SGN, e = (VTU){} + EXPM;
+    VTS na = (x & ~s) > e, nb = (y & ~s) > e, nd = op == FOP_MADD ? (z & ~s) > e : (VTS){};
+    VTS sa = na & ((x & q) == 0), sb = nb & ((y & q) == 0), sd = nd & ((z & q) == 0);
+    VTU res = (VTU){} + DNAN;
+    res = FN(vsel)(nd, z, res);
+    res = FN(vsel)(nb, y, res);
+    res = FN(vsel)(na, x, res);
+    res = FN(vsel)(sd, z | q, res);
+    res = FN(vsel)(sb, y | q, res);
+    res = FN(vsel)(sa, x | q, res);
+    VTS take;   // lanes that get res: NaN results, or for min/max NaN operands
+    if (op == FOP_MADD) {
+        VTS inf_b = (y & ~s) == e, inf_d = (z & ~s) == e, zero_b = (y & ~s) == 0, zero_d = (z & ~s) == 0;
+        res = FN(vsel)(na & ~sa & ((inf_b & zero_d) | (zero_b & inf_d)), (VTU){} + DNAN, res);
+    }
+    if (FMINMAX(op)) {
+        if (op == FOP_MAXNM || op == FOP_MINNM) {
+            res = FN(vsel)(nb & ~sb & ~na, x, res);
+            res = FN(vsel)(na & ~sa & ~nb, y, res);
+        }
+        take = na | nb;
+    } else {
+        take = r != r;
+    }
+    return (VT)FN(vsel)(take, res, (VTU)r);
+}
+SN VT FN(vnan)(int op, VT a, VT b, VT d, VT r) { return FN(nanv)(op, a, b, d, r); }
+SN T FN(snan)(int op, T a, T b, T d, T r) { return FN(nanv)(op, (VT){a}, (VT){b}, (VT){d}, (VT){r})[0]; }
+
 // Scalar FP op (constant op folds the selection). RMode = nearest runs on the host, with or without FZ.
 SI T FN(op)(Cpu *c, int op, T a, T b, T d) {
     if (simd_directed(c)) return FN(slow)(c, op, a, b, d);
@@ -217,7 +258,8 @@ SI T FN(op)(Cpu *c, int op, T a, T b, T d) {
         return FN(minmax)(c, op, a, b);
     }
     T r = FCALC(op, a, b, d, K, FMA_S);
-    if (__builtin_expect(op == FOP_RSQRTS ? FREDO(op, r) : !FOK(r), 0)) r = FN(redo)(c, op, a, b, d, r);
+    if (__builtin_expect(op == FOP_RSQRTS ? FREDO(op, r) : !FOK(r), 0))
+        r = FNANQ(op) && !(c->fpcr & (FPCR_FZ | FPCR_DN)) ? FN(snan)(op, a, b, d, r) : FN(redo)(c, op, a, b, d, r);
     return r;
 }
 
@@ -227,8 +269,6 @@ SN VT FN(vslow)(Cpu *c, int op, VT a, VT b, VT d) {
     return r;
 }
 
-SI VTU FN(vsel)(VTS m, VTU x, VTU y) { return (x & (VTU)m) | (y & ~(VTU)m); }
-
 SI VT FN(vflush)(VT a) {
     VTU u = (VTU)a;
     __asm__("" : "+x"(u));
@@ -237,23 +277,25 @@ SI VT FN(vflush)(VT a) {
     return (VT)FN(vsel)(den, u & SGN, u);
 }
 
-// Vector FP op: native lanes; any lane FREDO flags (or FPCR.RMode) reruns all lanes through the scalar path.
+// Vector FP op: native lanes; NaN lanes of the common ops are fixed in one pass (FN(vnan)); otherwise any lane FREDO
+// flags (or FPCR.RMode) reruns all lanes through the scalar path.
 SI VT FN(vop)(Cpu *c, int op, VT a, VT b, VT d) {
     if (simd_directed(c)) return FN(vslow)(c, op, a, b, d);
     VT r;
     if (FMINMAX(op)) {
         if (c->fpcr & FPCR_FZ) a = FN(vflush)(a), b = FN(vflush)(b);
-        if (__builtin_expect(__builtin_reduce_or((a != a) | (b != b)) != 0, 0)) return FN(vslow)(c, op, a, b, d);
         VTU x = (VTU)a, y = (VTU)b;
         if (op == FOP_MAX || op == FOP_MAXNM)
             r = (VT)FN(vsel)(a > b, x, FN(vsel)(a == b, x & y, y));
         else
             r = (VT)FN(vsel)(a < b, x, FN(vsel)(a == b, x | y, y));
+        if (__builtin_expect(__builtin_reduce_or((a != a) | (b != b)) != 0, 0))
+            return c->fpcr & FPCR_DN ? FN(vslow)(c, op, a, b, d) : FN(vnan)(op, a, b, d, r);
         return r;
     }
     r = FCALC(op, a, b, d, VK, FMA_V);
     if (__builtin_expect(op == FOP_RSQRTS ? __builtin_reduce_or(FREDO(op, r)) != 0 : __builtin_reduce_and(FOK(r)) == 0, 0))
-        return FN(vslow)(c, op, a, b, d);
+        return FNANQ(op) && !(c->fpcr & (FPCR_FZ | FPCR_DN)) ? FN(vnan)(op, a, b, d, r) : FN(vslow)(c, op, a, b, d);
     return r;
 }
 
