@@ -46,6 +46,7 @@ import hostmem  # noqa: E402
 import jumptables  # noqa: E402
 import patches  # noqa: E402
 import regs  # noqa: E402
+import fpcr  # noqa: E402
 import vregs  # noqa: E402
 from check_content import GENERATED_MARKER  # noqa: E402
 from layout import layout, write as write_layout  # noqa: E402
@@ -410,13 +411,15 @@ class Emitter:
         def call(t, a):
             if t in starts:
                 refs.add(t)
-                return f'c->x[30] = {hx(a + 4)}; {spill_call}{fname(t)}(c);{reload_call}'
+                return f'c->x[30] = {hx(a + 4)}; {spill_call}{fname(t)}(c);{reload_call}{fpcr.RELOAD}'
             self.stats['external_calls'] += 1
-            return f'c->x[30] = {hx(a + 4)}; {spill_call}c->pc = {hx(t)}; rt_dispatch(c);{reload_call}'
+            return f'c->x[30] = {hx(a + 4)}; {spill_call}c->pc = {hx(t)}; rt_dispatch(c);{reload_call}{fpcr.RELOAD}'
 
         def op(i, code):
             code = fx(i, code)
-            return f'{spill}{code}{reload}' if regs.ESCAPE.search(code) else code
+            if regs.ESCAPE.search(code):
+                return f'{spill}{code}{reload}{fpcr.RELOAD}'
+            return f'{code}{fpcr.RELOAD}' if fpcr.MSR in code else code   # mlbts-native: MSR FPCR (recomp/fpcr.py)
 
         def one(i, r, a):
             """C of one lifted word of a patched site."""
@@ -469,7 +472,8 @@ class Emitter:
             elif k == 'bl':
                 emit(i, '    ' + call(ins.target, a))
             elif k == 'blr':
-                emit(i, f'    c->pc = {ins.target}; c->x[30] = {hx(a + 4)}; {spill_call}rt_dispatch(c);{reload_call}')
+                emit(i, f'    c->pc = {ins.target}; c->x[30] = {hx(a + 4)}; {spill_call}rt_dispatch(c);{reload_call}'
+                        f'{fpcr.RELOAD}')
             elif k == 'br':
                 jt = tables.get(a)
                 if jt == 'all':
@@ -513,6 +517,10 @@ class Emitter:
             if any('VB' in line or vregs.MACRO.search(line) for _, line in body):   # fb_<entry>: on the Cpu's
                 out.insert(out.index(f'static void {fb}(Cpu *c) {{') + 1, '    vreg *const VB = (vreg *)c->v;')
             out += [line for _, line in body]
+        out, uses_fpcr = fpcr.finish(out)   # mlbts-native: the FP helpers on a local FPCR (recomp/fpcr.py)
+        if uses_fpcr:
+            at = out.index(f'static void {fb}(Cpu *c) {{') + 1 if all_labels else 2
+            out.insert(at, fpcr.DECL)
         out.append('}')
         self.stats['functions'] += 1
         self.stats['instructions'] += len(insns)
