@@ -62,7 +62,8 @@ static const CfgMeta metas[] = {
     // mlbts-native: FRAME_QUEUE on (uneven frames at 60): the frame queue (nvn_api_obj.c nvnWindowAcquireTexture).
     // Without it a window image is free only one period after its present, so a frame that runs a little long misses
     // its slot; with it the game draws the next frame while the previous one waits for its turn.
-    {"FPS_LIMIT", "60", "30|40|45|60|90|120|144|display", LIVE}, {"FPS60", "1", "0|1", LIVE}, {"FRAME_QUEUE", "1", "0|1", LIVE},
+    // mlbts-native: FPS_LIMIT 60 the game's own; any other rate through the game's frame timer (framerate.c)
+    {"FPS_LIMIT", "60", "30|40|45|60|90|120|144|165|240|display", LIVE}, {"FPS60", "1", "0|1", LIVE}, {"FRAME_QUEUE", "1", "0|1", LIVE},
     {"REALTIME", "1", "0|1", RESTART}, {"CLOTH_REALTIME", "1", "0|1", RESTART},
     {"MODS_REBUILD", "auto", "auto|off", RESTART},
     {"HIGHFPS_FIX", "1", "0|1", RESTART},

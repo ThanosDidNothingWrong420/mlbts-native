@@ -1388,6 +1388,9 @@ static void lock_acquire_for(RtThread *t, uint64_t addr, uint32_t tag) {
         }
         if (cas32(addr, &v, v | WAITERS_BIT)) break;
     }
+    // mlbts-native: the signal ended the condvar wait (TOTK_TRACE=sched names the waker; it read "cv on ..." with no
+    // waker when the signaller still held the lock, as if a timeout or a host thread had ended it).
+    t->waker = tcur ? tcur->handle : 0;
     acct(t, S_LOCK);
     t->wobj = v & ~WAITERS_BIT;
     t->wkind = W_LOCK;

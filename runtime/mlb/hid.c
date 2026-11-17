@@ -116,6 +116,7 @@ static int32_t clamp_stick(int32_t v) { return v > STICK_MAX ? STICK_MAX : v < -
 // ---- the settings this file reads, again whenever cfg_version changes (the settings menu applies them live)
 static unsigned knobs_ver;
 static double dz_l, dz_r, rumble_gain = 1;
+static int rumble_on;   // MLB_RUMBLE: read here, not per call (cfg_get is two getenv calls and a table scan)
 
 static double dead_zone_of(const char *key) {
     const char *v = cfg_get(key);   // unset or empty: both sticks' value
@@ -130,6 +131,7 @@ static void knobs(void) {
     dz_r = dead_zone_of("RSTICK_DEADZONE");
     double g = cfg_double("RUMBLE_STRENGTH");
     rumble_gain = g < 0 ? 0 : g / 100;
+    rumble_on = cfg_bool("MLB_RUMBLE");
     __atomic_store_n(&knobs_ver, v, __ATOMIC_RELEASE);
 }
 
@@ -646,6 +648,68 @@ static void ov_get_supported_styles(Cpu *c) {
 // NpadStyleSet GetNpadStyleSet(const NpadIdType &id)
 static void ov_style_set(Cpu *c) { ret_x(c, connected(id_of(c, 0, "GetNpadStyleSet")) ? STYLE_FULL_KEY : 0); }
 
+// mlbts-native: held-button repeat at 60 ticks a second whatever the frame rate (MLB_FPS_LIMIT, framerate.c).
+// MLB's pad update (1.0.20 f_7001341c20, 1.0.15 f_7001340720; read 2026-11-17) repeats a held d-pad or stick
+// direction by counting frames, not time: each pad record (0x790 bytes, an array whose address the game keeps at
+// 1.0.20 main+0x45aef28, 1.0.15 main+0x45acf28; 7 records seen) holds
+//   +0x1a4 the initial delay (20 frames as shipped)  +0x1a8 its countdown
+//   +0x1ac the repeat interval (2 frames)              +0x1b4 its countdown
+// Every update of a pad with a repeatable button held takes one off the delay countdown, then one off the interval
+// countdown, and repeats the button when the latter is at 0 (then back to the interval); with none held both go
+// back to their starting values. At 60 fps: a repeat after a third of a second, then 20 a second. Unlocked, the
+// countdowns ran with the frame rate: at 240 fps a held key repeated after 80 ms, then 80 times a second.
+// The game reads the controller (this file's GetNpadState) right before it updates its pads, on the same thread. Each
+// read here lets a pad's countdowns move by one only when 1/60 s of time is available for it, and puts back a step
+// the game took without it (a step to 0 that already fired a repeat stays). Below 60 fps the countdowns get the
+// missing steps here. At the game's own 60 nothing here changes.
+enum { PAD_SIZE = 0x790, PAD_MAX = 8, PAD_DELAY = 0x1a4, PAD_DELAY_N = 0x1a8, PAD_RATE = 0x1ac, PAD_RATE_N = 0x1b4 };
+
+static void repeat_pace(uint64_t now) {
+    static const struct { const char *build; uint64_t slot; } k_slot[] = {{"1.0.15", 0x70045acf28ull},
+                                                                         {"1.0.20", 0x70045aef28ull}};
+    static uint64_t slot, last_ns;
+    static int slot_read;
+    static struct { uint32_t d, r; double credit; int have; } st[PAD_MAX];
+    if (!slot_read) {
+        slot_read = 1;
+        for (size_t i = 0; i < sizeof k_slot / sizeof *k_slot; i++)
+            if (!strcmp(rt_game_build, k_slot[i].build)) slot = k_slot[i].slot;
+    }
+    double ticks = last_ns && now > last_ns ? (double)(now - last_ns) * 60 / 1e9 : 0;
+    last_ns = now;
+    if (ticks > 3) ticks = 3;   // a load or a pause: no burst of steps after it
+    int on = slot && frame_step_realtime();
+    uint64_t base = slot ? *(volatile uint64_t *)(uintptr_t)slot : 0;
+    if (!on || !base || !mem_guest_readable(base, (uint64_t)PAD_SIZE * PAD_MAX)) {
+        for (int i = 0; i < PAD_MAX; i++) st[i].have = 0;
+        return;
+    }
+    for (int i = 0; i < PAD_MAX; i++) {
+        volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)(base + (uint64_t)i * PAD_SIZE);
+        uint32_t delay = p[PAD_DELAY / 4], rate = p[PAD_RATE / 4];
+        if (!delay || delay > 600 || !rate || rate > 600) break;   // past the game's records
+        uint32_t d = p[PAD_DELAY_N / 4], r = p[PAD_RATE_N / 4];
+        if (!st[i].have || (d == delay && r == rate)) {   // first look, or nothing held: the game's start values
+            st[i].d = d, st[i].r = r, st[i].credit = 1, st[i].have = 1;
+            continue;
+        }
+        double credit = st[i].credit + ticks;
+        if (credit > 3) credit = 3;
+        int stepped = d != st[i].d || r != st[i].r;
+        int fired = st[i].d == 0 && d == 0 && st[i].r == 0;   // the game repeated the button: that step stays
+        if (stepped && (fired || credit >= 1)) credit -= 1;
+        else if (stepped) d = st[i].d, r = st[i].r;          // too soon: the step is undone
+        while (credit >= 2) {                                 // below 60 fps: the steps the frames missed
+            if (d > 1) d--;
+            else if (d == 0 && r > 1) r--;
+            else break;
+            credit -= 1;
+        }
+        p[PAD_DELAY_N / 4] = d, p[PAD_RATE_N / 4] = r;
+        st[i].d = d, st[i].r = r, st[i].credit = credit;
+    }
+}
+
 // void GetNpadState(NpadXxxState *out, const NpadIdType &id): the latest sample. The full-key state is the
 // controller's; the other styles' states read as disconnected (all zero but the sampling number).
 static void npad_state(Cpu *c, int full_key, const char *fn) {
@@ -654,9 +718,21 @@ static void npad_state(Cpu *c, int full_key, const char *fn) {
     uint32_t id = id_of(c, 1, fn);
     NpadState st;
     memset(&st, 0, sizeof st);
-    st.sampling = kern_now_ns() / 5000000;   // the console samples every 5 ms
+    uint64_t now = kern_now_ns();
+    st.sampling = now / 5000000;   // the console samples every 5 ms
     if (full_key && connected(id)) {
-        poll(&st);
+        // mlbts-native: one reading serves the calls of the next 1 ms. The game asks several times a frame on its main
+        // thread, and each reading asks SDL (or XInput) for the pads, Windows for 26 keys and the foreground window:
+        // 2% of that thread's time in the attract demo match at an unlocked frame rate. The console samples every 5 ms.
+        static PlatMutex poll_lock = PLAT_MUTEX_INIT;
+        static NpadState last;
+        static uint64_t last_ns;
+        plat_mutex_lock(&poll_lock);
+        if (!last_ns || now - last_ns >= 1000000) poll(&last), last_ns = now;
+        st.buttons = last.buttons;
+        st.lx = last.lx, st.ly = last.ly, st.rx = last.rx, st.ry = last.ry;
+        repeat_pace(now);
+        plat_mutex_unlock(&poll_lock);
         st.attributes = ATTR_CONNECTED | ATTR_WIRED;
     }
     *out = st;
@@ -723,13 +799,13 @@ static void ov_vib_info(Cpu *c) {
 static void ov_vib_send(Cpu *c) {
     const uint8_t *h = arg_p(c, 0);
     const VibrationValue *v = arg_p(c, 1);
-    if (!h || !v || !cfg_bool("MLB_RUMBLE")) return;
+    knobs();
+    if (!h || !v || !rumble_on) return;
     plat_mutex_lock(&lock);
     if (h[2]) vib_high = v->amp_high > v->amp_low ? v->amp_high : v->amp_low;
     else vib_low = v->amp_low > v->amp_high ? v->amp_low : v->amp_high;
     float lo = vib_low, hi = vib_high;
     plat_mutex_unlock(&lock);
-    knobs();
     lo *= (float)rumble_gain, hi *= (float)rumble_gain;
     pad_rumble((uint16_t)(fminf(fmaxf(lo, 0), 1) * 65535), (uint16_t)(fminf(fmaxf(hi, 0), 1) * 65535));
 }

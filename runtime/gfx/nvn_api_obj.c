@@ -773,7 +773,11 @@ NVN_API(nvnQueuePresentTexture) {
     uint64_t slot = now + pace(&o->pace, now, period);
     gfx_backend()->present(t, o->crop, slot);
     o->ticket[idx] = o->presents;
-    o->avail[idx] = cfg_bool("TOTK_FRAME_QUEUE") ? slot : slot + period;
+    // mlbts-native: the setting read again only when a setting changed (cfg_get is two getenv calls and a scan)
+    static unsigned fq_ver;
+    static int fq;
+    if (fq_ver != cfg_version()) fq = cfg_bool("TOTK_FRAME_QUEUE"), fq_ver = cfg_version();
+    o->avail[idx] = fq ? slot : slot + period;
     frame_step_present(slot, o->interval);   // frame_rate.c: the real-time step follows the display times
     rt_frame_presented(t, o->presents);
 }

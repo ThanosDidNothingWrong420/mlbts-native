@@ -260,6 +260,25 @@
             }
         },
         {
+            "id": "fps_limit",
+            "label": "Frame rate limit",
+            "group": "Display",
+            "help": "60 is the game's own. The game plays at the same speed at any limit. Above your monitor's refresh rate it only helps with Mailbox or Off.",
+            "choices": [
+                {"label": "30", "set": {"MLB_FPS_LIMIT": "30"}},
+                {"label": "60", "set": {"MLB_FPS_LIMIT": "60"}},
+                {"label": "90", "set": {"MLB_FPS_LIMIT": "90"}},
+                {"label": "120", "set": {"MLB_FPS_LIMIT": "120"}},
+                {"label": "144", "set": {"MLB_FPS_LIMIT": "144"}},
+                {"label": "165", "set": {"MLB_FPS_LIMIT": "165"}},
+                {"label": "240", "set": {"MLB_FPS_LIMIT": "240"}},
+                {"label": "Monitor refresh rate", "set": {"MLB_FPS_LIMIT": "display"}}
+            ],
+            "defaults": {
+                "MLB_FPS_LIMIT": "60"
+            }
+        },
+        {
             "id": "aspect",
             "label": "Aspect ratio",
             "group": "Display",

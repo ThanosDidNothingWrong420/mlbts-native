@@ -46,6 +46,8 @@ import hostmem  # noqa: E402
 import jumptables  # noqa: E402
 import patches  # noqa: E402
 import regs  # noqa: E402
+import fpcr  # noqa: E402
+import vregs  # noqa: E402
 from check_content import GENERATED_MARKER  # noqa: E402
 from layout import layout, write as write_layout  # noqa: E402
 from lifter import hx  # noqa: E402
@@ -361,6 +363,7 @@ class Emitter:
         # The same holds for registers in locals (recomp/regs.py): fb_<entry> keeps them in the Cpu too.
         local = not all_labels
         spill, reload, reload_call = (regs.SPILL, regs.RELOAD, regs.RELOAD_CALL) if local else ('', '', '')
+        spill_call = regs.SPILL_CALL if local else ''   # mlbts-native: a call keeps X19-X28 in locals (regs.LAZY)
         succ = self.flow(insns, entry, end, tables) if local else None
         fp = self.flag_plan(insns, entry, end, tables, succ) if local else None
         if fp and fp.used:
@@ -408,13 +411,15 @@ class Emitter:
         def call(t, a):
             if t in starts:
                 refs.add(t)
-                return f'c->x[30] = {hx(a + 4)}; {spill}{fname(t)}(c);{reload_call}'
+                return f'c->x[30] = {hx(a + 4)}; {spill_call}{fname(t)}(c);{reload_call}{fpcr.RELOAD}'
             self.stats['external_calls'] += 1
-            return f'c->x[30] = {hx(a + 4)}; {spill}c->pc = {hx(t)}; rt_dispatch(c);{reload_call}'
+            return f'c->x[30] = {hx(a + 4)}; {spill_call}c->pc = {hx(t)}; rt_dispatch(c);{reload_call}{fpcr.RELOAD}'
 
         def op(i, code):
             code = fx(i, code)
-            return f'{spill}{code}{reload}' if regs.ESCAPE.search(code) else code
+            if regs.ESCAPE.search(code):
+                return f'{spill}{code}{reload}{fpcr.RELOAD}'
+            return f'{code}{fpcr.RELOAD}' if fpcr.MSR in code else code   # mlbts-native: MSR FPCR (recomp/fpcr.py)
 
         def one(i, r, a):
             """C of one lifted word of a patched site."""
@@ -444,7 +449,7 @@ class Emitter:
         body = []   # (instruction index or None for a label, line); a line belongs to the instruction it lifts
 
         def emit(i, line):
-            body.append((i, line))
+            body.append((i, vregs.rewrite(line)))   # mlbts-native: V registers on VB (recomp/vregs.py)
 
         k = None
         for i, ins in enumerate(insns):
@@ -467,7 +472,8 @@ class Emitter:
             elif k == 'bl':
                 emit(i, '    ' + call(ins.target, a))
             elif k == 'blr':
-                emit(i, f'    c->pc = {ins.target}; c->x[30] = {hx(a + 4)}; {spill}rt_dispatch(c);{reload_call}')
+                emit(i, f'    c->pc = {ins.target}; c->x[30] = {hx(a + 4)}; {spill_call}rt_dispatch(c);{reload_call}'
+                        f'{fpcr.RELOAD}')
             elif k == 'br':
                 jt = tables.get(a)
                 if jt == 'all':
@@ -500,9 +506,21 @@ class Emitter:
                 out.append('    ' + rp.decl())
             self.stats['local_reg_functions'] += bool(rp.regs)
             self.stats['reg_spills'] += sum(len(s) for s in rp.spill)
-            out += [line if i is None else rp.resolve(i, line) for i, line in body]
+            vp = vregs.plan(texts, succ, clean, vregs.LAZY if self.kept else frozenset())
+            if vp.used:
+                out.append('    ' + vp.decl())
+            self.stats['local_vreg_functions'] += bool(vp.used)
+            self.stats['vreg_spills'] += sum(len(s) for s in vp.spill) + sum(len(s) for s in vp.spill_call)
+            self.stats['vreg_unparsed'] += vp.unparsed
+            out += [line if i is None else rp.resolve(i, vp.resolve(i, line)) for i, line in body]
         else:
+            if any('VB' in line or vregs.MACRO.search(line) for _, line in body):   # fb_<entry>: on the Cpu's
+                out.insert(out.index(f'static void {fb}(Cpu *c) {{') + 1, '    vreg *const VB = (vreg *)c->v;')
             out += [line for _, line in body]
+        out, uses_fpcr = fpcr.finish(out)   # mlbts-native: the FP helpers on a local FPCR (recomp/fpcr.py)
+        if uses_fpcr:
+            at = out.index(f'static void {fb}(Cpu *c) {{') + 1 if all_labels else 2
+            out.insert(at, fpcr.DECL)
         out.append('}')
         self.stats['functions'] += 1
         self.stats['instructions'] += len(insns)

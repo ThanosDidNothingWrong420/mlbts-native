@@ -35,7 +35,11 @@ from check_content import GENERATED_MARKER  # noqa: E402
 
 DEFAULT_CLANG = r'C:\Program Files\LLVM\bin\clang.exe'
 # Generated code: TotK Recomp tools/build_game.py GEN_FLAGS @ ae30a61 (LAS Recomp's flags plus -march).
-GEN_FLAGS = ['-O1', '-fno-strict-aliasing', '-Wno-return-type', '-Wno-unused-label', '-fvisibility=hidden',
+# mlbts-native: -O2 instead of TotK's -O1. In a match at an unlocked frame rate the game's own code (main thread and
+# its three job workers) holds the frame, not the GPU; -O2 gave 3-6% more fps in every game state measured on
+# 2026-11-17 (exhibition, MLB_FPS_LIMIT=240, Ryzen 5 5600X: 109.5 -> 113.8 fps over the match states) for about 13%
+# more compile time per file.
+GEN_FLAGS = ['-O2', '-fno-strict-aliasing', '-Wno-return-type', '-Wno-unused-label', '-fvisibility=hidden',
              '-march=x86-64-v3']
 RT_FLAGS = ['-O2', '-g', '-Wall', '-Wno-unused-function', '-fno-strict-aliasing', '-march=x86-64-v3', '-std=gnu11',
             '-D_CRT_SECURE_NO_WARNINGS']
@@ -232,7 +236,10 @@ def main():
     lines = [f'# {GENERATED_MARKER}: written by tools/build.py', f'builddir = {rel(out)}', f'cc = "{Path(a.clang).as_posix()}"',
              f'genflags = {" ".join(GEN_FLAGS)} {" ".join(inc_gen)}',
              f'rtflags = {" ".join(rt_flags)} {" ".join(inc_rt)}',
-             'rule cc_gen', '  command = $cc $genflags -c $in -o $out', '  description = CC $in',
+             # mlbts-native: the generated code tracks its headers too (runtime/core/simd.h is inlined everywhere: a
+             # change there left every game object stale)
+             'rule cc_gen', '  command = $cc $genflags -MD -MF $out.d -c $in -o $out', '  depfile = $out.d',
+             '  deps = gcc', '  description = CC $in',
              'rule cc_rt', '  command = $cc $rtflags -MD -MF $out.d -c $in -o $out', '  depfile = $out.d',
              '  deps = gcc', '  description = CC $in',
              f'cxxflags = {" ".join(cxx_flags)} {" ".join(inc_rt)}',
