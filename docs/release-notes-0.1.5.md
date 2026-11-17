@@ -9,21 +9,12 @@
 
 ## What's new
 
-- **Frame rate limit.** Press **F1 → Display → Frame rate limit** and pick 30, 40, 45, 60 (the default), 90, 120,
-  144, 165, 240 or your monitor's refresh rate. It applies at once. The game keeps its normal speed at any limit: MLB
-  already moves its game by the real time each frame takes, so the port only lets it skip its wait for the next 60 Hz
-  tick. No game code is changed.
-  - Loading screens stay at 60 fps.
-  - A limit above your monitor's refresh rate shows only with **Presentation** set to Fast VSync or Off.
-  - Held buttons and stick directions in menus repeat at the same speed at every frame rate (the game counts frames
-    for that, so at 240 fps they repeated four times faster until the port corrected it).
-- **The game's own code runs much faster.** Most of each frame in a match is the game's own code, translated from
-  the Switch's processor. The translation now keeps the game's working values in the PC processor's registers far
-  more often instead of in memory, handles math on "not a number" values in one step, and is compiled with more
-  optimisation. In an exhibition match with the limit at 240 (Ryzen 5 5600X) the frame rate went from about 110 to
-  about 139 fps. At 60 fps this means more headroom, so fewer drops on slower processors.
-- **Less work for the port on the game's main thread**: controller reads, calls into the graphics code and settings
-  checks each cost less per frame.
+- **Frame rate limit.** **F1 → Display → Frame rate limit**: 30 to 240 fps or your monitor's refresh rate (60 is the
+  default). The game keeps its normal speed at any limit, and held buttons repeat at the same speed. Loading screens
+  stay at 60. Above your monitor's refresh rate, set **Presentation** to Fast VSync or Off.
+- **Faster game code.** The game's translated code runs about a quarter faster: in a match at a 240 limit, about 110
+  → 139 fps (Ryzen 5 5600X). At 60 fps that means fewer drops on slower processors.
+- **Less overhead** from the port on the game's main thread (controller reads, graphics calls).
 
 ## Updating
 
@@ -61,7 +52,6 @@ You can delete the old setup folder afterwards.
   0.1.4.
 - Some game screens hold their own 60 fps whatever the limit (the F1 menu row then says "the game holds 60 here").
 - **The first matches stutter** while the game prepares its shaders; they are kept, so it gets smoother as you play.
-- Some images and lighting are still wrong or missing in places.
 - The setup takes NSP files only (no XCI or NSZ yet), and only game versions 1.0.20 and 1.0.15.
 
 ## Reporting a problem
